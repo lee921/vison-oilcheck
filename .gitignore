@@ -6,7 +6,8 @@ __pycache__/
 logs/
 snapshots/
 recordings/
-data/
+data/*
+!data/sample_data/
 *.bmp
 *.mp4
 # 海康 SDK 运行时日志（含设备 IP 等现场信息）
