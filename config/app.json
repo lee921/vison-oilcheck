@@ -1,0 +1,13 @@
+{
+  "layout": 1,
+  "ui_fps": 25,
+  "decode_max_fps": 25,
+  "offline_timeout_s": 10,
+  "snapshot_dir": "snapshots",
+  "log_dir": "logs",
+  "relay": {
+    "enabled": true,
+    "port": 10000,
+    "timeout_s": 1.0
+  }
+}

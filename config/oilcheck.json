@@ -1,0 +1,104 @@
+{
+  "version": "1.0",
+  "pipeline": {
+    "max_fps": 15,
+    "pick_confirm_s": 0.6,
+    "pick_abort_s": 0.5,
+    "occlusion_timeout_s": 2.0,
+    "pick_require_hand": true,
+    "hand_proximity_margin": 0.03,
+    "oiling_min_duration_s": 1.5,
+    "oiling_max_gap_s": 0.8,
+    "oiling_min_motion": 0.04,
+    "oiling_require_rod": true,
+    "oiling_wait_timeout_s": 0.0,
+    "event_cooldown_s": 1.0,
+    "part_reset_absent_s": 0.5,
+    "track_max_distance": 0.08,
+    "track_max_missing_s": 0.7,
+    "track_min_hits": 2,
+    "track_max_active": 8,
+    "track_hand_distance": 0.06,
+    "track_pick_window_s": 1.5,
+    "completed_retain_s": 10.0,
+    "tray_max_distance": 0.2,
+    "tray_max_missing_s": 1.0,
+    "tray_min_confidence": 0.3,
+    "tray_motion_speed": 0.05,
+    "slot_occupied_confirm_s": 0.25,
+    "slot_empty_confirm_s": 0.6,
+    "slot_occlusion_unknown_s": 2.0,
+    "slot_hand_occlusion_ratio": 0.15,
+    "slot_hand_margin": 0.03,
+    "pick_window_s": 2.0,
+    "hand_track_max_distance": 0.15,
+    "hand_track_max_missing_s": 0.8,
+    "hand_track_min_hits": 1,
+    "brush_track_max_distance": 0.15,
+    "brush_track_max_missing_s": 0.8,
+    "brush_track_min_hits": 1,
+    "brush_part_distance": 0.08,
+    "brush_min_duration_s": 1.5,
+    "brush_max_gap_s": 0.8,
+    "brush_min_motion": 0.15,
+    "brush_require_hand": true,
+    "identity_timeout_s": 2.0,
+    "identity_ambiguity_margin": 0.02,
+    "operation_max_active": 8
+  },
+  "recording": {
+    "training_dir": "recordings/training",
+    "fps": 15,
+    "segment_seconds": 300.0,
+    "codec": "mp4v",
+    "auto_start": false,
+    "event_clips_enabled": false
+  },
+  "stations": [
+    {
+      "station_id": "ST01",
+      "name": "1号取料工位",
+      "camera_id": "cam_6ca47a",
+      "enabled": true,
+      "slot_mode": "tray",
+      "pick_roi": {
+        "kind": "rect",
+        "points": [
+          [0.28, 0.08],
+          [0.72, 0.42]
+        ]
+      },
+      "tray_roi": {
+        "kind": "rect",
+        "points": [
+          [0.28, 0.08],
+          [0.72, 0.42]
+        ]
+      },
+      "oiling_roi": {
+        "kind": "rect",
+        "points": [
+          [0.1, 0.5],
+          [0.48, 0.96]
+        ]
+      },
+      "slot_layout": [
+        {"index": 1, "name": "1号槽", "x1": 0.02, "y1": 0.15, "x2": 0.23, "y2": 0.9},
+        {"index": 2, "name": "2号槽", "x1": 0.27, "y1": 0.15, "x2": 0.48, "y2": 0.9},
+        {"index": 3, "name": "3号槽", "x1": 0.52, "y1": 0.15, "x2": 0.73, "y2": 0.9},
+        {"index": 4, "name": "4号槽", "x1": 0.77, "y1": 0.15, "x2": 0.98, "y2": 0.9}
+      ],
+      "slots": [],
+      "detector": {
+        "kind": "null",
+        "model_path": "",
+        "confidence": 0.5,
+        "hand_label": "hand",
+        "rod_label": "rod",
+        "brush_label": "brush",
+        "tray_label": "tray",
+        "cycle_seconds": 18.0
+      }
+    }
+  ]
+}

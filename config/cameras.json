@@ -1,0 +1,38 @@
+[
+  {
+    "id": "cam_6ca47a",
+    "name": "1号位",
+    "enabled": true,
+    "ip": "192.168.1.64",
+    "port": 8000,
+    "username": "admin",
+    "password": "env:OILCHECK_CAM_PASSWORD",
+    "total_detections": 0,
+    "channel": 1,
+    "stream_type": "main",
+    "preferred_mode": "decode",
+    "reconnect": {
+      "enable": true,
+      "max_backoff_s": 30,
+      "offline_timeout_s": 10
+    }
+  },
+  {
+    "id": "cam_e4fdd6",
+    "name": "2号机",
+    "enabled": true,
+    "ip": "192.168.1.65",
+    "port": 8000,
+    "username": "admin",
+    "password": "env:OILCHECK_CAM_PASSWORD",
+    "total_detections": 0,
+    "channel": 1,
+    "stream_type": "main",
+    "preferred_mode": "decode",
+    "reconnect": {
+      "enable": true,
+      "max_backoff_s": 30,
+      "offline_timeout_s": 10
+    }
+  }
+]

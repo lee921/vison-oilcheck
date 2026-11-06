@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+logs/
+snapshots/
+recordings/
+data/
+*.bmp
+*.mp4
+# 海康 SDK 运行时日志（含设备 IP 等现场信息）
+SdkLog_*/
+SDKLOG/
+*.log
