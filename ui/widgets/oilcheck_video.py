@@ -39,9 +39,10 @@ class OilCheckVideoView(QWidget):
         self._banner = ""
         self._hint = "等待视频帧"
         self._hand_label = "hand"
-        self._rod_label = "rod"
-        self._brush_label = "brush"
-        self._tray_label = "tray"
+        self._screw_label = "screw"
+        self._brush_label = "brush_head"
+        self._brush_rod_label = "brush_rod"
+        self._tray_label = "oil_tray"
 
     def set_frame(self, bgr: np.ndarray, ts: float) -> bool:
         if bgr is None or getattr(bgr, "size", 0) == 0:
@@ -67,16 +68,18 @@ class OilCheckVideoView(QWidget):
         detections: tuple[Detection, ...],
         banner: str = "",
         hand_label: str = "hand",
-        rod_label: str = "rod",
-        brush_label: str = "brush",
-        tray_label: str = "tray",
+        screw_label: str = "screw",
+        brush_label: str = "brush_head",
+        brush_rod_label: str = "brush_rod",
+        tray_label: str = "oil_tray",
     ) -> None:
         self._rois = rois
         self._detections = detections
         self._banner = banner
         self._hand_label = hand_label
-        self._rod_label = rod_label
+        self._screw_label = screw_label
         self._brush_label = brush_label
+        self._brush_rod_label = brush_rod_label
         self._tray_label = tray_label
         self.update()
 
@@ -190,10 +193,12 @@ class OilCheckVideoView(QWidget):
             base_label = det.label.split("#", 1)[0]
             if base_label == self._hand_label:
                 color = QColor("#ff9f0a")
-            elif base_label == self._rod_label:
+            elif base_label == self._screw_label:
                 color = QColor("#32d74b")
             elif base_label == self._brush_label:
                 color = QColor("#ff375f")
+            elif base_label == self._brush_rod_label:
+                color = QColor("#bf5af2")
             elif base_label == self._tray_label:
                 color = QColor("#ffd60a")
             else:
@@ -208,6 +213,12 @@ class OilCheckVideoView(QWidget):
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(box_rect)
+
+            if det.point is not None:
+                point = self._map_point(det.point[0], det.point[1], image_rect)
+                painter.setBrush(color)
+                painter.drawEllipse(point, 4.0, 4.0)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
 
             label = f"{det.label} {det.confidence:.2f}"
             text_rect = QRectF(

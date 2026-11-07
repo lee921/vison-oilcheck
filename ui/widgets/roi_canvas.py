@@ -10,13 +10,18 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from app.oilcheck.roi import Roi
 
 ROI_COLORS = {
-    "pick": QColor("#32d74b"),
-    "oiling": QColor("#64d2ff"),
+    "tray": QColor("#ffd60a"),
+    "hand": QColor("#64d2ff"),
+    "brush": QColor("#ff375f"),
+    "exclude": QColor("#8a8f98"),
 }
 ROI_NAMES = {
-    "pick": "盘体/取料区",
-    "oiling": "二次涂油区",
+    "tray": "涂油盘区",
+    "hand": "手持操作区",
+    "brush": "刷涂区",
+    "exclude": "排除区（物料盒）",
 }
+ROI_KEYS = tuple(ROI_NAMES)
 
 
 class RoiCanvas(QWidget):
@@ -30,8 +35,8 @@ class RoiCanvas(QWidget):
 
         self._image: QImage | None = None
         self._source_size: tuple[int, int] = (0, 0)
-        self._rois: dict[str, Roi | None] = {"pick": None, "oiling": None}
-        self._mode = "pick"
+        self._rois: dict[str, Roi | None] = {key: None for key in ROI_KEYS}
+        self._mode = "tray"
         self._editable = False
         self._drag_start: QPointF | None = None
         self._drag_end: QPointF | None = None
@@ -59,8 +64,8 @@ class RoiCanvas(QWidget):
         self._hint = hint
         self.update()
 
-    def set_rois(self, pick: Roi | None, oiling: Roi | None) -> None:
-        self._rois = {"pick": pick, "oiling": oiling}
+    def set_rois(self, rois: dict[str, Roi | None]) -> None:
+        self._rois = {key: rois.get(key) for key in ROI_KEYS}
         self.update()
 
     def set_mode(self, mode: str) -> None:
@@ -172,6 +177,8 @@ class RoiCanvas(QWidget):
             color = ROI_COLORS.get(key, QColor("#ffffff"))
             pen = QPen(color)
             pen.setWidth(3 if key == self._mode else 2)
+            if key == "exclude":
+                pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             points = roi.pixel_points(src_w, src_h)

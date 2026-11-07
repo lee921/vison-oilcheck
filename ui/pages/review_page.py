@@ -75,7 +75,7 @@ class ReviewPage(QWidget):
         self._table = TableWidget()
         self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels(
-            ["时间", "工位", "物料", "事件", "结果", "复核", "片段"]
+            ["时间", "工位", "任务", "事件", "结果", "复核", "片段"]
         )
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -138,7 +138,7 @@ class ReviewPage(QWidget):
             values = (
                 format_timestamp(event.timestamp_end),
                 event.station_id,
-                event.logical_part_id,
+                event.task_id,
                 event.event_label,
                 event.result_label,
                 event.review_label,
@@ -197,7 +197,7 @@ class ReviewPage(QWidget):
             return
         InfoBar.success(
             "已记录复核",
-            f"{updated.logical_part_id} → {updated.review_label}",
+            f"{updated.task_id} → {updated.review_label}",
             position=InfoBarPosition.TOP_RIGHT,
             duration=1500,
             parent=self,

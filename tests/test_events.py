@@ -21,8 +21,7 @@ def _event(ts: float | None = None) -> EventRecord:
         camera_id="cam_test",
         event_type=EventType.PICK,
         result=EventResult.NEEDS_REVIEW,
-        logical_part_id="ST01-S01-P0001",
-        slot_index=1,
+        task_id="TASK-000001",
         cycle_id="TEST",
         evidence={"reason": "test"},
     )
@@ -39,13 +38,14 @@ def test_event_store_persists_and_reloads(tmp_path):
     assert data["event_id"] == event.event_id
     assert data["event_type"] == "PICK"
     assert data["result"] == "NEEDS_REVIEW"
+    assert data["task_id"] == "TASK-000001"
     assert data["timestamp_start"]
 
     loaded = EventStore(tmp_path)
     assert loaded.load_recent(days=1) == 1
     restored = loaded.get(event.event_id)
     assert restored is not None
-    assert restored.logical_part_id == event.logical_part_id
+    assert restored.task_id == event.task_id
     assert restored.review_result is None
 
 

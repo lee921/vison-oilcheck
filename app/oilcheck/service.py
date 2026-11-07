@@ -51,6 +51,7 @@ class _StationRuntime:
     )
     busy: bool = False
     last_frame_ts: float = 0.0
+    dropped_frames: int = 0
     last_snapshot: StationSnapshot | None = None
     last_error: str = ""
     closed: bool = False
@@ -183,7 +184,7 @@ class OilCheckService:
                 camera_id=station.camera_id,
                 mode=station.detector.kind,
                 online=False,
-                operations=(),
+                tasks=(),
             )
         snapshot = runtime.last_snapshot or runtime.pipeline.snapshot()
         session = self._manager.get_session(snapshot.camera_id)
@@ -205,6 +206,7 @@ class OilCheckService:
                 camera_state = "demo"
         stats = dict(snapshot.stats)
         stats["camera_state"] = camera_state
+        stats["dropped_frames"] = runtime.dropped_frames
         if runtime.last_error:
             stats["last_error"] = runtime.last_error
         stats["detector_override"] = self._detector_overrides.get(station_id, "")
@@ -245,16 +247,21 @@ class OilCheckService:
             limit, station_id=station_id, pending_only=pending_only
         )
 
-    def count_materials(self) -> dict[str, int]:
+    def count_tasks(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         with self._lock:
             runtimes = list(self._runtimes.values())
         for runtime in runtimes:
             snapshot = runtime.last_snapshot or runtime.pipeline.snapshot()
-            for material in snapshot.materials:
-                key = material.state.value
+            for task in snapshot.tasks:
+                key = task.final_result.value
                 counts[key] = counts.get(key, 0) + 1
         return counts
+
+    def count_materials(self) -> dict[str, int]:
+        """兼容旧 UI 命名：物料统计即任务统计。"""
+
+        return self.count_tasks()
 
     # ------------------------------------------------------------------
     # 操作接口
@@ -404,6 +411,7 @@ class OilCheckService:
             recorder.submit(frame.ts, frame.bgr)
 
         if runtime.busy:
+            runtime.dropped_frames += 1
             return
         runtime.busy = True
         try:
@@ -525,10 +533,9 @@ def _station_meta(station: StationConfig | None) -> dict[str, Any]:
         "station_id": station.station_id,
         "station_name": station.name,
         "rois": {
-            "pick_roi": station.pick_roi.to_dict(),
-            "oiling_roi": station.oiling_roi.to_dict(),
-            "tray_roi": (station.tray_roi or station.pick_roi).to_dict(),
-            "slot_layout": [layout.to_dict() for layout in station.slot_layout],
-            "slots": [slot.to_dict() for slot in station.slots],
+            "tray_roi": station.tray_roi.to_dict(),
+            "hand_roi": station.hand_roi.to_dict(),
+            "brush_roi": station.brush_roi.to_dict(),
+            "exclude_rois": [roi.to_dict() for roi in station.exclude_rois],
         },
     }

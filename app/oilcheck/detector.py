@@ -4,10 +4,11 @@
 
 1. 定义稳定的检测结果契约（:class:`FrameDetections`）；
 2. 提供 ``null`` 与 ``simulated`` 两种实现，保证无模型时 UI/状态机可运行；
-3. 提供 YOLO 适配器骨架，后续接入外部项目导出的权重。
+3. 提供 YOLO 适配器骨架（Detect / OBB / Keypoint），后续接入外部项目导出的权重。
 
-检测器只负责“这一帧里有什么”，不做跨帧判断；跨帧证据与状态流转在
-``pipeline.py`` 中完成。
+类别按实现文档第 4 节：``screw``、``hand``、``brush_head`` 为核心，
+``brush_rod``、``oil_tray`` 为辅助。检测器只负责“这一帧里有什么”，
+跨帧证据与状态流转在 ``pipeline.py`` 中完成。
 """
 
 from __future__ import annotations
@@ -15,11 +16,11 @@ from __future__ import annotations
 import math
 import time
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
-from .config import DetectorConfig, StationConfig, default_slot_layouts
+from .config import DetectorConfig, StationConfig
 from .roi import Roi
 from .types import BBox, Detection, FrameDetections
 
@@ -38,7 +39,7 @@ class Detector(Protocol):
 class NullDetector:
     """不产生任何检测结果。
 
-    第一阶段未接入模型时使用。状态机会稳定停留在“待取料”，不会伪造事件，
+    第一阶段未接入模型时使用。状态机会稳定停留在“等待取料”，不会伪造事件，
     适合先验证相机、ROI、录制和 UI。
     """
 
@@ -55,16 +56,16 @@ class NullDetector:
 
 
 class SimulatedDetector:
-    """演示检测器：机器涂油盘上下移动、4 个槽位、取料与刷子涂油。
+    """演示检测器：模拟“取出一根丝杆 → 手持 → 刷头刷涂”的完整周期。
 
-    每个周期的脚本：
+    每个周期的脚本（按 ``cycle_seconds`` 归一化）：
 
-    1. 手部接近一个 OCCUPIED 槽位并取走丝杆；
-    2. 手部把丝杆带到人工涂油区；
-    3. 刷子在丝杆附近做往复运动，提供“相对物料运动”证据；
-    4. 其他槽位保持 OCCUPIED，模拟机器继续处理其他物料。
+    1. 涂油盘内有多根丝杆，手从画面下方接近其中一根；
+    2. 手与丝杆共同移动到手持操作区；
+    3. 刷头进入丝杆邻域，沿丝杆轴向做往复运动，覆盖全部区段；
+    4. 刷头离开，丝杆仍被手持；手返回，下一周期重新上料。
 
-    演示数据不是真实现场结果，仅用于验证盘体/槽位/操作状态机和 UI。
+    演示数据不是真实现场结果，仅用于验证状态机与 UI。
     """
 
     name = "simulated"
@@ -75,7 +76,7 @@ class SimulatedDetector:
         self._start_ts: float | None = None
         self._cycle = max(12.0, float(cfg.cycle_seconds))
         self._cycle_index = -1
-        self._operation_slot = 1
+        self._operation_index = 0
 
     def close(self) -> None:
         return None
@@ -93,118 +94,136 @@ class SimulatedDetector:
         phase = (elapsed % self._cycle) / self._cycle
         if cycle_index != self._cycle_index:
             self._cycle_index = cycle_index
-            self._operation_slot = (cycle_index % 4) + 1
+            self._operation_index = cycle_index % 4
 
         tray_box = self._tray_box(w=w, h=h, elapsed=elapsed)
-        layouts = self._station.slot_layout or default_slot_layouts(4)
         detections: list[Detection] = [
-            Detection(
-                label=self._cfg.tray_label,
-                confidence=0.92,
-                box=tray_box,
-            )
+            Detection(label=self._cfg.tray_label, confidence=0.92, box=tray_box)
         ]
 
-        pick_phase = 0.22
-        oil_start = 0.32
-        oil_end = 0.64
-        leave_phase = 0.78
-        reload_phase = 0.96
+        approach_end = 0.26
+        move_end = 0.40
+        brush_start = 0.44
+        brush_end = 0.68
+        release_phase = 0.80
+        reload_phase = 0.94
 
-        operation_layout = None
-        for layout in layouts:
-            if layout.index == self._operation_slot:
-                operation_layout = layout
-                break
-        if operation_layout is None:
-            operation_layout = layouts[0]
-
-        slot_boxes = {layout.index: layout.pixel_bbox(tray_box) for layout in layouts}
-        picked = phase >= pick_phase and phase < reload_phase
-        for layout in layouts:
-            empty = layout.index == operation_layout.index and picked
-            if empty:
-                continue
-            slot_box = slot_boxes[layout.index]
-            detections.append(
-                Detection(
-                    label=self._cfg.rod_label,
-                    confidence=0.90,
-                    box=_shrink_box(slot_box, 0.55),
+        screw_boxes = self._tray_screw_boxes(tray_box, w=w, h=h)
+        picked = self._operation_index
+        tray_screws_visible = phase < approach_end or phase >= reload_phase
+        if tray_screws_visible:
+            for box in screw_boxes:
+                detections.append(
+                    Detection(
+                        label=self._cfg.screw_label,
+                        confidence=0.90,
+                        box=box,
+                        angle=math.pi * 0.5,
+                    )
                 )
-            )
+        else:
+            for index, box in enumerate(screw_boxes):
+                if index != picked:
+                    detections.append(
+                        Detection(
+                            label=self._cfg.screw_label,
+                            confidence=0.90,
+                            box=box,
+                            angle=math.pi * 0.5,
+                        )
+                    )
 
-        slot_center = slot_boxes[operation_layout.index].center
-        oil_box = self._station.oiling_roi.pixel_bbox(w, h)
-        oil_center = oil_box.center
-        hand_center: tuple[float, float] | None = None
+        target_center = screw_boxes[picked].center
+        hand_box = self._station.hand_roi.pixel_bbox(w, h)
+        hand_center = hand_box.center
+        start_center = (target_center[0], min(h * 0.98, target_center[1] + h * 0.25))
+
+        hand_center_now: tuple[float, float] | None = None
         held_center: tuple[float, float] | None = None
 
-        if 0.04 <= phase < pick_phase:
-            # 手部从画面下方接近目标槽位，手框覆盖槽位造成短时遮挡。
-            t = _smoothstep((phase - 0.04) / max(1e-6, pick_phase - 0.04))
-            start = (slot_center[0], min(h * 0.98, slot_center[1] + h * 0.22))
-            hand_center = (
-                _lerp(start[0], slot_center[0], t),
-                _lerp(start[1], slot_center[1], t),
+        if 0.02 <= phase < approach_end:
+            t = _smoothstep(
+                (phase - 0.02) / max(1e-6, approach_end - 0.02)
             )
-        elif pick_phase <= phase < oil_start:
-            # 取走丝杆并移动到人工涂油区。
-            t = _smoothstep((phase - pick_phase) / max(1e-6, oil_start - pick_phase))
-            hand_center = (
-                _lerp(slot_center[0], oil_center[0], t),
-                _lerp(slot_center[1], oil_center[1], t),
+            hand_center_now = (
+                _lerp(start_center[0], target_center[0], t),
+                _lerp(start_center[1], target_center[1], t),
             )
-            held_center = hand_center
-        elif oil_start <= phase < oil_end:
-            # 在涂油区小幅移动，手中丝杆始终跟随。
-            angle = (phase - oil_start) / max(1e-6, oil_end - oil_start)
-            offset = math.sin(angle * math.pi * 2.0) * oil_box.width * 0.04
-            hand_center = (oil_center[0] + offset, oil_center[1])
-            held_center = hand_center
-        elif oil_end <= phase < leave_phase:
-            # 涂完后手部离开涂油区，不产生新的涂油证据。
-            t = _smoothstep((phase - oil_end) / max(1e-6, leave_phase - oil_end))
-            hand_center = (
-                _lerp(oil_center[0], slot_center[0], t),
-                _lerp(oil_center[1], slot_center[1], t),
+        elif approach_end <= phase < move_end:
+            t = _smoothstep(
+                (phase - approach_end) / max(1e-6, move_end - approach_end)
             )
-            held_center = hand_center
+            hand_center_now = (
+                _lerp(target_center[0], hand_center[0], t),
+                _lerp(target_center[1], hand_center[1], t),
+            )
+            held_center = hand_center_now
+        elif move_end <= phase < release_phase:
+            # 手持丝杆在操作区内轻微移动；刷涂时可以更稳定地保持中心。
+            angle = (phase - move_end) / max(1e-6, release_phase - move_end)
+            offset = math.sin(angle * math.pi * 2.0) * hand_box.width * 0.05
+            hand_center_now = (hand_center[0] + offset, hand_center[1])
+            held_center = hand_center_now
+        elif release_phase <= phase < reload_phase:
+            t = _smoothstep(
+                (phase - release_phase) / max(1e-6, reload_phase - release_phase)
+            )
+            hand_center_now = (
+                _lerp(hand_center[0], start_center[0], t),
+                _lerp(hand_center[1], start_center[1], t),
+            )
 
-        if hand_center is not None:
+        if hand_center_now is not None:
             detections.append(
                 Detection(
                     label=self._cfg.hand_label,
                     confidence=0.90,
-                    box=_box_around(hand_center, w, h),
-                )
-            )
-        if held_center is not None and phase < leave_phase:
-            detections.append(
-                Detection(
-                    label=self._cfg.rod_label,
-                    confidence=0.86,
-                    box=_held_rod_box(held_center, w, h),
+                    box=_box_around(hand_center_now, w, h, ratio=0.09),
                 )
             )
 
-        if oil_start + 0.04 <= phase < oil_end - 0.04 and held_center is not None:
-            # 刷子相对丝杆做往复运动：横向和纵向都有位移，提供相对运动证据。
-            angle = (phase - oil_start) / max(1e-6, oil_end - oil_start)
-            swing = math.sin(angle * math.pi * 6.0)
-            amp_x = max(12.0, w * 0.035)
-            amp_y = max(8.0, h * 0.018)
-            brush_center = (
-                held_center[0] + swing * amp_x,
-                held_center[1] + math.cos(angle * math.pi * 6.0) * amp_y,
+        if held_center is not None:
+            screw_box = _held_screw_box(held_center, w, h)
+            detections.append(
+                Detection(
+                    label=self._cfg.screw_label,
+                    confidence=0.88,
+                    box=screw_box,
+                    angle=0.0,
+                )
+            )
+
+        if brush_start <= phase < brush_end and held_center is not None:
+            t = (phase - brush_start) / max(1e-6, brush_end - brush_start)
+            # 刷头工作端沿丝杆轴向来回移动，覆盖整根丝杆。
+            screw_box = _held_screw_box(held_center, w, h)
+            half_len = screw_box.width * 0.46
+            work_point = (
+                held_center[0] + math.sin(t * math.pi * 8.0) * half_len,
+                held_center[1],
             )
             detections.append(
                 Detection(
-                    label=self._cfg.brush_label,
+                    label=self._cfg.brush_head_label,
                     confidence=0.87,
-                    box=_brush_box(brush_center, w, h),
+                    box=_brush_head_box(work_point, w),
+                    point=work_point,
                 )
             )
+            if self._cfg.brush_rod_label:
+                detections.append(
+                    Detection(
+                        label=self._cfg.brush_rod_label,
+                        confidence=0.80,
+                        box=BBox(
+                            work_point[0],
+                            work_point[1] - max(6.0, h * 0.01),
+                            work_point[0] + max(70.0, w * 0.06),
+                            work_point[1] + max(6.0, h * 0.01),
+                        ),
+                        angle=0.0,
+                    )
+                )
 
         return FrameDetections(
             ts=now,
@@ -214,21 +233,34 @@ class SimulatedDetector:
         )
 
     def _tray_box(self, *, w: int, h: int, elapsed: float) -> BBox:
-        base = (self._station.tray_roi or self._station.pick_roi).pixel_bbox(w, h)
-        tray_w = max(40.0, base.width * 0.86)
-        tray_h = max(30.0, base.height * 0.72)
+        base = self._station.tray_roi.pixel_bbox(w, h)
+        tray_w = max(60.0, base.width * 0.88)
+        tray_h = max(40.0, base.height * 0.74)
         cx = base.center[0]
-        cy = base.center[1] + math.sin(elapsed * math.pi / 3.0) * base.height * 0.10
+        cy = base.center[1] + math.sin(elapsed * math.pi / 3.0) * base.height * 0.08
         x1 = max(0.0, min(float(w) - tray_w, cx - tray_w * 0.5))
         y1 = max(0.0, min(float(h) - tray_h, cy - tray_h * 0.5))
         return BBox(x1, y1, x1 + tray_w, y1 + tray_h)
 
+    def _tray_screw_boxes(self, tray: BBox, *, w: int, h: int) -> list[BBox]:
+        boxes: list[BBox] = []
+        for ratio in (0.18, 0.40, 0.62, 0.84):
+            cx = tray.x1 + tray.width * ratio
+            cy = tray.center[1]
+            rw = max(8.0, w * 0.009)
+            rh = max(36.0, tray.height * 0.42)
+            boxes.append(BBox(cx - rw, cy - rh * 0.5, cx + rw, cy + rh * 0.5))
+        return boxes
+
 
 class YoloDetector:
-    """外部训练项目导出权重的适配器骨架。
+    """外部训练项目导出权重的适配器。
 
-    本版本不把 ``ultralytics`` 作为依赖，调用时会给出明确错误。接入步骤见
-    ``docs/04-视觉检测管线.md``。
+    支持 Ultralytics 的普通检测框、OBB 与关键点输出：
+
+    - 普通框：``angle`` 为空，流水线用框的长边估计丝杆主轴；
+    - OBB：读取长轴角度；
+    - 关键点：每个实例的第一个关键点作为 ``point``（刷头工作端）。
     """
 
     name = "yolo"
@@ -268,23 +300,14 @@ class YoloDetector:
         if results:
             result = results[0]
             names = getattr(result, "names", {}) or {}
-            boxes = getattr(result, "boxes", None)
-            if boxes is not None:
-                for box in boxes:
-                    try:
-                        cls_id = int(box.cls[0])
-                        conf = float(box.conf[0])
-                        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-                    except (IndexError, TypeError, ValueError):
-                        continue
-                    label = str(names.get(cls_id, cls_id))
-                    detections.append(
-                        Detection(
-                            label=label,
-                            confidence=conf,
-                            box=BBox(x1, y1, x2, y2),
-                        )
-                    )
+            points = _keypoint_points(result)
+            obb = getattr(result, "obb", None)
+            if obb is not None and len(obb) > 0:
+                detections.extend(_detections_from_obb(obb, names, points))
+            else:
+                boxes = getattr(result, "boxes", None)
+                if boxes is not None:
+                    detections.extend(_detections_from_boxes(boxes, names, points))
 
         return FrameDetections(
             ts=float(ts),
@@ -310,21 +333,128 @@ def create_detector(
     return NullDetector()
 
 
-def _box_around(center: tuple[float, float], width: int, height: int) -> BBox:
-    size = max(48.0, min(width, height) * 0.16)
+def _keypoint_points(result: Any) -> list[tuple[float, float] | None]:
+    keypoints = getattr(result, "keypoints", None)
+    if keypoints is None:
+        return []
+    xy = getattr(keypoints, "xy", None)
+    if xy is None:
+        return []
+    try:
+        data = xy.tolist()
+    except (AttributeError, TypeError, ValueError):
+        return []
+    points: list[tuple[float, float] | None] = []
+    for instance in data:
+        if not instance:
+            points.append(None)
+            continue
+        first = instance[0]
+        try:
+            points.append((float(first[0]), float(first[1])))
+        except (IndexError, TypeError, ValueError):
+            points.append(None)
+    return points
+
+
+def _label(names: Any, cls_id: int) -> str:
+    try:
+        return str(names.get(cls_id, cls_id))
+    except AttributeError:
+        return str(cls_id)
+
+
+def _detections_from_boxes(
+    boxes: Any,
+    names: Any,
+    points: list[tuple[float, float] | None],
+) -> list[Detection]:
+    items: list[Detection] = []
+    for index, box in enumerate(boxes):
+        try:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+        except (IndexError, TypeError, ValueError):
+            continue
+        items.append(
+            Detection(
+                label=_label(names, cls_id),
+                confidence=conf,
+                box=BBox(x1, y1, x2, y2),
+                point=points[index] if index < len(points) else None,
+            )
+        )
+    return items
+
+
+def _detections_from_obb(
+    obb: Any,
+    names: Any,
+    points: list[tuple[float, float] | None],
+) -> list[Detection]:
+    items: list[Detection] = []
+    try:
+        xywhr = obb.xywhr.tolist()
+        cls_ids = obb.cls.tolist()
+        confs = obb.conf.tolist()
+    except (AttributeError, TypeError, ValueError):
+        return items
+    for index, (cx, cy, width, height, angle) in enumerate(xywhr):
+        try:
+            cls_id = int(cls_ids[index])
+            conf = float(confs[index])
+        except (IndexError, TypeError, ValueError):
+            continue
+        box = _rotated_bbox(float(cx), float(cy), float(width), float(height), float(angle))
+        items.append(
+            Detection(
+                label=_label(names, cls_id),
+                confidence=conf,
+                box=box,
+                angle=float(angle),
+                point=points[index] if index < len(points) else None,
+            )
+        )
+    return items
+
+
+def _rotated_bbox(
+    cx: float, cy: float, width: float, height: float, angle: float
+) -> BBox:
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    hw, hh = width * 0.5, height * 0.5
+    xs: list[float] = []
+    ys: list[float] = []
+    for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)):
+        xs.append(cx + dx * cos_a - dy * sin_a)
+        ys.append(cy + dx * sin_a + dy * cos_a)
+    return BBox(min(xs), min(ys), max(xs), max(ys))
+
+
+def _box_around(
+    center: tuple[float, float],
+    width: int,
+    height: int,
+    *,
+    ratio: float = 0.16,
+) -> BBox:
+    size = max(48.0, min(width, height) * ratio)
     cx, cy = center
     return BBox(cx - size * 0.5, cy - size * 0.5, cx + size * 0.5, cy + size * 0.5)
 
 
-def _held_rod_box(center: tuple[float, float], width: int, height: int) -> BBox:
-    rw = max(24.0, width * 0.10)
-    rh = max(12.0, height * 0.045)
+def _held_screw_box(
+    center: tuple[float, float], width: int, height: int
+) -> BBox:
+    rw = max(70.0, width * 0.09)
+    rh = max(10.0, height * 0.025)
     cx, cy = center
     return BBox(cx - rw * 0.5, cy - rh * 0.5, cx + rw * 0.5, cy + rh * 0.5)
 
 
-def _brush_box(center: tuple[float, float], width: int, height: int) -> BBox:
-    size = max(14.0, min(width, height) * 0.025)
+def _brush_head_box(center: tuple[float, float], width: int) -> BBox:
+    size = max(14.0, width * 0.018)
     cx, cy = center
     return BBox(
         cx - size * 0.5,
@@ -332,13 +462,6 @@ def _brush_box(center: tuple[float, float], width: int, height: int) -> BBox:
         cx + size * 0.5,
         cy + size * 0.5,
     )
-
-
-def _shrink_box(box: BBox, ratio: float) -> BBox:
-    cx, cy = box.center
-    half_w = box.width * ratio * 0.5
-    half_h = box.height * ratio * 0.5
-    return BBox(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
 
 def _lerp(a: float, b: float, t: float) -> float:
@@ -357,5 +480,5 @@ def now_ts() -> float:
 def roi_inside_station(
     roi: Roi, station: StationConfig, width: int, height: int
 ) -> bool:
-    """调试辅助：判断 ROI 是否落在工位取料区内。"""
-    return station.pick_roi.intersects_box(roi.pixel_bbox(width, height), width, height)
+    """调试辅助：判断 ROI 是否落在工位有效推理区域内。"""
+    return station.tray_roi.intersects_box(roi.pixel_bbox(width, height), width, height)

@@ -2,6 +2,13 @@
 
 本模块只放纯数据定义，不依赖 Qt、相机 SDK 或具体检测模型，方便单元测试与
 后续替换推理实现。
+
+模型对应《涂油工位视觉检测项目实现文档》：
+
+- 视觉 Track ID 与业务任务 ID 分离；
+- 单根丝杆任务（:class:`TaskSnapshot`）是唯一业务对象；
+- 取料、手持、刷涂分别有独立状态字段，最终结果为 OK / NG /
+  PENDING_CONFIRMATION / PROCESSING。
 """
 
 from __future__ import annotations
@@ -14,70 +21,111 @@ from enum import Enum
 from typing import Any
 
 
-class SlotOccupancy(str, Enum):
-    """机器涂油盘单个槽位的占用状态（设计文档 5.3）。"""
+class PickStatus(str, Enum):
+    """取料状态（文档 5.1 / 10）。"""
 
-    OCCUPIED = "OCCUPIED"
-    EMPTY = "EMPTY"
+    CANDIDATE = "CANDIDATE"
+    CONFIRMED = "CONFIRMED"
     UNKNOWN = "UNKNOWN"
 
 
-SLOT_OCCUPANCY_LABELS: dict[SlotOccupancy, str] = {
-    SlotOccupancy.OCCUPIED: "有物料",
-    SlotOccupancy.EMPTY: "空槽",
-    SlotOccupancy.UNKNOWN: "未知",
+PICK_STATUS_LABELS: dict[PickStatus, str] = {
+    PickStatus.CANDIDATE: "取料候选",
+    PickStatus.CONFIRMED: "取料已确认",
+    PickStatus.UNKNOWN: "取料未知",
 }
 
 
-class Visibility(str, Enum):
-    """槽位当前是否具备可靠可见证据。"""
+class HoldingStatus(str, Enum):
+    """手持丝杆关联状态（文档 6 / 10）。"""
 
-    VISIBLE = "VISIBLE"
-    OCCLUDED = "OCCLUDED"
-    UNRELIABLE = "UNRELIABLE"
+    HOLDING = "HOLDING"
+    LOST = "LOST"
+    RELEASED = "RELEASED"
 
 
-VISIBILITY_LABELS: dict[Visibility, str] = {
-    Visibility.VISIBLE: "可见",
-    Visibility.OCCLUDED: "遮挡",
-    Visibility.UNRELIABLE: "定位不可靠",
+HOLDING_STATUS_LABELS: dict[HoldingStatus, str] = {
+    HoldingStatus.HOLDING: "手持中",
+    HoldingStatus.LOST: "已丢失",
+    HoldingStatus.RELEASED: "已结束",
 }
 
 
-class OperationState(str, Enum):
-    """逐根逻辑物料的二次涂油状态（设计文档 7.2）。"""
+class OilingStatus(str, Enum):
+    """二次涂油进程状态（文档 7 / 10）。"""
 
-    NOT_STARTED = "NOT_STARTED"
-    PICKED = "PICKED"
-    OILING_CANDIDATE = "OILING_CANDIDATE"
+    WAITING = "WAITING"
+    CONTACT = "CONTACT"
+    BRUSHING = "BRUSHING"
+    COMPLETED = "COMPLETED"
+
+
+OILING_STATUS_LABELS: dict[OilingStatus, str] = {
+    OilingStatus.WAITING: "等待刷涂",
+    OilingStatus.CONTACT: "刷头接触",
+    OilingStatus.BRUSHING: "有效刷涂",
+    OilingStatus.COMPLETED: "刷涂完成",
+}
+
+
+class TaskStage(str, Enum):
+    """业务状态机阶段（文档 8）。"""
+
+    WAITING_PICK = "WAITING_PICK"
+    PICK_CANDIDATE = "PICK_CANDIDATE"
+    LEAVING_TRAY = "LEAVING_TRAY"
+    PICK_CONFIRMED = "PICK_CONFIRMED"
+    HOLDING = "HOLDING"
+    BRUSH_CONTACT = "BRUSH_CONTACT"
+    BRUSHING = "BRUSHING"
+    OILING_COMPLETED = "OILING_COMPLETED"
     PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
-    IDENTITY_UNCERTAIN = "IDENTITY_UNCERTAIN"
-    OILING_CONFIRMED = "OILING_CONFIRMED"
+    NG = "NG"
 
 
-OPERATION_STATE_LABELS: dict[OperationState, str] = {
-    OperationState.NOT_STARTED: "未开始",
-    OperationState.PICKED: "已取料",
-    OperationState.OILING_CANDIDATE: "涂油候选",
-    OperationState.PENDING_CONFIRMATION: "待确认",
-    OperationState.IDENTITY_UNCERTAIN: "身份不确定",
-    OperationState.OILING_CONFIRMED: "二次涂油已确认",
+TASK_STAGE_LABELS: dict[TaskStage, str] = {
+    TaskStage.WAITING_PICK: "等待取料",
+    TaskStage.PICK_CANDIDATE: "取料候选",
+    TaskStage.LEAVING_TRAY: "离开涂油盘",
+    TaskStage.PICK_CONFIRMED: "取料确认",
+    TaskStage.HOLDING: "手持跟踪",
+    TaskStage.BRUSH_CONTACT: "刷头接触",
+    TaskStage.BRUSHING: "二次涂油中",
+    TaskStage.OILING_COMPLETED: "二次涂油完成",
+    TaskStage.PENDING_CONFIRMATION: "待确认",
+    TaskStage.NG: "不合格",
 }
 
-UNCONFIRMED_STATES = {
-    OperationState.PENDING_CONFIRMATION,
-    OperationState.IDENTITY_UNCERTAIN,
+
+class TaskResult(str, Enum):
+    """任务最终结果（文档 8 / 10）。"""
+
+    PROCESSING = "PROCESSING"
+    OK = "OK"
+    NG = "NG"
+    PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
+
+
+TASK_RESULT_LABELS: dict[TaskResult, str] = {
+    TaskResult.PROCESSING: "进行中",
+    TaskResult.OK: "合格",
+    TaskResult.NG: "不合格",
+    TaskResult.PENDING_CONFIRMATION: "待确认",
 }
 
 
 class EventType(str, Enum):
     PICK = "PICK"
+    BRUSH_CONTACT = "BRUSH_CONTACT"
     MANUAL_OILING = "MANUAL_OILING"
+    TASK_RESULT = "TASK_RESULT"
 
 
 EVENT_TYPE_LABELS: dict[EventType, str] = {
     EventType.PICK: "取料",
+    EventType.BRUSH_CONTACT: "刷头接触",
     EventType.MANUAL_OILING: "人工二次涂油",
+    EventType.TASK_RESULT: "任务结果",
 }
 
 
@@ -128,6 +176,10 @@ class BBox:
     def center(self) -> tuple[float, float]:
         return ((self.x1 + self.x2) * 0.5, (self.y1 + self.y2) * 0.5)
 
+    @property
+    def size(self) -> float:
+        return max(self.width, self.height)
+
     def as_int_tuple(self) -> tuple[int, int, int, int]:
         return (int(self.x1), int(self.y1), int(self.x2), int(self.y2))
 
@@ -151,15 +203,31 @@ class BBox:
         union = self.width * self.height + other.width * other.height - inter
         return 0.0 if union <= 0 else inter / union
 
+    def long_axis(self) -> tuple[float, float]:
+        """由水平框估计主轴方向（单位向量）。
+
+        有 OBB 时检测器应在 :class:`Detection` 中提供 ``angle``，这里只作为
+        没有角度信息时的兜底。
+        """
+
+        angle = 0.0 if self.width >= self.height else 1.5707963267948966
+        return (1.0, 0.0) if angle == 0.0 else (0.0, 1.0)
+
 
 @dataclass(frozen=True)
 class Detection:
-    """一帧中的单个目标检测结果。"""
+    """一帧中的单个目标检测结果。
+
+    ``angle`` 为 OBB 长轴角度（弧度，0 表示水平向右），可选。
+    ``point`` 为关键点（例如刷头工作端），可选；没有时由检测框推算。
+    """
 
     label: str
     confidence: float
     box: BBox
     track_id: int | None = None
+    angle: float | None = None
+    point: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -186,31 +254,8 @@ class FrameDetections:
 
 
 @dataclass(frozen=True)
-class SlotSnapshot:
-    """机器涂油盘单个槽位的实时状态。"""
-
-    slot_index: int
-    slot_name: str
-    occupancy: SlotOccupancy
-    visibility: Visibility
-    confidence: float | None
-    last_change_ts: float
-    reason: str
-    box: BBox | None = None
-    last_observed_ts: float | None = None
-
-    @property
-    def occupancy_label(self) -> str:
-        return SLOT_OCCUPANCY_LABELS.get(self.occupancy, self.occupancy.value)
-
-    @property
-    def visibility_label(self) -> str:
-        return VISIBILITY_LABELS.get(self.visibility, self.visibility.value)
-
-
-@dataclass(frozen=True)
 class TraySnapshot:
-    """机器涂油盘定位结果。"""
+    """涂油盘定位结果（只作为取料参考区域，不识别槽位）。"""
 
     track_id: int | None
     box: BBox | None
@@ -224,7 +269,7 @@ class TraySnapshot:
 
 @dataclass(frozen=True)
 class TrackSnapshot:
-    """手部或刷子的跟踪快照。"""
+    """丝杆/手部/刷头的跟踪快照。"""
 
     track_id: int
     label: str
@@ -233,35 +278,66 @@ class TrackSnapshot:
     observed: bool
     missing_s: float
     last_seen_ts: float
+    angle: float | None = None
+    point: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
-class OperationSnapshot:
-    """一条人工取料/二次涂油操作记录，供 UI 展示。"""
+class TaskSnapshot:
+    """单根丝杆任务（文档 10 的 ScrewTask），供 UI 展示。"""
 
-    operation_id: str
-    logical_part_id: str
-    source_slot: int
-    slot_name: str
-    state: OperationState
-    state_since: float
-    pickup_status: str = "CONFIRMED"
-    identity_status: str = "ASSOCIATED"
+    task_id: str
+    created_at: float
+    stage: TaskStage
+    stage_since: float
+    pick_status: PickStatus
+    holding_status: HoldingStatus
+    oiling_status: OilingStatus
+    final_result: TaskResult
+    screw_track_id: int | None = None
+    hand_track_id: int | None = None
+    brush_track_id: int | None = None
+    contact_intervals: tuple[tuple[float, float], ...] = ()
+    axis_segments: tuple[bool, ...] = ()
+    coverage: float = 0.0
+    effective_brush_duration_s: float = 0.0
+    brush_motion: float = 0.0
     confidence: float | None = None
     reason_code: str | None = None
     evidence: tuple[str, ...] = ()
-    hand_track_id: int | None = None
-    brush_track_id: int | None = None
     picked_at: float | None = None
+    confirmed_at: float | None = None
+    completed_at: float | None = None
     last_seen_ts: float | None = None
+    timeline: tuple[tuple[str, float], ...] = ()
 
     @property
-    def slot_index(self) -> int:
-        return self.source_slot
+    def stage_label(self) -> str:
+        return TASK_STAGE_LABELS.get(self.stage, self.stage.value)
 
     @property
-    def state_label(self) -> str:
-        return OPERATION_STATE_LABELS.get(self.state, self.state.value)
+    def result_label(self) -> str:
+        return TASK_RESULT_LABELS.get(self.final_result, self.final_result.value)
+
+    @property
+    def pick_label(self) -> str:
+        return PICK_STATUS_LABELS.get(self.pick_status, self.pick_status.value)
+
+    @property
+    def holding_label(self) -> str:
+        return HOLDING_STATUS_LABELS.get(
+            self.holding_status, self.holding_status.value
+        )
+
+    @property
+    def oiling_label(self) -> str:
+        return OILING_STATUS_LABELS.get(
+            self.oiling_status, self.oiling_status.value
+        )
+
+    @property
+    def coverage_percent(self) -> int:
+        return int(round(max(0.0, min(1.0, self.coverage)) * 100))
 
 
 @dataclass(frozen=True)
@@ -273,8 +349,7 @@ class StationSnapshot:
     camera_id: str
     mode: str
     online: bool
-    operations: tuple[OperationSnapshot, ...]
-    slots: tuple[SlotSnapshot, ...] = ()
+    tasks: tuple[TaskSnapshot, ...]
     tray: TraySnapshot | None = None
     tracks: tuple[TrackSnapshot, ...] = ()
     detections: tuple[Detection, ...] = ()
@@ -283,9 +358,14 @@ class StationSnapshot:
     stats: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def materials(self) -> tuple[OperationSnapshot, ...]:
-        """兼容旧 UI/统计代码：物料即人工操作记录。"""
-        return self.operations
+    def operations(self) -> tuple[TaskSnapshot, ...]:
+        """兼容旧 UI/统计命名。"""
+
+        return self.tasks
+
+    @property
+    def materials(self) -> tuple[TaskSnapshot, ...]:
+        return self.tasks
 
 
 @dataclass(frozen=True)
@@ -303,7 +383,7 @@ class RecordingStatus:
 
 @dataclass(frozen=True)
 class EventRecord:
-    """一条流程事件，字段与方案文档第 8 节对应。"""
+    """一条流程事件，字段与实现文档第 8、10 节对应。"""
 
     event_id: str
     timestamp_start: float
@@ -312,8 +392,7 @@ class EventRecord:
     camera_id: str
     event_type: EventType
     result: EventResult
-    logical_part_id: str
-    slot_index: int
+    task_id: str
     cycle_id: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
     clip_reference: str | None = None
@@ -331,8 +410,7 @@ class EventRecord:
         camera_id: str,
         event_type: EventType,
         result: EventResult,
-        logical_part_id: str,
-        slot_index: int,
+        task_id: str,
         cycle_id: str | None = None,
         evidence: dict[str, Any] | None = None,
         clip_reference: str | None = None,
@@ -345,8 +423,7 @@ class EventRecord:
             camera_id=str(camera_id),
             event_type=event_type,
             result=result,
-            logical_part_id=str(logical_part_id),
-            slot_index=int(slot_index),
+            task_id=str(task_id),
             cycle_id=cycle_id,
             evidence=dict(evidence or {}),
             clip_reference=clip_reference,
@@ -366,6 +443,12 @@ class EventRecord:
             return "未复核"
         return REVIEW_RESULT_LABELS.get(self.review_result, self.review_result.value)
 
+    @property
+    def logical_part_id(self) -> str:
+        """兼容旧字段：业务物料即任务。"""
+
+        return self.task_id
+
     def with_review(
         self,
         review_result: ReviewResult,
@@ -380,8 +463,7 @@ class EventRecord:
             camera_id=self.camera_id,
             event_type=self.event_type,
             result=self.result,
-            logical_part_id=self.logical_part_id,
-            slot_index=self.slot_index,
+            task_id=self.task_id,
             cycle_id=self.cycle_id,
             evidence=dict(self.evidence),
             clip_reference=self.clip_reference,
@@ -398,8 +480,7 @@ class EventRecord:
             "station_id": self.station_id,
             "camera_id": self.camera_id,
             "cycle_id": self.cycle_id,
-            "logical_part_id": self.logical_part_id,
-            "slot_index": self.slot_index,
+            "task_id": self.task_id,
             "event_type": self.event_type.value,
             "result": self.result.value,
             "evidence": self.evidence,
@@ -420,6 +501,12 @@ class EventRecord:
                 review = ReviewResult(str(review_raw))
             except ValueError:
                 review = None
+        # 兼容旧事件文件：task_id 缺失时回退到 logical_part_id。
+        task_id = str(
+            data.get("task_id")
+            or data.get("logical_part_id")
+            or ""
+        )
         return cls(
             event_id=str(data.get("event_id", "")),
             timestamp_start=_parse_ts(data.get("timestamp_start")),
@@ -428,8 +515,7 @@ class EventRecord:
             camera_id=str(data.get("camera_id", "")),
             event_type=_enum_or(EventType, data.get("event_type"), EventType.PICK),
             result=_enum_or(EventResult, data.get("result"), EventResult.NEEDS_REVIEW),
-            logical_part_id=str(data.get("logical_part_id", "")),
-            slot_index=int(data.get("slot_index", 0) or 0),
+            task_id=task_id,
             cycle_id=(
                 None if data.get("cycle_id") in (None, "") else str(data["cycle_id"])
             ),

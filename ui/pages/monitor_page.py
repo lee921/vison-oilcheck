@@ -1,10 +1,13 @@
 """实时监控页。
 
-页面结构对应方案第 7 节：
+页面结构尽量保持原样：
 
 - 顶部：系统在线、工位、检测模式、录制状态；
-- 左侧：视频 + 取料 ROI + 二次涂油 ROI + 检测框；
-- 右侧：单根物料状态、最近事件、复核入口。
+- 左侧：视频 + ROI + 检测/跟踪结果；
+- 右侧：检测区域状态、最近任务、最近事件、复核入口。
+
+检测逻辑改为“单根丝杆任务”模型：取料状态、手持状态、刷涂状态与覆盖进度
+直接来自 :class:`TaskSnapshot`。
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -37,56 +41,36 @@ from qfluentwidgets import (
 from app.camera_manager import CameraManager
 from app.config_service import ConfigService
 from app.models import AppConfig
-from app.oilcheck.config import default_slot_layouts
 from app.oilcheck.roi import Roi
 from app.oilcheck.service import OilCheckService
 from app.oilcheck.types import (
     Detection,
-    OperationSnapshot,
-    OperationState,
-    SlotOccupancy,
-    SlotSnapshot,
     StationSnapshot,
-    format_timestamp,
+    TaskResult,
+    TaskSnapshot,
+    TaskStage,
 )
 from ui.utils import UiInvoker
 from ui.widgets.oilcheck_video import OilCheckVideoView, RoiOverlay
 
-STATE_COLORS: dict[OperationState, str] = {
-    OperationState.NOT_STARTED: "#6b7280",
-    OperationState.PICKED: "#2563eb",
-    OperationState.OILING_CANDIDATE: "#d97706",
-    OperationState.PENDING_CONFIRMATION: "#b91c1c",
-    OperationState.IDENTITY_UNCERTAIN: "#7c3aed",
-    OperationState.OILING_CONFIRMED: "#15803d",
+STAGE_COLORS: dict[TaskStage, str] = {
+    TaskStage.WAITING_PICK: "#6b7280",
+    TaskStage.PICK_CANDIDATE: "#d97706",
+    TaskStage.LEAVING_TRAY: "#d97706",
+    TaskStage.PICK_CONFIRMED: "#2563eb",
+    TaskStage.HOLDING: "#2563eb",
+    TaskStage.BRUSH_CONTACT: "#0891b2",
+    TaskStage.BRUSHING: "#7c3aed",
+    TaskStage.OILING_COMPLETED: "#15803d",
+    TaskStage.PENDING_CONFIRMATION: "#b91c1c",
+    TaskStage.NG: "#b91c1c",
 }
 
-SLOT_COLORS: dict[SlotOccupancy, str] = {
-    SlotOccupancy.OCCUPIED: "#15803d",
-    SlotOccupancy.EMPTY: "#6b7280",
-    SlotOccupancy.UNKNOWN: "#b45309",
-}
-
-SLOT_REASON_LABELS = {
-    "INITIAL": "初始化",
-    "RESET": "已重置",
-    "SCREW_STABLE": "稳定有料",
-    "SCREW_STABLE_UNDER_HAND": "遮挡下有料",
-    "CLEAR_EMPTY_EVIDENCE": "稳定空槽",
-    "OCCLUSION_TIMEOUT": "遮挡超时",
-    "TRAY_UNRELIABLE": "盘体不可靠",
-    "NO_TRAY": "未检测到盘体",
-}
-
-PICKUP_STATUS_LABELS = {
-    "CONFIRMED": "已确认",
-    "PENDING": "待确认",
-    "UNCONFIRMED": "未确认",
-}
-
-IDENTITY_STATUS_LABELS = {
-    "ASSOCIATED": "已关联",
-    "UNCERTAIN": "不确定",
+RESULT_COLORS: dict[TaskResult, str] = {
+    TaskResult.PROCESSING: "#374151",
+    TaskResult.OK: "#15803d",
+    TaskResult.NG: "#b91c1c",
+    TaskResult.PENDING_CONFIRMATION: "#b45309",
 }
 
 CAMERA_STATE_LABELS = {
@@ -107,24 +91,24 @@ MODE_LABELS = {
 }
 
 
-class SlotCard(QFrame):
-    """机器涂油盘单个槽位的状态卡片。"""
+class RegionCard(QFrame):
+    """检测区域/跟踪状态卡片（保留原槽位卡片的位置与样式）。"""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("slotCard")
+        self.setObjectName("regionCard")
         self.setStyleSheet(
-            "QFrame#slotCard{background:#1b1c1f;border:1px solid #2a2c31;"
+            "QFrame#regionCard{background:#1b1c1f;border:1px solid #2a2c31;"
             "border-radius:8px;}"
         )
         self.setMinimumHeight(64)
 
-        self._title = QLabel("-")
+        self._title = QLabel(title)
         self._title.setStyleSheet("color:#e5e7eb;font-weight:600;")
-        self._chip = QLabel("未知")
+        self._chip = QLabel("-")
         self._chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._chip.setStyleSheet(
-            "background:#b45309;color:#ffffff;border-radius:9px;"
+            "background:#374151;color:#ffffff;border-radius:9px;"
             "padding:2px 8px;font-size:11px;"
         )
         self._detail = QLabel("-")
@@ -142,50 +126,35 @@ class SlotCard(QFrame):
         layout.addLayout(top)
         layout.addWidget(self._detail)
 
-    def set_slot(self, slot: SlotSnapshot | None) -> None:
-        if slot is None:
-            self._title.setText("-")
-            self._chip.setText("未知")
-            self._detail.setText("-")
-            return
-        self._title.setText(slot.slot_name)
-        color = SLOT_COLORS.get(slot.occupancy, "#b45309")
-        self._chip.setText(slot.occupancy_label)
+    def set_state(
+        self, chip: str, color: str, detail: str, *, tooltip: str = ""
+    ) -> None:
+        self._chip.setText(chip)
         self._chip.setStyleSheet(
             f"background:{color};color:#ffffff;border-radius:9px;"
             "padding:2px 8px;font-size:11px;"
         )
-        self._detail.setText(
-            f"{slot.visibility_label} · "
-            f"{SLOT_REASON_LABELS.get(slot.reason, slot.reason)}"
-        )
-        self.setToolTip(
-            f"{slot.slot_name}\n"
-            f"占用：{slot.occupancy.value}\n"
-            f"可见性：{slot.visibility.value}\n"
-            f"原因：{slot.reason}\n"
-            f"最近变化：{format_timestamp(slot.last_change_ts)}\n"
-            f"置信度：{slot.confidence if slot.confidence is not None else '-'}"
-        )
+        self._detail.setText(detail)
+        self.setToolTip(tooltip or detail)
 
 
-class OperationCard(QFrame):
-    """一条人工取料/二次涂油操作记录。"""
+class TaskCard(QFrame):
+    """一条单根丝杆任务记录。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("operationCard")
+        self.setObjectName("taskCard")
         self.setStyleSheet(
-            "QFrame#operationCard{background:#1b1c1f;border:1px solid #2a2c31;"
+            "QFrame#taskCard{background:#1b1c1f;border:1px solid #2a2c31;"
             "border-radius:8px;}"
         )
-        self.setMinimumHeight(88)
+        self.setMinimumHeight(104)
 
         self._title = QLabel("-")
         self._title.setStyleSheet("color:#e5e7eb;font-weight:600;")
-        self._part = QLabel("-")
-        self._part.setStyleSheet("color:#9ca3af;font-size:11px;")
-        self._chip = QLabel("未开始")
+        self._stage = QLabel("-")
+        self._stage.setStyleSheet("color:#9ca3af;font-size:11px;")
+        self._chip = QLabel("空闲")
         self._chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._chip.setStyleSheet(
             "background:#374151;color:#ffffff;border-radius:9px;"
@@ -193,12 +162,22 @@ class OperationCard(QFrame):
         )
         self._detail = QLabel("-")
         self._detail.setStyleSheet("color:#6b7280;font-size:11px;")
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("覆盖 %p%")
+        self._progress.setFixedHeight(14)
+        self._progress.setStyleSheet(
+            "QProgressBar{background:#25272c;color:#d1d5db;border:none;"
+            "border-radius:7px;font-size:10px;text-align:center;}"
+            "QProgressBar::chunk{background:#2ea6ff;border-radius:7px;}"
+        )
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(self._title)
         top.addStretch(1)
-        top.addWidget(self._part)
+        top.addWidget(self._stage)
 
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
@@ -208,48 +187,51 @@ class OperationCard(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(6)
+        layout.setSpacing(5)
         layout.addLayout(top)
         layout.addLayout(bottom)
+        layout.addWidget(self._progress)
 
-    def set_operation(
-        self, operation: OperationSnapshot | None, *, fallback_name: str = ""
-    ) -> None:
-        if operation is None:
-            self._title.setText(fallback_name or "-")
-            self._part.setText("-")
+    def set_task(self, task: TaskSnapshot | None) -> None:
+        if task is None:
+            self._title.setText("-")
+            self._stage.setText("-")
             self._chip.setText("空闲")
             self._chip.setStyleSheet(
                 "background:#374151;color:#ffffff;border-radius:9px;"
                 "padding:2px 10px;font-size:12px;"
             )
             self._detail.setText("-")
+            self._progress.setValue(0)
             return
 
-        self._title.setText(f"{operation.logical_part_id} · {operation.slot_name}")
-        self._part.setText(operation.operation_id)
-        color = STATE_COLORS.get(operation.state, "#374151")
-        self._chip.setText(operation.state_label)
+        self._title.setText(task.task_id)
+        self._stage.setText(task.stage_label)
+        color = RESULT_COLORS.get(task.final_result, "#374151")
+        self._chip.setText(task.result_label)
         self._chip.setStyleSheet(
             f"background:{color};color:#ffffff;border-radius:9px;"
             "padding:2px 10px;font-size:12px;"
         )
-        reason = operation.reason_code or "-"
-        pickup = PICKUP_STATUS_LABELS.get(
-            operation.pickup_status, operation.pickup_status
+        self._detail.setText(
+            f"取料 {task.pick_label} · 手持 {task.holding_label} · "
+            f"涂油 {task.oiling_label}"
         )
-        identity = IDENTITY_STATUS_LABELS.get(
-            operation.identity_status, operation.identity_status
+        self._progress.setValue(task.coverage_percent)
+        timeline = " → ".join(
+            f"{name}@{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}"
+            for name, ts in task.timeline
         )
-        self._detail.setText(f"取料 {pickup} · 关联 {identity}")
         self.setToolTip(
-            f"{operation.operation_id}\n"
-            f"来源槽位：{operation.source_slot}\n"
-            f"状态：{operation.state.value}\n"
-            f"取料：{operation.pickup_status}\n"
-            f"关联：{operation.identity_status}\n"
-            f"原因：{reason}\n"
-            f"证据：{', '.join(operation.evidence) or '-'}"
+            f"{task.task_id}\n"
+            f"阶段：{task.stage.value}（{task.reason_code or '-'}）\n"
+            f"丝杆轨迹：{task.screw_track_id}  手部轨迹：{task.hand_track_id}  "
+            f"刷头轨迹：{task.brush_track_id}\n"
+            f"有效刷涂：{task.effective_brush_duration_s:.2f}s  "
+            f"相对运动：{task.brush_motion:.3f}\n"
+            f"覆盖区段：{list(task.axis_segments)}\n"
+            f"证据：{', '.join(task.evidence) or '-'}\n"
+            f"时间线：{timeline or '-'}"
         )
 
 
@@ -276,8 +258,8 @@ class MonitorPage(QWidget):
 
         self._stations = list(service.stations())
         self._current_index = 0
-        self._slot_cards: dict[int, SlotCard] = {}
-        self._operation_cards: dict[int, OperationCard] = {}
+        self._region_cards: dict[str, RegionCard] = {}
+        self._task_cards: dict[int, TaskCard] = {}
         self._event_ids: list[str] = []
         self._last_frame_ts = 0.0
         self._last_events_version = -1
@@ -338,16 +320,16 @@ class MonitorPage(QWidget):
         left.addWidget(self._video, 1)
         left.addWidget(self._video_info)
 
-        self._slot_grid = QGridLayout()
-        self._slot_grid.setSpacing(8)
+        self._region_grid = QGridLayout()
+        self._region_grid.setSpacing(8)
 
-        self._card_grid = QGridLayout()
-        self._card_grid.setSpacing(8)
+        self._task_grid = QGridLayout()
+        self._task_grid.setSpacing(8)
 
         self._event_table = TableWidget()
         self._event_table.setColumnCount(4)
         self._event_table.setHorizontalHeaderLabels(
-            ["时间", "事件", "物料", "结果/复核"]
+            ["时间", "事件", "任务", "结果/复核"]
         )
         self._event_table.verticalHeader().setVisible(False)
         self._event_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -375,15 +357,15 @@ class MonitorPage(QWidget):
         right = QVBoxLayout()
         right.setContentsMargins(12, 0, 0, 0)
         right.setSpacing(8)
-        slots_title = QLabel("槽位状态（机器涂油盘）")
-        slots_title.setStyleSheet("color:#e5e7eb;font-weight:600;")
-        right.addWidget(slots_title)
-        right.addLayout(self._slot_grid)
+        regions_title = QLabel("检测区域与跟踪")
+        regions_title.setStyleSheet("color:#e5e7eb;font-weight:600;")
+        right.addWidget(regions_title)
+        right.addLayout(self._region_grid)
         right.addSpacing(6)
-        materials_title = QLabel("人工操作（最近 4 条）")
-        materials_title.setStyleSheet("color:#e5e7eb;font-weight:600;")
-        right.addWidget(materials_title)
-        right.addLayout(self._card_grid)
+        tasks_title = QLabel("任务（最近 4 条）")
+        tasks_title.setStyleSheet("color:#e5e7eb;font-weight:600;")
+        right.addWidget(tasks_title)
+        right.addLayout(self._task_grid)
         right.addSpacing(8)
         right.addWidget(events_title)
         right.addWidget(self._event_table, 1)
@@ -442,32 +424,36 @@ class MonitorPage(QWidget):
             return
         index = max(0, min(index, len(self._stations) - 1))
         self._current_index = index
-        station = self._stations[index]
 
-        while self._slot_grid.count():
-            item = self._slot_grid.takeAt(0)
+        while self._region_grid.count():
+            item = self._region_grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        while self._card_grid.count():
-            item = self._card_grid.takeAt(0)
+        while self._task_grid.count():
+            item = self._task_grid.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        self._slot_cards.clear()
-        self._operation_cards.clear()
+        self._region_cards.clear()
+        self._task_cards.clear()
 
-        layouts = station.slot_layout or default_slot_layouts(4)
-        for pos, layout in enumerate(layouts[:8]):
-            card = SlotCard()
-            self._slot_cards[layout.index] = card
-            self._slot_grid.addWidget(card, pos // 2, pos % 2)
+        for pos, (key, title) in enumerate(
+            (
+                ("tray", "涂油盘参考区"),
+                ("hand", "手持操作区"),
+                ("brush", "刷涂区"),
+                ("exclude", "物料盒排除区"),
+            )
+        ):
+            card = RegionCard(title)
+            self._region_cards[key] = card
+            self._region_grid.addWidget(card, pos // 2, pos % 2)
 
-        operation_count = 4
-        for pos in range(operation_count):
-            card = OperationCard()
-            self._operation_cards[pos + 1] = card
-            self._card_grid.addWidget(card, pos // 2, pos % 2)
+        for pos in range(4):
+            card = TaskCard()
+            self._task_cards[pos + 1] = card
+            self._task_grid.addWidget(card, pos // 2, pos % 2)
 
         self._event_ids.clear()
         self._last_events_version = -1
@@ -496,7 +482,6 @@ class MonitorPage(QWidget):
         frame = self._service.latest_frame(station.camera_id)
         has_live_picture = camera_state in {"previewing", "demo"}
         if not has_live_picture:
-            # 相机停止后清掉最后一帧，避免监控页看起来仍在实时预览。
             if self._video.has_frame or self._last_frame_ts:
                 self._last_frame_ts = 0.0
                 label = CAMERA_STATE_LABELS.get(camera_state, camera_state)
@@ -512,42 +497,35 @@ class MonitorPage(QWidget):
             else:
                 self._video_info.setText(f"画面 {frame.width}×{frame.height}")
 
+        rois: list[RoiOverlay] = [
+            RoiOverlay("涂油盘区", station.tray_roi, "#ffd60a"),
+            RoiOverlay("手持操作区", station.hand_roi, "#64d2ff"),
+            RoiOverlay("刷涂区", station.brush_roi, "#ff375f"),
+        ]
+        for roi in station.exclude_rois:
+            rois.append(RoiOverlay("排除区", roi, "#8a8f98", dashed=True))
+
         frame_size = snapshot.frame_size if snapshot is not None else (0, 0)
-        rois: tuple[RoiOverlay, ...] = ()
-        if snapshot is not None:
+        if snapshot is not None and snapshot.tray is not None:
             tray = snapshot.tray
-            if tray is not None and tray.box is not None:
+            if tray.box is not None:
                 tray_roi = _box_to_roi(tray.box, frame_size)
                 if tray_roi is not None:
-                    rois += (
+                    rois.append(
                         RoiOverlay(
-                            "机器涂油盘",
+                            f"检测盘体 · {'可靠' if tray.reliable else '预测'}",
                             tray_roi,
-                            "#ffd60a",
+                            "#f59e0b",
                             dashed=True,
-                        ),
+                        )
                     )
-            for slot in snapshot.slots:
-                if slot.box is None:
-                    continue
-                slot_roi = _box_to_roi(slot.box, frame_size)
-                if slot_roi is None:
-                    continue
-                color = SLOT_COLORS.get(slot.occupancy, "#b45309")
-                rois += (
-                    RoiOverlay(
-                        f"{slot.slot_name} · {slot.occupancy_label}",
-                        slot_roi,
-                        color,
-                        dashed=slot.occupancy != SlotOccupancy.OCCUPIED,
-                    ),
-                )
 
         detections: tuple[Detection, ...] = ()
         if snapshot is not None:
             excluded = {
                 station.detector.hand_label,
-                station.detector.brush_label,
+                station.detector.brush_head_label,
+                station.detector.brush_rod_label,
                 station.detector.tray_label,
             }
             detections = tuple(
@@ -557,6 +535,8 @@ class MonitorPage(QWidget):
                     label=f"{track.label}#{track.track_id}",
                     confidence=track.confidence,
                     box=track.box,
+                    angle=track.angle,
+                    point=track.point,
                 )
                 for track in snapshot.tracks
             )
@@ -564,18 +544,23 @@ class MonitorPage(QWidget):
         mode = "" if snapshot is None else snapshot.mode
         tray_state = ""
         if snapshot is not None and snapshot.tray is not None:
-            tray_state = " · 盘体可靠" if snapshot.tray.reliable else " · 盘体不可靠"
+            tray_state = " · 盘体可靠" if snapshot.tray.reliable else " · 盘体预测"
+        active_task = ""
+        if snapshot is not None:
+            active_task = str(snapshot.stats.get("active_task_id", ""))
+        task_state = f" · {active_task}" if active_task else ""
         banner = (
             f"{station.name} · {CAMERA_STATE_LABELS.get(camera_state, camera_state)}"
-            f" · {MODE_LABELS.get(mode, mode)}{tray_state}"
+            f" · {MODE_LABELS.get(mode, mode)}{tray_state}{task_state}"
         )
         self._video.set_overlays(
-            rois=rois,
+            rois=tuple(rois),
             detections=detections,
             banner=banner,
             hand_label=station.detector.hand_label,
-            rod_label=station.detector.rod_label,
-            brush_label=station.detector.brush_label,
+            screw_label=station.detector.screw_label,
+            brush_label=station.detector.brush_head_label,
+            brush_rod_label=station.detector.brush_rod_label,
             tray_label=station.detector.tray_label,
         )
 
@@ -584,8 +569,8 @@ class MonitorPage(QWidget):
         if station is None:
             return
         snapshot = self._service.station_snapshot(station.station_id)
-        self._update_slot_cards(snapshot)
-        self._update_operation_cards(snapshot)
+        self._update_region_cards(station, snapshot)
+        self._update_task_cards(snapshot)
         self._update_status_chips(station, snapshot)
         self._update_events(station.station_id)
 
@@ -602,17 +587,58 @@ class MonitorPage(QWidget):
             self._btn_camera.setEnabled(True)
         self._btn_snapshot.setEnabled(previewing)
 
-    def _update_slot_cards(self, snapshot: StationSnapshot | None) -> None:
-        slots = {} if snapshot is None else {s.slot_index: s for s in snapshot.slots}
-        for index, card in self._slot_cards.items():
-            card.set_slot(slots.get(index))
+    def _update_region_cards(self, station, snapshot: StationSnapshot | None) -> None:
+        tray = snapshot.tray if snapshot is not None else None
+        tracks = snapshot.tracks if snapshot is not None else ()
+        hand_count = sum(
+            1
+            for t in tracks
+            if t.label == station.detector.hand_label and t.observed
+        )
+        brush_count = sum(
+            1
+            for t in tracks
+            if t.label == station.detector.brush_head_label and t.observed
+        )
+        screw_count = sum(
+            1
+            for t in tracks
+            if t.label == station.detector.screw_label and t.observed
+        )
+        if tray is not None and tray.visible:
+            motion = {"MOVING": "移动中", "STILL": "静止"}.get(tray.motion, "未知")
+            self._region_cards["tray"].set_state(
+                "可见" if tray.reliable else "预测",
+                "#15803d" if tray.reliable else "#b45309",
+                f"{motion} · 置信度 {tray.confidence or 0:.2f}",
+            )
+        else:
+            self._region_cards["tray"].set_state(
+                "配置 ROI" if snapshot is not None else "等待",
+                "#374151",
+                "使用固定涂油盘 ROI" if snapshot is not None else "-",
+            )
+        self._region_cards["hand"].set_state(
+            f"{hand_count} 只手", "#15803d" if hand_count else "#374151",
+            f"丝杆轨迹 {screw_count} 条",
+        )
+        self._region_cards["brush"].set_state(
+            f"{brush_count} 个刷头",
+            "#15803d" if brush_count else "#374151",
+            "刷头工作端接触与相对运动",
+        )
+        self._region_cards["exclude"].set_state(
+            f"{len(station.exclude_rois)} 个区域",
+            "#b45309" if station.exclude_rois else "#374151",
+            "物料盒区域不参与推理",
+        )
 
-    def _update_operation_cards(self, snapshot: StationSnapshot | None) -> None:
-        operations = list(snapshot.operations if snapshot else ())
-        cards = list(self._operation_cards.values())
+    def _update_task_cards(self, snapshot: StationSnapshot | None) -> None:
+        tasks = list(snapshot.tasks if snapshot else ())[-4:][::-1]
+        cards = list(self._task_cards.values())
         for index, card in enumerate(cards):
-            operation = operations[index] if index < len(operations) else None
-            card.set_operation(operation)
+            task = tasks[index] if index < len(tasks) else None
+            card.set_task(task)
 
     def _update_status_chips(self, station, snapshot: StationSnapshot | None) -> None:
         camera_state = (
@@ -644,17 +670,29 @@ class MonitorPage(QWidget):
             rate_text = "检测：-"
         else:
             rate_text = f"检测：{float(processing):.1f}ms · {int(stats.get('detections', 0))}目标"
-        if snapshot is not None and snapshot.slots:
-            occupied = sum(
-                1 for slot in snapshot.slots if slot.occupancy == SlotOccupancy.OCCUPIED
-            )
-            unknown = sum(
-                1 for slot in snapshot.slots if slot.occupancy == SlotOccupancy.UNKNOWN
-            )
-            rate_text += f" · 槽位 {occupied}/{len(snapshot.slots)} 有料"
-            if unknown:
-                rate_text += f" · {unknown} 未知"
-        self._set_chip(self._rate_chip, rate_text, "#374151")
+        if snapshot is not None:
+            tasks = snapshot.tasks
+            if tasks:
+                active = sum(
+                    1 for task in tasks if task.final_result == TaskResult.PROCESSING
+                )
+                ok = sum(1 for task in tasks if task.final_result == TaskResult.OK)
+                rate_text += f" · 任务 {len(tasks)}（进行中 {active}，OK {ok}）"
+            candidates = int(stats.get("pick_candidates", 0))
+            if candidates:
+                rate_text += f" · 候选 {candidates}"
+        health: list[str] = []
+        gap_events = int(stats.get("frame_gap_events", 0) or 0)
+        dropped = int(stats.get("dropped_frames", 0) or 0)
+        if gap_events:
+            health.append(f"时间跳变 {gap_events}")
+        if dropped:
+            health.append(f"丢帧 {dropped}")
+        if health:
+            rate_text += " · " + "，".join(health)
+        self._set_chip(
+            self._rate_chip, rate_text, "#b45309" if health else "#374151"
+        )
 
         status = self._service.recording_status(station.camera_id)
         if status.active:
@@ -689,7 +727,7 @@ class MonitorPage(QWidget):
             values = (
                 datetime.fromtimestamp(event.timestamp_end).strftime("%H:%M:%S"),
                 event.event_label,
-                event.logical_part_id,
+                event.task_id,
                 result_text,
             )
             for col, text in enumerate(values):
@@ -782,7 +820,7 @@ class MonitorPage(QWidget):
         self._service.reset_station(station.station_id)
         InfoBar.success(
             "已重置",
-            f"{station.name} 的物料状态已复位",
+            f"{station.name} 的任务状态已复位",
             position=InfoBarPosition.TOP_RIGHT,
             duration=1500,
             parent=self,

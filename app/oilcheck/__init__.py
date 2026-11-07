@@ -6,8 +6,6 @@ from .config import (
     OilCheckConfigService,
     PipelineConfig,
     RecordingConfig,
-    SlotConfig,
-    SlotLayout,
     StationConfig,
 )
 from .detector import Detector, NullDetector, SimulatedDetector, create_detector
@@ -15,22 +13,23 @@ from .events import EventStore
 from .pipeline import StationPipeline
 from .recorder import TrainingRecorder, list_segments
 from .service import OilCheckService
-from .tracker import ObjectTracker, RodTracker, Track, TrayTracker
+from .tracker import ObjectTracker, Track, TrayTracker
 from .types import (
     Detection,
     EventRecord,
     EventResult,
     EventType,
     FrameDetections,
-    OperationSnapshot,
-    OperationState,
+    HoldingStatus,
+    OilingStatus,
+    PickStatus,
     RecordingStatus,
     ReviewResult,
-    SlotOccupancy,
-    SlotSnapshot,
     StationSnapshot,
+    TaskResult,
+    TaskSnapshot,
+    TaskStage,
     TraySnapshot,
-    Visibility,
 )
 
 __all__ = [
@@ -42,31 +41,29 @@ __all__ = [
     "EventStore",
     "EventType",
     "FrameDetections",
+    "HoldingStatus",
     "NullDetector",
     "ObjectTracker",
     "OilCheckConfig",
     "OilCheckConfigService",
     "OilCheckService",
-    "OperationSnapshot",
-    "OperationState",
+    "OilingStatus",
+    "PickStatus",
     "PipelineConfig",
     "RecordingConfig",
     "RecordingStatus",
-    "RodTracker",
     "ReviewResult",
     "SimulatedDetector",
-    "SlotConfig",
-    "SlotLayout",
-    "SlotOccupancy",
-    "SlotSnapshot",
     "StationConfig",
     "StationPipeline",
     "StationSnapshot",
+    "TaskResult",
+    "TaskSnapshot",
+    "TaskStage",
     "Track",
     "TrainingRecorder",
     "TraySnapshot",
     "TrayTracker",
-    "Visibility",
     "create_detector",
     "list_segments",
 ]

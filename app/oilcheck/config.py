@@ -1,7 +1,16 @@
 """取料/二次涂油业务配置。
 
-配置文件默认位于数据目录的 ``config/oilcheck.json``。仓库 ``config/oilcheck.json``
-只作为首次运行的模板，实际运行配置由 :class:`OilCheckConfigService` 复制并维护。
+配置结构对应《涂油工位视觉检测项目实现文档》第 3、10 节：
+
+- 每个工位配置涂油盘、手持操作、刷涂三个有效 ROI，以及需要完全排除的
+  物料盒 ROI；
+- 不配置槽位，也不做槽位绑定；
+- 判定参数按“取料事件 / 跟踪 / 刷涂 / 任务”分组。
+
+配置文件默认位于数据目录的 ``config/oilcheck.json``。仓库
+``config/oilcheck.json`` 只作为首次运行的模板，实际运行配置由
+:class:`OilCheckConfigService` 复制并维护。旧版配置中的 ``pick_roi``、
+``oiling_roi``、``slot_layout`` 等字段在读取时会自动迁移为新的 ROI。
 """
 
 from __future__ import annotations
@@ -11,7 +20,6 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,121 +27,8 @@ from typing import Any
 from app.paths import runtime_root
 
 from .roi import Roi
-from .types import BBox
 
 logger = logging.getLogger("oilcheck.config")
-
-
-@dataclass(frozen=True)
-class SlotLayout:
-    """槽位相对机器涂油盘边界的局部归一化几何。
-
-    ``x1/y1/x2/y2`` 均为相对 tray 检测框的 0~1 比例；盘体上下移动时随盘体
-    一起平移，不需要重新标定绝对 ROI。
-    """
-
-    index: int
-    name: str
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SlotLayout | None:
-        try:
-            index = int(data.get("index", 0))
-            x1 = _clamp01(float(data.get("x1", 0.0)))
-            y1 = _clamp01(float(data.get("y1", 0.0)))
-            x2 = _clamp01(float(data.get("x2", 0.0)))
-            y2 = _clamp01(float(data.get("y2", 0.0)))
-        except (TypeError, ValueError):
-            return None
-        if index < 1:
-            return None
-        left, right = sorted((x1, x2))
-        top, bottom = sorted((y1, y2))
-        if right - left <= 1e-6 or bottom - top <= 1e-6:
-            return None
-        return cls(
-            index=index,
-            name=str(data.get("name") or f"{index}号槽"),
-            x1=left,
-            y1=top,
-            x2=right,
-            y2=bottom,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "index": self.index,
-            "name": self.name,
-            "x1": self.x1,
-            "y1": self.y1,
-            "x2": self.x2,
-            "y2": self.y2,
-        }
-
-    def pixel_bbox(self, tray_box: BBox) -> BBox:
-        width = max(1.0, tray_box.width)
-        height = max(1.0, tray_box.height)
-        return BBox(
-            tray_box.x1 + self.x1 * width,
-            tray_box.y1 + self.y1 * height,
-            tray_box.x1 + self.x2 * width,
-            tray_box.y1 + self.y2 * height,
-        )
-
-
-def default_slot_layouts(count: int = 4) -> tuple[SlotLayout, ...]:
-    """默认 4 槽横向均分布局；现场应按实际盘体几何调整。"""
-    count = max(1, int(count))
-    step = 1.0 / count
-    margin = min(0.02, step * 0.15)
-    return tuple(
-        SlotLayout(
-            index=index + 1,
-            name=f"{index + 1}号槽",
-            x1=index * step + margin,
-            y1=0.15,
-            x2=(index + 1) * step - margin,
-            y2=0.90,
-        )
-        for index in range(count)
-    )
-
-
-def _clamp01(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
-
-
-@dataclass(frozen=True)
-class SlotConfig:
-    """一个取料位置。设备最多 4 根丝杆，对应 1~4 号位。"""
-
-    index: int
-    name: str
-    roi: Roi
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SlotConfig | None:
-        roi = Roi.from_dict(data.get("roi"))
-        if roi is None:
-            return None
-        try:
-            index = int(data.get("index", 0))
-        except (TypeError, ValueError):
-            return None
-        if index < 1:
-            return None
-        return cls(
-            index=index,
-            name=str(data.get("name") or f"{index}号位"),
-            roi=roi,
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"index": self.index, "name": self.name, "roi": self.roi.to_dict()}
 
 
 @dataclass(frozen=True)
@@ -143,42 +38,64 @@ class DetectorConfig:
     ``kind`` 支持：
 
     - ``null``：不产生检测结果，用于无模型的第一阶段框架运行。
-    - ``simulated``：按时间脚本生成手部/丝杆检测，用于 UI 与流程联调。
-    - ``yolo``：预留给外部训练项目导出的模型，本版本不实现推理。
+    - ``simulated``：按时间脚本生成丝杆/手/刷头检测，用于 UI 与流程联调。
+    - ``yolo``：外部训练项目导出的模型（支持 Detect 与 OBB 输出）。
+
+    类别按实现文档第 4 节：``screw``、``hand``、``brush_head`` 为核心，
+    ``brush_rod``、``oil_tray`` 为辅助。
     """
 
     kind: str = "null"
     model_path: str = ""
     confidence: float = 0.5
+    screw_label: str = "screw"
     hand_label: str = "hand"
-    rod_label: str = "rod"
-    brush_label: str = "brush"
-    tray_label: str = "tray"
+    brush_head_label: str = "brush_head"
+    brush_rod_label: str = "brush_rod"
+    tray_label: str = "oil_tray"
+    brush_point_offset_x: float = 0.5
+    brush_point_offset_y: float = 0.9
     cycle_seconds: float = 18.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> DetectorConfig:
         data = dict(data or {})
+        d = cls()
         kind = str(data.get("kind", "null")).strip().lower()
         if kind not in {"null", "simulated", "yolo"}:
             kind = "null"
-        try:
-            confidence = float(data.get("confidence", 0.5))
-        except (TypeError, ValueError):
-            confidence = 0.5
-        try:
-            cycle_seconds = float(data.get("cycle_seconds", 18.0))
-        except (TypeError, ValueError):
-            cycle_seconds = 18.0
+
+        def _f(key: str, default: float, lo: float, hi: float) -> float:
+            try:
+                return max(lo, min(hi, float(data.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
         return cls(
             kind=kind,
             model_path=str(data.get("model_path", "")),
-            confidence=max(0.0, min(1.0, confidence)),
-            hand_label=str(data.get("hand_label", "hand") or "hand"),
-            rod_label=str(data.get("rod_label") or data.get("screw_label") or "rod"),
-            brush_label=str(data.get("brush_label", "brush") or "brush"),
-            tray_label=str(data.get("tray_label", "tray") or "tray"),
-            cycle_seconds=max(4.0, cycle_seconds),
+            confidence=_f("confidence", d.confidence, 0.0, 1.0),
+            # 旧配置：rod_label → screw_label，brush_label → brush_head_label。
+            screw_label=str(
+                data.get("screw_label")
+                or data.get("rod_label")
+                or d.screw_label
+            ),
+            hand_label=str(data.get("hand_label") or d.hand_label),
+            brush_head_label=str(
+                data.get("brush_head_label")
+                or data.get("brush_label")
+                or d.brush_head_label
+            ),
+            brush_rod_label=str(data.get("brush_rod_label") or d.brush_rod_label),
+            tray_label=str(data.get("tray_label") or d.tray_label),
+            brush_point_offset_x=_f(
+                "brush_point_offset_x", d.brush_point_offset_x, 0.0, 1.0
+            ),
+            brush_point_offset_y=_f(
+                "brush_point_offset_y", d.brush_point_offset_y, 0.0, 1.0
+            ),
+            cycle_seconds=_f("cycle_seconds", d.cycle_seconds, 4.0, 3600.0),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -186,77 +103,80 @@ class DetectorConfig:
             "kind": self.kind,
             "model_path": self.model_path,
             "confidence": self.confidence,
+            "screw_label": self.screw_label,
             "hand_label": self.hand_label,
-            "rod_label": self.rod_label,
-            "brush_label": self.brush_label,
+            "brush_head_label": self.brush_head_label,
+            "brush_rod_label": self.brush_rod_label,
             "tray_label": self.tray_label,
+            "brush_point_offset_x": self.brush_point_offset_x,
+            "brush_point_offset_y": self.brush_point_offset_y,
             "cycle_seconds": self.cycle_seconds,
         }
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    """时序事件判定参数。所有时间单位为秒。"""
+    """时序事件判定参数。所有时间单位为秒，距离为按画面对角线归一化。"""
 
     max_fps: int = 15
-    pick_confirm_s: float = 0.6
-    pick_abort_s: float = 0.5
-    occlusion_timeout_s: float = 2.0
-    pick_require_hand: bool = True
-    hand_proximity_margin: float = 0.03
-    oiling_min_duration_s: float = 1.5
-    oiling_max_gap_s: float = 0.8
-    oiling_min_motion: float = 0.04
-    oiling_require_rod: bool = True
+
+    # 取料事件（文档 5）
+    pick_hand_distance: float = 0.05
+    pick_motion_min: float = 0.010
+    pick_relative_max: float = 0.030
+    pick_comotion_min_s: float = 0.25
+    pick_confirm_s: float = 0.30
+    pick_abort_s: float = 0.50
+    pick_occlusion_timeout_s: float = 2.0
+    pick_ambiguity_margin: float = 0.02
+    pick_window_s: float = 2.0
+
+    # 目标跟踪（文档 6）
+    screw_track_max_distance: float = 0.08
+    screw_track_max_missing_s: float = 0.70
+    screw_track_min_hits: int = 2
+    screw_track_max_active: int = 16
+    hand_track_max_distance: float = 0.15
+    hand_track_max_missing_s: float = 0.80
+    hand_track_min_hits: int = 1
+    brush_track_max_distance: float = 0.15
+    brush_track_max_missing_s: float = 0.80
+    brush_track_min_hits: int = 1
+
+    # 刷涂行为（文档 7）
+    brush_contact_distance: float = 0.060
+    brush_min_duration_s: float = 1.0
+    brush_max_gap_s: float = 0.60
+    brush_min_motion: float = 0.15
+    brush_require_hand: bool = False
+    coverage_segments: int = 5
+    coverage_required: float = 0.60
+
+    # 业务身份与任务（文档 6、8、10）
+    identity_timeout_s: float = 2.0
+    identity_ambiguity_margin: float = 0.02
+    holding_lost_timeout_s: float = 2.0
     oiling_wait_timeout_s: float = 0.0
-    event_cooldown_s: float = 1.0
-    part_reset_absent_s: float = 0.5
-    # 动态跟踪（物料盘连续移动）参数
-    track_max_distance: float = 0.08
-    track_max_missing_s: float = 0.7
-    track_min_hits: int = 2
-    track_max_active: int = 8
-    track_hand_distance: float = 0.06
-    track_pick_window_s: float = 1.5
+    single_active_task: bool = True
+    task_max_active: int = 4
     completed_retain_s: float = 10.0
-    # 机器涂油盘与动态槽位
+
+    # 涂油盘定位（只作为取料参考区域）
     tray_max_distance: float = 0.20
     tray_max_missing_s: float = 1.0
     tray_min_confidence: float = 0.30
-    tray_motion_speed: float = 0.05
-    slot_occupied_confirm_s: float = 0.25
-    slot_empty_confirm_s: float = 0.60
-    slot_occlusion_unknown_s: float = 2.0
-    slot_hand_occlusion_ratio: float = 0.15
-    slot_hand_margin: float = 0.03
-    # 取料与操作身份
-    pick_window_s: float = 2.0
-    hand_track_max_distance: float = 0.15
-    hand_track_max_missing_s: float = 0.8
-    hand_track_min_hits: int = 1
-    brush_track_max_distance: float = 0.15
-    brush_track_max_missing_s: float = 0.8
-    brush_track_min_hits: int = 1
-    # 二次涂油：刷子相对物料的运动证据
-    brush_part_distance: float = 0.08
-    brush_min_duration_s: float = 1.0
-    brush_max_gap_s: float = 0.6
-    brush_min_motion: float = 0.15
-    brush_require_hand: bool = True
-    identity_timeout_s: float = 2.0
-    identity_ambiguity_margin: float = 0.02
-    operation_max_active: int = 8
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> PipelineConfig:
         data = dict(data or {})
         d = cls()
 
-        def _f(key: str, default: float) -> float:
+        def _f(key: str, default: float, lo: float = 0.0) -> float:
             try:
-                return float(data.get(key, default))
+                value = float(data.get(key, default))
             except (TypeError, ValueError):
-                return default
+                value = default
+            return max(lo, value)
 
         def _b(key: str, default: bool) -> bool:
             value = data.get(key, default)
@@ -264,173 +184,194 @@ class PipelineConfig:
                 return value.strip().lower() in {"1", "true", "yes", "on"}
             return bool(value)
 
-        def _i(key: str, default: int) -> int:
+        def _i(key: str, default: int, lo: int, hi: int) -> int:
             try:
-                return int(data.get(key, default))
+                value = int(data.get(key, default))
             except (TypeError, ValueError):
-                return default
+                value = default
+            return max(lo, min(hi, value))
+
+        def _legacy(new_key: str, *old_keys: str, default: float) -> float:
+            """新字段缺失时回退到旧配置字段，便于现场配置平滑迁移。"""
+
+            if new_key in data:
+                return _f(new_key, default)
+            for old_key in old_keys:
+                if old_key in data:
+                    return _f(old_key, default)
+            return default
 
         return cls(
-            max_fps=max(1, min(60, _i("max_fps", d.max_fps))),
-            pick_confirm_s=max(0.0, _f("pick_confirm_s", d.pick_confirm_s)),
-            pick_abort_s=max(0.0, _f("pick_abort_s", d.pick_abort_s)),
-            occlusion_timeout_s=max(
-                0.0, _f("occlusion_timeout_s", d.occlusion_timeout_s)
+            max_fps=_i("max_fps", d.max_fps, 1, 60),
+            pick_hand_distance=_legacy(
+                "pick_hand_distance",
+                "slot_hand_margin",
+                "hand_proximity_margin",
+                default=d.pick_hand_distance,
             ),
-            pick_require_hand=_b("pick_require_hand", d.pick_require_hand),
-            hand_proximity_margin=max(
-                0.0, min(0.5, _f("hand_proximity_margin", d.hand_proximity_margin))
+            pick_motion_min=_f("pick_motion_min", d.pick_motion_min, 0.0),
+            pick_relative_max=_f("pick_relative_max", d.pick_relative_max, 0.0),
+            pick_comotion_min_s=_f(
+                "pick_comotion_min_s", d.pick_comotion_min_s, 0.0
             ),
-            oiling_min_duration_s=max(
-                0.0, _f("oiling_min_duration_s", d.oiling_min_duration_s)
+            pick_confirm_s=_f("pick_confirm_s", d.pick_confirm_s, 0.0),
+            pick_abort_s=_f("pick_abort_s", d.pick_abort_s, 0.0),
+            pick_occlusion_timeout_s=_legacy(
+                "pick_occlusion_timeout_s",
+                "occlusion_timeout_s",
+                default=d.pick_occlusion_timeout_s,
             ),
-            oiling_max_gap_s=max(0.0, _f("oiling_max_gap_s", d.oiling_max_gap_s)),
-            oiling_min_motion=max(0.0, _f("oiling_min_motion", d.oiling_min_motion)),
-            oiling_require_rod=_b("oiling_require_rod", d.oiling_require_rod),
-            oiling_wait_timeout_s=max(
-                0.0, _f("oiling_wait_timeout_s", d.oiling_wait_timeout_s)
+            pick_ambiguity_margin=_legacy(
+                "pick_ambiguity_margin",
+                "identity_ambiguity_margin",
+                default=d.pick_ambiguity_margin,
             ),
-            event_cooldown_s=max(0.0, _f("event_cooldown_s", d.event_cooldown_s)),
-            part_reset_absent_s=max(
-                0.0, _f("part_reset_absent_s", d.part_reset_absent_s)
+            pick_window_s=_f("pick_window_s", d.pick_window_s, 0.0),
+            screw_track_max_distance=_legacy(
+                "screw_track_max_distance",
+                "track_max_distance",
+                default=d.screw_track_max_distance,
             ),
-            track_max_distance=max(
-                0.005, min(0.5, _f("track_max_distance", d.track_max_distance))
+            screw_track_max_missing_s=_legacy(
+                "screw_track_max_missing_s",
+                "track_max_missing_s",
+                default=d.screw_track_max_missing_s,
             ),
-            track_max_missing_s=max(
-                0.0, _f("track_max_missing_s", d.track_max_missing_s)
+            screw_track_min_hits=_i(
+                "screw_track_min_hits",
+                _int_or(data.get("track_min_hits"), d.screw_track_min_hits),
+                1,
+                20,
             ),
-            track_min_hits=max(1, min(20, _i("track_min_hits", d.track_min_hits))),
-            track_max_active=max(
-                1, min(64, _i("track_max_active", d.track_max_active))
+            screw_track_max_active=_i(
+                "screw_track_max_active",
+                _int_or(data.get("track_max_active"), d.screw_track_max_active),
+                1,
+                64,
             ),
-            track_hand_distance=max(
-                0.005, min(0.5, _f("track_hand_distance", d.track_hand_distance))
+            hand_track_max_distance=_f(
+                "hand_track_max_distance", d.hand_track_max_distance, 0.005
             ),
-            track_pick_window_s=max(
-                0.0, _f("track_pick_window_s", d.track_pick_window_s)
+            hand_track_max_missing_s=_f(
+                "hand_track_max_missing_s", d.hand_track_max_missing_s, 0.0
             ),
-            completed_retain_s=max(0.0, _f("completed_retain_s", d.completed_retain_s)),
-            tray_max_distance=max(
-                0.01, min(0.5, _f("tray_max_distance", d.tray_max_distance))
+            hand_track_min_hits=_i(
+                "hand_track_min_hits", d.hand_track_min_hits, 1, 20
             ),
-            tray_max_missing_s=max(0.0, _f("tray_max_missing_s", d.tray_max_missing_s)),
-            tray_min_confidence=max(
-                0.0, min(1.0, _f("tray_min_confidence", d.tray_min_confidence))
+            brush_track_max_distance=_f(
+                "brush_track_max_distance", d.brush_track_max_distance, 0.005
             ),
-            tray_motion_speed=max(
-                0.001, min(0.5, _f("tray_motion_speed", d.tray_motion_speed))
+            brush_track_max_missing_s=_f(
+                "brush_track_max_missing_s", d.brush_track_max_missing_s, 0.0
             ),
-            slot_occupied_confirm_s=max(
-                0.0, _f("slot_occupied_confirm_s", d.slot_occupied_confirm_s)
+            brush_track_min_hits=_i(
+                "brush_track_min_hits", d.brush_track_min_hits, 1, 20
             ),
-            slot_empty_confirm_s=max(
-                0.0, _f("slot_empty_confirm_s", d.slot_empty_confirm_s)
+            brush_contact_distance=_legacy(
+                "brush_contact_distance",
+                "brush_part_distance",
+                default=d.brush_contact_distance,
             ),
-            slot_occlusion_unknown_s=max(
-                0.0,
-                _f("slot_occlusion_unknown_s", d.slot_occlusion_unknown_s),
+            brush_min_duration_s=_legacy(
+                "brush_min_duration_s",
+                "oiling_min_duration_s",
+                default=d.brush_min_duration_s,
             ),
-            slot_hand_occlusion_ratio=max(
-                0.0,
-                min(1.0, _f("slot_hand_occlusion_ratio", d.slot_hand_occlusion_ratio)),
+            brush_max_gap_s=_legacy(
+                "brush_max_gap_s",
+                "oiling_max_gap_s",
+                default=d.brush_max_gap_s,
             ),
-            slot_hand_margin=max(
-                0.0, min(0.5, _f("slot_hand_margin", d.slot_hand_margin))
+            brush_min_motion=_legacy(
+                "brush_min_motion",
+                "oiling_min_motion",
+                default=d.brush_min_motion,
             ),
-            pick_window_s=max(0.0, _f("pick_window_s", d.pick_window_s)),
-            hand_track_max_distance=max(
-                0.01,
-                min(0.5, _f("hand_track_max_distance", d.hand_track_max_distance)),
-            ),
-            hand_track_max_missing_s=max(
-                0.0, _f("hand_track_max_missing_s", d.hand_track_max_missing_s)
-            ),
-            hand_track_min_hits=max(
-                1, min(20, _i("hand_track_min_hits", d.hand_track_min_hits))
-            ),
-            brush_track_max_distance=max(
-                0.01,
-                min(0.5, _f("brush_track_max_distance", d.brush_track_max_distance)),
-            ),
-            brush_track_max_missing_s=max(
-                0.0, _f("brush_track_max_missing_s", d.brush_track_max_missing_s)
-            ),
-            brush_track_min_hits=max(
-                1, min(20, _i("brush_track_min_hits", d.brush_track_min_hits))
-            ),
-            brush_part_distance=max(
-                0.005, min(0.5, _f("brush_part_distance", d.brush_part_distance))
-            ),
-            brush_min_duration_s=max(
-                0.0,
-                _f(
-                    "brush_min_duration_s",
-                    _f("oiling_min_duration_s", d.brush_min_duration_s),
-                ),
-            ),
-            brush_max_gap_s=max(
-                0.0,
-                _f("brush_max_gap_s", _f("oiling_max_gap_s", d.brush_max_gap_s)),
-            ),
-            brush_min_motion=max(0.0, _f("brush_min_motion", d.brush_min_motion)),
             brush_require_hand=_b("brush_require_hand", d.brush_require_hand),
-            identity_timeout_s=max(0.0, _f("identity_timeout_s", d.identity_timeout_s)),
-            identity_ambiguity_margin=max(
-                0.0,
-                min(0.2, _f("identity_ambiguity_margin", d.identity_ambiguity_margin)),
+            coverage_segments=_i(
+                "coverage_segments", d.coverage_segments, 1, 16
             ),
-            operation_max_active=max(
-                1, min(64, _i("operation_max_active", d.operation_max_active))
+            coverage_required=max(
+                0.0,
+                min(1.0, _f("coverage_required", d.coverage_required, 0.0)),
+            ),
+            identity_timeout_s=_f(
+                "identity_timeout_s", d.identity_timeout_s, 0.0
+            ),
+            identity_ambiguity_margin=_f(
+                "identity_ambiguity_margin", d.identity_ambiguity_margin, 0.0
+            ),
+            holding_lost_timeout_s=_f(
+                "holding_lost_timeout_s", d.holding_lost_timeout_s, 0.0
+            ),
+            oiling_wait_timeout_s=_f(
+                "oiling_wait_timeout_s", d.oiling_wait_timeout_s, 0.0
+            ),
+            single_active_task=_b(
+                "single_active_task", d.single_active_task
+            ),
+            task_max_active=_i(
+                "task_max_active",
+                int(data.get("operation_max_active", d.task_max_active))
+                if "task_max_active" not in data
+                else d.task_max_active,
+                1,
+                64,
+            ),
+            completed_retain_s=_f(
+                "completed_retain_s", d.completed_retain_s, 0.0
+            ),
+            tray_max_distance=_f(
+                "tray_max_distance", d.tray_max_distance, 0.01
+            ),
+            tray_max_missing_s=_f(
+                "tray_max_missing_s", d.tray_max_missing_s, 0.0
+            ),
+            tray_min_confidence=max(
+                0.0,
+                min(1.0, _f("tray_min_confidence", d.tray_min_confidence, 0.0)),
             ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_fps": self.max_fps,
+            "pick_hand_distance": self.pick_hand_distance,
+            "pick_motion_min": self.pick_motion_min,
+            "pick_relative_max": self.pick_relative_max,
+            "pick_comotion_min_s": self.pick_comotion_min_s,
             "pick_confirm_s": self.pick_confirm_s,
             "pick_abort_s": self.pick_abort_s,
-            "occlusion_timeout_s": self.occlusion_timeout_s,
-            "pick_require_hand": self.pick_require_hand,
-            "hand_proximity_margin": self.hand_proximity_margin,
-            "oiling_min_duration_s": self.oiling_min_duration_s,
-            "oiling_max_gap_s": self.oiling_max_gap_s,
-            "oiling_min_motion": self.oiling_min_motion,
-            "oiling_require_rod": self.oiling_require_rod,
-            "oiling_wait_timeout_s": self.oiling_wait_timeout_s,
-            "event_cooldown_s": self.event_cooldown_s,
-            "part_reset_absent_s": self.part_reset_absent_s,
-            "track_max_distance": self.track_max_distance,
-            "track_max_missing_s": self.track_max_missing_s,
-            "track_min_hits": self.track_min_hits,
-            "track_max_active": self.track_max_active,
-            "track_hand_distance": self.track_hand_distance,
-            "track_pick_window_s": self.track_pick_window_s,
-            "completed_retain_s": self.completed_retain_s,
-            "tray_max_distance": self.tray_max_distance,
-            "tray_max_missing_s": self.tray_max_missing_s,
-            "tray_min_confidence": self.tray_min_confidence,
-            "tray_motion_speed": self.tray_motion_speed,
-            "slot_occupied_confirm_s": self.slot_occupied_confirm_s,
-            "slot_empty_confirm_s": self.slot_empty_confirm_s,
-            "slot_occlusion_unknown_s": self.slot_occlusion_unknown_s,
-            "slot_hand_occlusion_ratio": self.slot_hand_occlusion_ratio,
-            "slot_hand_margin": self.slot_hand_margin,
+            "pick_occlusion_timeout_s": self.pick_occlusion_timeout_s,
+            "pick_ambiguity_margin": self.pick_ambiguity_margin,
             "pick_window_s": self.pick_window_s,
+            "screw_track_max_distance": self.screw_track_max_distance,
+            "screw_track_max_missing_s": self.screw_track_max_missing_s,
+            "screw_track_min_hits": self.screw_track_min_hits,
+            "screw_track_max_active": self.screw_track_max_active,
             "hand_track_max_distance": self.hand_track_max_distance,
             "hand_track_max_missing_s": self.hand_track_max_missing_s,
             "hand_track_min_hits": self.hand_track_min_hits,
             "brush_track_max_distance": self.brush_track_max_distance,
             "brush_track_max_missing_s": self.brush_track_max_missing_s,
             "brush_track_min_hits": self.brush_track_min_hits,
-            "brush_part_distance": self.brush_part_distance,
+            "brush_contact_distance": self.brush_contact_distance,
             "brush_min_duration_s": self.brush_min_duration_s,
             "brush_max_gap_s": self.brush_max_gap_s,
             "brush_min_motion": self.brush_min_motion,
             "brush_require_hand": self.brush_require_hand,
+            "coverage_segments": self.coverage_segments,
+            "coverage_required": self.coverage_required,
             "identity_timeout_s": self.identity_timeout_s,
             "identity_ambiguity_margin": self.identity_ambiguity_margin,
-            "operation_max_active": self.operation_max_active,
+            "holding_lost_timeout_s": self.holding_lost_timeout_s,
+            "oiling_wait_timeout_s": self.oiling_wait_timeout_s,
+            "single_active_task": self.single_active_task,
+            "task_max_active": self.task_max_active,
+            "completed_retain_s": self.completed_retain_s,
+            "tray_max_distance": self.tray_max_distance,
+            "tray_max_missing_s": self.tray_max_missing_s,
+            "tray_min_confidence": self.tray_min_confidence,
         }
 
 
@@ -490,60 +431,47 @@ class RecordingConfig:
 
 @dataclass(frozen=True)
 class StationConfig:
+    """一个工位的有效 ROI 与检测配置。
+
+    ``exclude_rois`` 内的区域完全屏蔽推理（物料盒等）。ROI 使用归一化坐标，
+    现场调整后无需改代码。
+    """
+
     station_id: str
     name: str
     camera_id: str
     enabled: bool
-    pick_roi: Roi
-    oiling_roi: Roi
-    slots: tuple[SlotConfig, ...]
+    tray_roi: Roi
+    hand_roi: Roi
+    brush_roi: Roi
+    exclude_rois: tuple[Roi, ...] = ()
     detector: DetectorConfig = field(default_factory=DetectorConfig)
-    slot_mode: str = "tray"
-    tray_roi: Roi | None = None
-    slot_layout: tuple[SlotLayout, ...] = field(default_factory=default_slot_layouts)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> StationConfig | None:
-        pick_roi = Roi.from_dict(data.get("pick_roi"))
-        oiling_roi = Roi.from_dict(data.get("oiling_roi"))
-        if pick_roi is None or oiling_roi is None:
+        # 兼容旧配置：pick_roi → tray_roi，oiling_roi → hand_roi。
+        tray_roi = Roi.from_dict(data.get("tray_roi") or data.get("pick_roi"))
+        hand_roi = Roi.from_dict(data.get("hand_roi") or data.get("oiling_roi"))
+        if tray_roi is None or hand_roi is None:
             return None
-        tray_roi = Roi.from_dict(data.get("tray_roi")) or pick_roi
+        brush_roi = Roi.from_dict(data.get("brush_roi")) or hand_roi
 
-        slots: list[SlotConfig] = []
-        for item in data.get("slots", ()):
-            if not isinstance(item, dict):
-                continue
-            slot = SlotConfig.from_dict(item)
-            if slot is not None:
-                slots.append(slot)
-        slots.sort(key=lambda s: s.index)
-
-        layouts: list[SlotLayout] = []
-        raw_layout = data.get("slot_layout")
-        if isinstance(raw_layout, list):
-            for item in raw_layout:
-                if not isinstance(item, dict):
-                    continue
-                layout = SlotLayout.from_dict(item)
-                if layout is not None:
-                    layouts.append(layout)
-        if not layouts:
-            try:
-                count = int(data.get("slot_count", 4))
-            except (TypeError, ValueError):
-                count = 4
-            layouts = list(default_slot_layouts(max(1, min(16, count))))
-        layouts.sort(key=lambda item: item.index)
+        exclude_rois: list[Roi] = []
+        raw_exclude = data.get("exclude_rois")
+        if raw_exclude is None:
+            raw_exclude = data.get("material_box_rois")
+        if raw_exclude is None and data.get("material_box_roi") is not None:
+            raw_exclude = [data.get("material_box_roi")]
+        if isinstance(raw_exclude, dict):
+            raw_exclude = [raw_exclude]
+        for item in raw_exclude or ():
+            roi = Roi.from_dict(item)
+            if roi is not None:
+                exclude_rois.append(roi)
 
         station_id = str(data.get("station_id", "")).strip()
         camera_id = str(data.get("camera_id", "")).strip()
-        slot_mode = str(data.get("slot_mode", "tray")).strip().lower()
-        if slot_mode not in {"fixed", "dynamic", "tray"}:
-            slot_mode = "tray"
         if not station_id or not camera_id:
-            return None
-        if slot_mode == "fixed" and not slots:
             return None
 
         return cls(
@@ -551,13 +479,11 @@ class StationConfig:
             name=str(data.get("name") or station_id),
             camera_id=camera_id,
             enabled=bool(data.get("enabled", True)),
-            pick_roi=pick_roi,
-            oiling_roi=oiling_roi,
-            slots=tuple(slots),
-            detector=DetectorConfig.from_dict(data.get("detector")),
-            slot_mode=slot_mode,
             tray_roi=tray_roi,
-            slot_layout=tuple(layouts),
+            hand_roi=hand_roi,
+            brush_roi=brush_roi,
+            exclude_rois=tuple(exclude_rois),
+            detector=DetectorConfig.from_dict(data.get("detector")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -566,19 +492,17 @@ class StationConfig:
             "name": self.name,
             "camera_id": self.camera_id,
             "enabled": self.enabled,
-            "pick_roi": self.pick_roi.to_dict(),
-            "oiling_roi": self.oiling_roi.to_dict(),
-            "tray_roi": (self.tray_roi or self.pick_roi).to_dict(),
-            "slot_layout": [layout.to_dict() for layout in self.slot_layout],
-            "slots": [slot.to_dict() for slot in self.slots],
+            "tray_roi": self.tray_roi.to_dict(),
+            "hand_roi": self.hand_roi.to_dict(),
+            "brush_roi": self.brush_roi.to_dict(),
+            "exclude_rois": [roi.to_dict() for roi in self.exclude_rois],
             "detector": self.detector.to_dict(),
-            "slot_mode": self.slot_mode,
         }
 
 
 @dataclass(frozen=True)
 class OilCheckConfig:
-    version: str = "1.0"
+    version: str = "2.0"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     stations: tuple[StationConfig, ...] = ()
@@ -593,7 +517,7 @@ class OilCheckConfig:
             if station is not None:
                 stations.append(station)
         return cls(
-            version=str(data.get("version", "1.0")),
+            version=str(data.get("version", "2.0")),
             pipeline=PipelineConfig.from_dict(data.get("pipeline")),
             recording=RecordingConfig.from_dict(data.get("recording")),
             stations=tuple(stations),
@@ -664,6 +588,13 @@ class OilCheckConfigService:
         _write_json_atomic(self.config_path, cfg.to_dict())
 
 
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _write_json_atomic(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -683,7 +614,3 @@ def _write_json_atomic(path: Path, payload: object) -> None:
             pass
         except OSError as exc:
             logger.debug("删除临时文件失败 (%s): %s", tmp_name, exc)
-
-
-def iter_station_ids(stations: Iterable[StationConfig]) -> tuple[str, ...]:
-    return tuple(station.station_id for station in stations)

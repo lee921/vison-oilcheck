@@ -34,6 +34,17 @@ from ui.widgets.roi_canvas import RoiCanvas
 
 logger = logging.getLogger("oilcheck.ui.roi_calibration")
 
+_ROI_NAMES = {
+    "tray": "涂油盘区",
+    "hand": "手持操作区",
+    "brush": "刷涂区",
+    "exclude": "排除区（物料盒）",
+}
+
+
+def _roi_name(key: str) -> str:
+    return _ROI_NAMES.get(key, key)
+
 
 class RoiCalibrationDialog(QDialog):
     def __init__(
@@ -63,8 +74,13 @@ class RoiCalibrationDialog(QDialog):
         # 标定属于配置层操作，未启用的工位也允许预先标定。
         self._stations = list(cfg.stations)
         self._camera_id = ""
-        self._mode = "pick"
-        self._rois: dict[str, Roi | None] = {"pick": None, "oiling": None}
+        self._mode = "tray"
+        self._rois: dict[str, Roi | None] = {
+            "tray": None,
+            "hand": None,
+            "brush": None,
+            "exclude": None,
+        }
         self._frozen = False
         self._last_frame_ts = 0.0
         self._camera_starting = False
@@ -86,13 +102,19 @@ class RoiCalibrationDialog(QDialog):
         self._btn_capture = PushButton("截取画面")
         self._btn_capture.clicked.connect(self._toggle_capture)
 
-        self._btn_pick = PushButton("设置盘体区")
-        self._btn_pick.setCheckable(True)
-        self._btn_pick.setChecked(True)
-        self._btn_pick.clicked.connect(lambda: self._set_mode("pick"))
-        self._btn_oil = PushButton("设置涂油区")
-        self._btn_oil.setCheckable(True)
-        self._btn_oil.clicked.connect(lambda: self._set_mode("oiling"))
+        self._btn_tray = PushButton("涂油盘区")
+        self._btn_tray.setCheckable(True)
+        self._btn_tray.setChecked(True)
+        self._btn_tray.clicked.connect(lambda: self._set_mode("tray"))
+        self._btn_hand = PushButton("手持操作区")
+        self._btn_hand.setCheckable(True)
+        self._btn_hand.clicked.connect(lambda: self._set_mode("hand"))
+        self._btn_brush = PushButton("刷涂区")
+        self._btn_brush.setCheckable(True)
+        self._btn_brush.clicked.connect(lambda: self._set_mode("brush"))
+        self._btn_exclude = PushButton("排除区")
+        self._btn_exclude.setCheckable(True)
+        self._btn_exclude.clicked.connect(lambda: self._set_mode("exclude"))
         self._btn_clear = PushButton("清除当前区域")
         self._btn_clear.clicked.connect(self._clear_current)
 
@@ -119,8 +141,10 @@ class RoiCalibrationDialog(QDialog):
         top.addWidget(self._btn_capture)
 
         tools = QHBoxLayout()
-        tools.addWidget(self._btn_pick)
-        tools.addWidget(self._btn_oil)
+        tools.addWidget(self._btn_tray)
+        tools.addWidget(self._btn_hand)
+        tools.addWidget(self._btn_brush)
+        tools.addWidget(self._btn_exclude)
         tools.addWidget(self._btn_clear)
         tools.addSpacing(12)
         tools.addWidget(self._status, 1)
@@ -128,8 +152,9 @@ class RoiCalibrationDialog(QDialog):
         tools.addWidget(self._btn_cancel)
 
         hint = QLabel(
-            "操作：打开相机 → 截取画面 → 选择“盘体区/涂油区”→ 在画面上拖拽矩形 → 保存并应用。"
-            "盘体区用于跟踪上下移动的机器涂油盘；4 个槽位按盘体局部几何自动计算。"
+            "操作：打开相机 → 截取画面 → 选择区域类型 → 在画面上拖拽矩形 → 保存并应用。"
+            "涂油盘区用于判断丝杆离盘；手持操作区用于恢复离盘后的丝杆关联；"
+            "刷涂区覆盖刷头与手持丝杆的接触范围；排除区（物料盒）完全不参与推理。"
             "拖到画面外会自动裁剪到边缘；坐标为归一化值，保存后检测服务会重新加载。"
         )
         hint.setWordWrap(True)
@@ -155,8 +180,10 @@ class RoiCalibrationDialog(QDialog):
             for button in (
                 self._btn_camera,
                 self._btn_capture,
-                self._btn_pick,
-                self._btn_oil,
+                self._btn_tray,
+                self._btn_hand,
+                self._btn_brush,
+                self._btn_exclude,
                 self._btn_clear,
                 self._btn_save,
             ):
@@ -182,14 +209,21 @@ class RoiCalibrationDialog(QDialog):
             return
         station = self._stations[index]
         self._camera_id = station.camera_id
-        self._rois = {"pick": station.pick_roi, "oiling": station.oiling_roi}
+        self._rois = {
+            "tray": station.tray_roi,
+            "hand": station.hand_roi,
+            "brush": station.brush_roi,
+            "exclude": station.exclude_rois[0] if station.exclude_rois else None,
+        }
         self._camera_label.setText(f"相机：{station.camera_id}")
         self._frame_info.setText("画面：-")
-        self._canvas.set_rois(self._rois["pick"], self._rois["oiling"])
-        self._canvas.set_mode("pick")
-        self._mode = "pick"
-        self._btn_pick.setChecked(True)
-        self._btn_oil.setChecked(False)
+        self._canvas.set_rois(self._rois)
+        self._canvas.set_mode("tray")
+        self._mode = "tray"
+        self._btn_tray.setChecked(True)
+        self._btn_hand.setChecked(False)
+        self._btn_brush.setChecked(False)
+        self._btn_exclude.setChecked(False)
         self._frozen = False
         self._last_frame_ts = 0.0
         self._camera_starting = False
@@ -292,7 +326,7 @@ class RoiCalibrationDialog(QDialog):
             self._frame_info.setText(
                 f"画面：{frame.width}×{frame.height}（原始分辨率）"
             )
-        self._canvas.set_rois(self._rois["pick"], self._rois["oiling"])
+        self._canvas.set_rois(self._rois)
         self._canvas.set_editable(False)
 
     def _toggle_capture(self) -> None:
@@ -322,7 +356,7 @@ class RoiCalibrationDialog(QDialog):
             self._frame_info.setText(
                 f"画面：{frame.width}×{frame.height}（原始分辨率）"
             )
-        self._canvas.set_rois(self._rois["pick"], self._rois["oiling"])
+        self._canvas.set_rois(self._rois)
         self._canvas.set_editable(True)
         self._frozen = True
         self._live_timer.stop()
@@ -334,9 +368,11 @@ class RoiCalibrationDialog(QDialog):
     def _set_mode(self, mode: str) -> None:
         self._mode = mode
         self._canvas.set_mode(mode)
-        self._btn_pick.setChecked(mode == "pick")
-        self._btn_oil.setChecked(mode == "oiling")
-        name = "盘体/取料区" if mode == "pick" else "二次涂油区"
+        self._btn_tray.setChecked(mode == "tray")
+        self._btn_hand.setChecked(mode == "hand")
+        self._btn_brush.setChecked(mode == "brush")
+        self._btn_exclude.setChecked(mode == "exclude")
+        name = _roi_name(mode)
         if self._frozen:
             self._status.setText(f"当前绘制：{name}（在画面上拖拽矩形）")
         else:
@@ -344,13 +380,12 @@ class RoiCalibrationDialog(QDialog):
 
     def _clear_current(self) -> None:
         if not self._canvas.clear_roi(self._mode):
-            name = "盘体/取料区" if self._mode == "pick" else "二次涂油区"
-            self._status.setText(f"{name}尚未设置")
+            self._status.setText(f"{_roi_name(self._mode)}尚未设置")
 
     def _on_roi_changed(self, target: str, roi: Roi | None) -> None:
         self._rois[target] = roi
-        self._canvas.set_rois(self._rois["pick"], self._rois["oiling"])
-        name = "盘体/取料区" if target == "pick" else "二次涂油区"
+        self._canvas.set_rois(self._rois)
+        name = _roi_name(target)
         if roi is None:
             self._status.setText(f"{name}已清除")
             return
@@ -366,26 +401,26 @@ class RoiCalibrationDialog(QDialog):
         station = self._current_station()
         if station is None:
             return
-        pick = self._rois.get("pick")
-        oiling = self._rois.get("oiling")
-        if pick is None or oiling is None:
+        tray = self._rois.get("tray")
+        hand = self._rois.get("hand")
+        brush = self._rois.get("brush") or hand
+        exclude = self._rois.get("exclude")
+        if tray is None or hand is None:
             InfoBar.warning(
                 "ROI 不完整",
-                "盘体区和二次涂油区都需要设置",
+                "涂油盘区和手持操作区都需要设置",
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000,
                 parent=self,
             )
             return
 
-        tray_roi = station.tray_roi
-        if tray_roi is None or tray_roi == station.pick_roi:
-            tray_roi = pick
         updated = replace(
             station,
-            pick_roi=pick,
-            oiling_roi=oiling,
-            tray_roi=tray_roi,
+            tray_roi=tray,
+            hand_roi=hand,
+            brush_roi=brush,
+            exclude_rois=(exclude,) if exclude is not None else (),
         )
         stations = tuple(
             updated if s.station_id == station.station_id else s
@@ -408,7 +443,7 @@ class RoiCalibrationDialog(QDialog):
         self._on_saved(cfg)
         InfoBar.success(
             "ROI 已保存",
-            f"{station.name}：盘体区与二次涂油区已更新",
+            f"{station.name}：涂油盘区、手持操作区与刷涂区已更新",
             position=InfoBarPosition.TOP_RIGHT,
             duration=1800,
             parent=self,

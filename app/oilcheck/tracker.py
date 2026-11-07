@@ -1,16 +1,14 @@
-"""动态物料跟踪。
+"""短时目标跟踪。
 
-物料盘连续移动时，固定 1~4 号位 ROI 不再适用。本模块在取料区（``pick_roi``）内
-对丝杆检测做跨帧关联，为每根物料分配稳定的 ``track_id``；状态机按 track 维护
-单根物料状态，而不是按固定位置。
+视觉 Track ID 只表示相邻帧的短时视觉身份，遮挡后可能发生 ID Switch；
+业务层的任务 ID 在 :mod:`app.oilcheck.pipeline` 中独立维护。
 
 跟踪策略：
 
-- 用“预测位置 + 中心距离”做贪心匹配，速度根据相邻帧位移平滑更新，适应连续移动；
-- 新 track 只有在检测中心进入取料区后才创建，需连续命中 ``track_min_hits`` 次才
-  被状态机采用，过滤单帧误检；
-- 短暂漏检保留 ``track_max_missing_s``，超过则判定丢失；
-- 物料中心离开取料区判定为“离开”，与“手取走”区分，避免料盘移动产生取料事件。
+- 用“预测位置 + 中心距离”做贪心匹配，速度根据相邻帧位移平滑更新；
+- 短时漏检保留 ``max_missing_s``，超过则判定丢失；
+- 丝杆、手、刷头共用 :class:`ObjectTracker`，由调用方负责 ROI 过滤；
+- 检测器提供 OBB 角度/关键点时，随轨迹一起保存。
 """
 
 from __future__ import annotations
@@ -18,7 +16,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .roi import Roi
 from .types import BBox, Detection
 
 
@@ -34,6 +31,8 @@ class Track:
     matched: bool = True
     exited: bool = False
     confidence: float = 0.0
+    angle: float | None = None
+    point: tuple[float, float] | None = None
 
     def predicted_box(self, ts: float) -> BBox:
         dt = max(0.0, float(ts) - self.last_ts)
@@ -48,6 +47,23 @@ class Track:
             self.box.y2 + dy,
         )
 
+    def predicted_point(self, ts: float) -> tuple[float, float] | None:
+        if self.point is None:
+            return None
+        dt = max(0.0, float(ts) - self.last_ts)
+        return (
+            self.point[0] + self.velocity[0] * dt,
+            self.point[1] + self.velocity[1] * dt,
+        )
+
+    @property
+    def axis(self) -> tuple[float, float]:
+        """单位主轴方向：优先用 OBB 角度，否则取框的长边方向。"""
+
+        if self.angle is not None:
+            return (math.cos(self.angle), math.sin(self.angle))
+        return self.box.long_axis()
+
 
 @dataclass(frozen=True)
 class TrackerOutput:
@@ -56,10 +72,10 @@ class TrackerOutput:
 
 
 class ObjectTracker:
-    """通用多目标跟踪（手部/刷子）。
+    """通用多目标跟踪（丝杆/手部/刷头）。
 
-    与 :class:`RodTracker` 相同的贪心关联策略，但不限定 ROI：手和刷子可能
-    离开取料区进入人工操作区，轨迹需要继续保留一段时间。
+    不限定 ROI：丝杆需要从涂油盘跨到手持操作区，手和刷头也会移动；
+    ROI 屏蔽由 :class:`StationPipeline` 在送入跟踪器前完成。
     """
 
     def __init__(
@@ -68,7 +84,7 @@ class ObjectTracker:
         max_distance: float = 0.15,
         max_missing_s: float = 0.8,
         min_hits: int = 1,
-        max_active: int = 4,
+        max_active: int = 16,
         velocity_smoothing: float = 0.5,
     ) -> None:
         self._max_distance = max(0.005, float(max_distance))
@@ -155,6 +171,8 @@ class ObjectTracker:
                 last_ts=float(ts),
                 last_seen_ts=float(ts),
                 confidence=det.confidence,
+                angle=det.angle,
+                point=det.point,
             )
             self._tracks[track.track_id] = track
             self._next_id += 1
@@ -174,6 +192,8 @@ class ObjectTracker:
         )
         track.box = det.box
         track.confidence = det.confidence
+        track.angle = det.angle
+        track.point = det.point
         track.last_ts = float(ts)
         track.last_seen_ts = float(ts)
         track.hits += 1
@@ -183,7 +203,7 @@ class ObjectTracker:
 
 @dataclass
 class TrayTrack:
-    """机器涂油盘的单目标跟踪状态。"""
+    """涂油盘的单目标跟踪状态，只用于稳定取料参考区域。"""
 
     track_id: int | None = None
     box: BBox | None = None
@@ -213,7 +233,7 @@ class TrayTrack:
 
 
 class TrayTracker:
-    """跟踪机器涂油盘整体框；短时遮挡保留预测框，但标记为不可靠。"""
+    """跟踪涂油盘整体框；短时遮挡保留预测框，但标记为不可靠。"""
 
     def __init__(
         self,
@@ -301,140 +321,3 @@ class TrayTracker:
             self._track.box = None
             self._track.hits = 0
         return self._track
-
-
-class RodTracker:
-    def __init__(
-        self,
-        *,
-        roi: Roi,
-        max_distance: float = 0.08,
-        max_missing_s: float = 0.7,
-        min_hits: int = 2,
-        max_active: int = 8,
-        velocity_smoothing: float = 0.6,
-    ) -> None:
-        self._roi = roi
-        self._max_distance = max(0.005, float(max_distance))
-        self._max_missing_s = max(0.0, float(max_missing_s))
-        self._min_hits = max(1, int(min_hits))
-        self._max_active = max(1, int(max_active))
-        self._smoothing = max(0.0, min(0.95, float(velocity_smoothing)))
-
-        self._tracks: dict[int, Track] = {}
-        self._next_id = 1
-
-    @property
-    def min_hits(self) -> int:
-        return self._min_hits
-
-    def reset(self) -> None:
-        self._tracks.clear()
-        self._next_id = 1
-
-    def drop(self, track_id: int) -> None:
-        self._tracks.pop(int(track_id), None)
-
-    def active_tracks(self) -> tuple[Track, ...]:
-        return tuple(self._tracks.values())
-
-    def update(
-        self,
-        *,
-        ts: float,
-        detections: tuple[Detection, ...],
-        frame_size: tuple[int, int],
-    ) -> TrackerOutput:
-        width, height = frame_size
-        if width <= 0 or height <= 0:
-            return TrackerOutput(active=(), lost=())
-
-        frame_diag = max(1.0, math.hypot(width, height))
-        rods = list(detections)
-        matched_dets: set[int] = set()
-        matched_tracks: set[int] = set()
-
-        pairs: list[tuple[float, int, int]] = []
-        for track in self._tracks.values():
-            predicted = track.predicted_box(ts)
-            pcx, pcy = predicted.center
-            for index, det in enumerate(rods):
-                cx, cy = det.box.center
-                distance = math.hypot(cx - pcx, cy - pcy) / frame_diag
-                iou = predicted.iou(det.box)
-                if distance <= self._max_distance or iou >= 0.15:
-                    # 距离优先；IoU 高时给予小幅优势。
-                    pairs.append(
-                        (distance - min(iou, 0.5) * 0.01, track.track_id, index)
-                    )
-
-        pairs.sort(key=lambda item: item[0])
-        for _cost, track_id, det_index in pairs:
-            if track_id in matched_tracks or det_index in matched_dets:
-                continue
-            track = self._tracks.get(track_id)
-            if track is None:
-                continue
-            det = rods[det_index]
-            self._update_track(track, det, ts)
-            matched_tracks.add(track_id)
-            matched_dets.add(det_index)
-
-        lost: list[Track] = []
-        for track_id in list(self._tracks):
-            track = self._tracks[track_id]
-            if track_id not in matched_tracks:
-                track.matched = False
-                track.missing_s = max(0.0, ts - track.last_seen_ts)
-                if track.missing_s > self._max_missing_s:
-                    track.exited = not self._roi.contains_box_center(
-                        track.predicted_box(ts), width, height
-                    )
-                    lost.append(track)
-                    self._tracks.pop(track_id, None)
-                continue
-
-            track.matched = True
-            if not self._roi.contains_box_center(track.box, width, height):
-                track.exited = True
-                lost.append(track)
-                self._tracks.pop(track_id, None)
-
-        for det_index, det in enumerate(rods):
-            if det_index in matched_dets:
-                continue
-            if not self._roi.contains_box_center(det.box, width, height):
-                continue
-            if len(self._tracks) >= self._max_active:
-                continue
-            track = Track(
-                track_id=self._next_id,
-                box=det.box,
-                last_ts=float(ts),
-                last_seen_ts=float(ts),
-                confidence=det.confidence,
-            )
-            self._tracks[track.track_id] = track
-            self._next_id += 1
-
-        active = tuple(self._tracks.values())
-        return TrackerOutput(active=active, lost=tuple(lost))
-
-    def _update_track(self, track: Track, det: Detection, ts: float) -> None:
-        old_cx, old_cy = track.box.center
-        new_cx, new_cy = det.box.center
-        dt = max(1e-3, float(ts) - track.last_ts)
-        inst_vx = (new_cx - old_cx) / dt
-        inst_vy = (new_cy - old_cy) / dt
-        s = self._smoothing
-        track.velocity = (
-            s * track.velocity[0] + (1.0 - s) * inst_vx,
-            s * track.velocity[1] + (1.0 - s) * inst_vy,
-        )
-        track.box = det.box
-        track.confidence = det.confidence
-        track.last_ts = float(ts)
-        track.last_seen_ts = float(ts)
-        track.hits += 1
-        track.missing_s = 0.0
-        track.matched = True
