@@ -58,7 +58,8 @@ class DetectorConfig:
     iou: float = 0.7
     max_det: int = 100
     imgsz: int = 0
-    device: str = "cpu"
+    # 空串/auto = 有 CUDA 用 cuda:0，否则 cpu；可显式写 cpu / cuda:0 / 0。
+    device: str = ""
     half: bool = False
     raw_mode: bool = False
     screw_label: str = "screw"
@@ -103,7 +104,7 @@ class DetectorConfig:
             max_det=_i("max_det", d.max_det, 1, 1000),
             # 0 表示自适应训练尺寸；非 0 时会被向上取整到 stride 的整数倍。
             imgsz=_i("imgsz", d.imgsz, 0, 8192),
-            device=str(data.get("device") or d.device).strip() or d.device,
+            device=str(data.get("device") or d.device).strip(),
             half=_b("half", d.half),
             raw_mode=_b("raw_mode", d.raw_mode),
             # 旧配置：rod_label → screw_label，brush_head_label → brush_label。

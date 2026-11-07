@@ -60,7 +60,11 @@ lib/                   海康 SDK 运行库与 Python 封装
 | 3 | `screw` | 每根独立丝杆 |
 
 仓库自带权重：`model/detect/exp/weights/best.pt`（YOLO11n，`imgsz=1024`，
-mAP50 0.976）。`detector.imgsz=0` 会自适应训练尺寸。
+mAP50 0.976）。`detector.imgsz=0` 会自适应训练尺寸；`detector.device=auto`
+在 GPU 服务器上自动使用 CUDA，无显卡的开发机自动回退 CPU。
+
+部署目标为 GPU 服务器，`uv.lock` 锁定 CUDA 12.8 版 torch；无 GPU 的开发机
+同样可 `uv sync`（推理走 CPU，仅慢），详见 [docs/09](docs/09-开发环境与运行.md)。
 
 没有模型时使用 `null`。示例视频放在 `data/sample_video/`，在监控页
 “画面源”下拉里直接回放，检测仍由模型完成（`detector.raw_mode=true`

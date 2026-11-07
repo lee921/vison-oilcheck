@@ -65,6 +65,7 @@ class YoloDetector:
 
     - 权重路径支持相对仓库根目录（``model/detect/exp/weights/best.pt``）；
     - ``imgsz=0`` 时自适应 checkpoint 中训练时的输入尺寸；
+    - ``device`` 为空或 ``auto`` 时自动选：有 CUDA 用 ``cuda:0``，否则 ``cpu``；
     - 类别名原样输出（``hand`` / ``brush`` / ``oil_station`` / ``screw``），
       与配置文件中的标签字段一一对应。
     """
@@ -97,17 +98,23 @@ class YoloDetector:
         self._model = YOLO(str(model_path))
         self._imgsz = _resolve_imgsz(self._model, cfg.imgsz)
         self._names = _model_names(self._model)
+        self._device = _resolve_device(cfg.device)
         logger.info(
-            "检测模型已加载: %s（imgsz=%d, device=%s, 类别=%s）",
+            "检测模型已加载: %s（imgsz=%d, device=%s, half=%s, 类别=%s）",
             model_path,
             self._imgsz,
-            cfg.device,
+            self._device,
+            bool(cfg.half and self._device.startswith("cuda")),
             ",".join(f"{k}={v}" for k, v in sorted(self._names.items())),
         )
 
     @property
     def imgsz(self) -> int:
         return self._imgsz
+
+    @property
+    def device(self) -> str:
+        return self._device
 
     @property
     def class_names(self) -> dict[int, str]:
@@ -123,11 +130,11 @@ class YoloDetector:
             "iou": float(self._cfg.iou),
             "max_det": int(self._cfg.max_det),
             "imgsz": int(self._imgsz),
-            "device": self._cfg.device or None,
+            "device": self._device,
             "verbose": False,
         }
-        # Ultralytics 8.4 起对 half 给出弃用告警；只在真正开启时传。
-        if self._cfg.half:
+        # Ultralytics 8.4 起对 half 给出弃用告警；只在 CUDA 上真正开启时传。
+        if self._cfg.half and self._device.startswith("cuda"):
             kwargs["half"] = True
         results = self._model.predict(frame, **kwargs)
         detections: list[Detection] = []
@@ -191,6 +198,29 @@ def _resolve_imgsz(model: Any, configured: int) -> int:
     if value <= 0:
         return _FALLBACK_IMGSZ
     return int(math.ceil(value / _MODEL_STRIDE) * _MODEL_STRIDE)
+
+
+def _resolve_device(configured: str) -> str:
+    """确定推理设备。
+
+    ``auto`` / 空串表示跟随硬件：有 CUDA 用 ``cuda:0``，否则 ``cpu``。
+    显式配置（``cpu`` / ``cuda:0`` / ``0``）原样使用，便于现场固定行为。
+    """
+
+    value = (configured or "").strip()
+    if value and value.lower() not in {"auto", "default"}:
+        return value
+
+    try:
+        import torch  # type: ignore[import-not-found]
+    except ImportError:
+        return "cpu"
+    try:
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:  # noqa: BLE001
+        pass
+    return "cpu"
 
 
 def _model_names(model: Any) -> dict[int, str]:

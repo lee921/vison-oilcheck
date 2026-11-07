@@ -153,3 +153,22 @@ def test_video_source_rejects_missing_file(tmp_path):
     source = VideoFileSource(tmp_path / "nope.mp4")
     with pytest.raises(FileNotFoundError):
         source.start()
+
+
+# ----------------------------------------------------------------------
+# 设备选择
+# ----------------------------------------------------------------------
+def test_resolve_device_explicit_values_pass_through():
+    from app.oilcheck.detector import _resolve_device
+
+    assert _resolve_device("cpu") == "cpu"
+    assert _resolve_device("cuda:1") == "cuda:1"
+    assert _resolve_device("0") == "0"
+
+
+def test_resolve_device_auto_falls_back_to_cpu_without_cuda():
+    from app.oilcheck.detector import _resolve_device
+
+    device = _resolve_device("auto")
+    assert device in {"cpu", "cuda:0"}
+    assert _resolve_device("") == device

@@ -27,17 +27,17 @@ name = "tuna"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
-# 本机无 NVIDIA 显卡，torch 走 CPU 索引：避免下载约 4GB 的 CUDA 运行库。
-# 需要 GPU 推理时把下面的 cpu 改成 cu128 并重新 `uv lock`：
-#   url = "https://download.pytorch.org/whl/cu128"
+# 部署目标为 GPU 服务器：torch/torchvision 走 CUDA 12.8 索引。
+# 无显卡的纯开发机见 docs/09-开发环境与运行.md「无 GPU 的本地环境」，
+# 用 uv.toml 本地覆盖，不要改动本文件与 uv.lock。
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
-torchvision = [{ index = "pytorch-cpu" }]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

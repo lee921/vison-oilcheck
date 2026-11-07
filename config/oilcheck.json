@@ -96,7 +96,7 @@
         "iou": 0.7,
         "max_det": 100,
         "imgsz": 0,
-        "device": "cpu",
+        "device": "auto",
         "half": false,
         "raw_mode": true,
         "screw_label": "screw",
