@@ -7,7 +7,8 @@ logs/
 snapshots/
 recordings/
 data/*
-!data/sample_data/
+!data/sample_img/
+!data/sample_video/
 *.bmp
 *.mp4
 # 海康 SDK 运行时日志（含设备 IP 等现场信息）

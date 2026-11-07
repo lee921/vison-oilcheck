@@ -1,0 +1,95 @@
+{
+  "type": "training_video",
+  "status": "finished",
+  "path": "/home/zw/OilCheckData/recordings/training/cam_6ca47a/2026-10-27/cam_6ca47a_20261027_105708.mp4",
+  "camera_id": "cam_6ca47a",
+  "camera_name": "1号位",
+  "station_id": "ST01",
+  "station_name": "1号取料工位",
+  "started_at": "2026-10-27T10:57:08.363+08:00",
+  "ended_at": "2026-10-27T10:58:11.073+08:00",
+  "started_at_epoch": 1793069828.363369,
+  "ended_at_epoch": 1793069891.0730448,
+  "fps": 15,
+  "width": 2560,
+  "height": 1440,
+  "frame_count": 846,
+  "dropped_frames": 0,
+  "codec": "mp4v",
+  "rois": {
+    "pick_roi": {
+      "kind": "rect",
+      "points": [
+        [
+          0.498162,
+          0.058824
+        ],
+        [
+          0.706801,
+          0.338235
+        ]
+      ]
+    },
+    "oiling_roi": {
+      "kind": "rect",
+      "points": [
+        [
+          0.341912,
+          0.408497
+        ],
+        [
+          0.903493,
+          0.996732
+        ]
+      ]
+    },
+    "tray_roi": {
+      "kind": "rect",
+      "points": [
+        [
+          0.498162,
+          0.058824
+        ],
+        [
+          0.706801,
+          0.338235
+        ]
+      ]
+    },
+    "slot_layout": [
+      {
+        "index": 1,
+        "name": "1号槽",
+        "x1": 0.02,
+        "y1": 0.15,
+        "x2": 0.23,
+        "y2": 0.9
+      },
+      {
+        "index": 2,
+        "name": "2号槽",
+        "x1": 0.27,
+        "y1": 0.15,
+        "x2": 0.48,
+        "y2": 0.9
+      },
+      {
+        "index": 3,
+        "name": "3号槽",
+        "x1": 0.52,
+        "y1": 0.15,
+        "x2": 0.73,
+        "y2": 0.9
+      },
+      {
+        "index": 4,
+        "name": "4号槽",
+        "x1": 0.77,
+        "y1": 0.15,
+        "x2": 0.98,
+        "y2": 0.9
+      }
+    ],
+    "slots": []
+  }
+}

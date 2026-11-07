@@ -1,0 +1,13 @@
+classes:
+- hand
+- brush
+- oil_station
+- screw
+conf_threshold: 0.25
+display_name: exp
+iou_threshold: 0.45
+max_det: 300
+model_path: weights/best.onnx
+name: exp
+provider: Ultralytics
+type: yolo11
