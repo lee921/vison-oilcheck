@@ -30,6 +30,24 @@ from .roi import Roi
 
 logger = logging.getLogger("oilcheck.config")
 
+# 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
+_CONFIG_VERSION = "2.1"
+
+# 仓库自带的权重（相对仓库根解析）。
+_DEFAULT_MODEL_PATH = "model/detect/exp/weights/best.pt"
+
+# 2.1 新增的检测器字段及其默认值，迁移时补齐。
+_DETECTOR_DEFAULTS_2_1: dict[str, Any] = {
+    "iou": 0.7,
+    "max_det": 100,
+    "imgsz": 0,
+    "device": "auto",
+    "half": False,
+    "raw_mode": True,
+    "brush_label": "brush",
+    "tray_label": "oil_station",
+}
+
 
 @dataclass(frozen=True)
 class DetectorConfig:
@@ -611,7 +629,7 @@ class StationConfig:
 
 @dataclass(frozen=True)
 class OilCheckConfig:
-    version: str = "2.0"
+    version: str = "2.1"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
@@ -627,7 +645,7 @@ class OilCheckConfig:
             if station is not None:
                 stations.append(station)
         return cls(
-            version=str(data.get("version", "2.0")),
+            version=str(data.get("version", _CONFIG_VERSION)),
             pipeline=PipelineConfig.from_dict(data.get("pipeline")),
             recording=RecordingConfig.from_dict(data.get("recording")),
             demo=DemoConfig.from_dict(data.get("demo")),
@@ -670,6 +688,7 @@ class OilCheckConfigService:
     def ensure_defaults(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         if self.config_path.exists():
+            self._migrate_existing()
             return
         template = runtime_root() / "config" / "oilcheck.json"
         if template.exists() and template.resolve() != self.config_path.resolve():
@@ -680,6 +699,101 @@ class OilCheckConfigService:
             except OSError as exc:
                 logger.warning("复制检测配置模板失败: %s", exc)
         self.save(OilCheckConfig())
+
+    def _migrate_existing(self) -> None:
+        """把新增配置项合并进已存在的配置文件。
+
+        已有配置不会被模板覆盖（现场 ROI 等不能丢），但旧版本缺少
+        ``demo`` 段、``detector`` 仍是 ``null`` 时，服务器拉取新代码后
+        会出现“接入不了模型 / 没有示例视频”的假故障。这里按版本号
+        做一次幂等合并，并在改动前备份原文件。
+        """
+
+        try:
+            with self.config_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("检测配置无法解析，跳过迁移 (%s): %s", self.config_path, exc)
+            return
+        if not isinstance(data, dict):
+            return
+
+        old_version = str(data.get("version", "2.0"))
+        try:
+            outdated = tuple(int(x) for x in old_version.split(".")) < (2, 1)
+        except ValueError:
+            outdated = True
+
+        changed: list[str] = []
+
+        # 1) demo 段：仅对旧版本补上模板里的示例视频清单。
+        #    已是当前版本但缺 demo（例如用户主动删掉），尊重用户选择不再加回。
+        if outdated and not isinstance(data.get("demo"), dict):
+            template = runtime_root() / "config" / "oilcheck.json"
+            demo = None
+            if template.exists():
+                try:
+                    tpl = json.loads(template.read_text(encoding="utf-8"))
+                    demo = tpl.get("demo")
+                except (OSError, json.JSONDecodeError):
+                    demo = None
+            # 模板里也没有示例视频时不要凭空写一个空段，否则每次启动都会改文件。
+            if isinstance(demo, dict) and demo:
+                data["demo"] = demo
+                changed.append("demo")
+
+        # 2) detector：旧配置的 null / 空路径不会自动用上仓库权重
+        for station in data.get("stations", ()) or ():
+            if not isinstance(station, dict):
+                continue
+            detector = station.get("detector")
+            if not isinstance(detector, dict):
+                station["detector"] = detector = {}
+            kind = str(detector.get("kind", "null")).strip().lower()
+            if outdated and kind in {"", "null"}:
+                detector["kind"] = "yolo"
+                changed.append("detector.kind")
+            if outdated and not str(detector.get("model_path", "")).strip():
+                detector["model_path"] = _DEFAULT_MODEL_PATH
+                changed.append("detector.model_path")
+            for key, value in _DETECTOR_DEFAULTS_2_1.items():
+                if key not in detector:
+                    detector[key] = value
+                    changed.append(f"detector.{key}")
+
+            # 旧类别名与训练模型（0=hand 1=brush 2=oil_station 3=screw）
+            # 不一致，模型只输出 oil_station，配置成 oil_tray 会一个盘体都匹配不到。
+            if outdated:
+                legacy_labels = {
+                    "tray_label": "oil_tray",
+                    "brush_label": "brush_head",
+                }
+                for key, legacy in legacy_labels.items():
+                    if str(detector.get(key, "")).strip() == legacy:
+                        detector[key] = _DETECTOR_DEFAULTS_2_1[key]
+                        changed.append(f"detector.{key}")
+
+        if not changed:
+            return
+
+        backup = self.config_path.with_suffix(".json.bak")
+        try:
+            shutil.copy2(self.config_path, backup)
+        except OSError as exc:
+            logger.warning("备份检测配置失败: %s", exc)
+
+        data["version"] = _CONFIG_VERSION
+        try:
+            _write_json_atomic(self.config_path, data)
+        except OSError as exc:
+            logger.error("写回迁移后的检测配置失败: %s", exc)
+            return
+        logger.warning(
+            "检测配置已升级到 %s，补充字段: %s（原文件备份为 %s）",
+            _CONFIG_VERSION,
+            ", ".join(dict.fromkeys(changed)),
+            backup.name,
+        )
 
     def load(self, *, create_if_missing: bool = True) -> OilCheckConfig:
         if create_if_missing:
