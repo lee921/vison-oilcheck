@@ -47,6 +47,20 @@
     "auto_start": false,
     "event_clips_enabled": false
   },
+  "demo": {
+    "loop": true,
+    "fps_limit": 15,
+    "videos": [
+      {
+        "name": "示例① 105708",
+        "path": "data/sample_video/cam_6ca47a_20261027_105708.mp4"
+      },
+      {
+        "name": "示例② 140911",
+        "path": "data/sample_video/cam_6ca47a_20261027_140911.mp4"
+      }
+    ]
+  },
   "stations": [
     {
       "station_id": "ST01",
@@ -70,23 +84,25 @@
       "brush_roi": {
         "kind": "rect",
         "points": [
-          [0.1, 0.4],
-          [0.55, 0.96]
+          [0.349, 0.412],
+          [0.876, 1.0]
         ]
       },
       "exclude_rois": [],
       "detector": {
-        "kind": "null",
-        "model_path": "",
+        "kind": "yolo",
+        "model_path": "model/detect/exp/weights/best.pt",
         "confidence": 0.5,
+        "iou": 0.7,
+        "max_det": 100,
+        "imgsz": 0,
+        "device": "cpu",
+        "half": false,
+        "raw_mode": true,
         "screw_label": "screw",
         "hand_label": "hand",
-        "brush_head_label": "brush_head",
-        "brush_rod_label": "brush_rod",
-        "tray_label": "oil_tray",
-        "brush_point_offset_x": 0.5,
-        "brush_point_offset_y": 0.9,
-        "cycle_seconds": 18.0
+        "brush_label": "brush",
+        "tray_label": "oil_station"
       }
     }
   ]

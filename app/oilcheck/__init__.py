@@ -1,6 +1,8 @@
 """丝杆取料与人工二次涂油检测业务包。"""
 
 from .config import (
+    DemoConfig,
+    DemoVideo,
     DetectorConfig,
     OilCheckConfig,
     OilCheckConfigService,
@@ -8,7 +10,7 @@ from .config import (
     RecordingConfig,
     StationConfig,
 )
-from .detector import Detector, NullDetector, SimulatedDetector, create_detector
+from .detector import Detector, NullDetector, YoloDetector, create_detector
 from .events import EventStore
 from .pipeline import StationPipeline
 from .recorder import TrainingRecorder, list_segments
@@ -31,8 +33,11 @@ from .types import (
     TaskStage,
     TraySnapshot,
 )
+from .video_source import VideoFileSource
 
 __all__ = [
+    "DemoConfig",
+    "DemoVideo",
     "Detection",
     "Detector",
     "DetectorConfig",
@@ -53,7 +58,6 @@ __all__ = [
     "RecordingConfig",
     "RecordingStatus",
     "ReviewResult",
-    "SimulatedDetector",
     "StationConfig",
     "StationPipeline",
     "StationSnapshot",
@@ -64,6 +68,8 @@ __all__ = [
     "TrainingRecorder",
     "TraySnapshot",
     "TrayTracker",
+    "VideoFileSource",
+    "YoloDetector",
     "create_detector",
     "list_segments",
 ]

@@ -41,7 +41,6 @@ from qfluentwidgets import (
 from app.camera_manager import CameraManager
 from app.config_service import ConfigService
 from app.models import AppConfig
-from app.oilcheck.roi import Roi
 from app.oilcheck.service import OilCheckService
 from app.oilcheck.types import (
     Detection,
@@ -51,7 +50,7 @@ from app.oilcheck.types import (
     TaskStage,
 )
 from ui.utils import UiInvoker
-from ui.widgets.oilcheck_video import OilCheckVideoView, RoiOverlay
+from ui.widgets.oilcheck_video import PALETTE, OilCheckVideoView, RoiOverlay
 
 STAGE_COLORS: dict[TaskStage, str] = {
     TaskStage.WAITING_PICK: "#6b7280",
@@ -74,6 +73,8 @@ RESULT_COLORS: dict[TaskResult, str] = {
 }
 
 CAMERA_STATE_LABELS = {
+    "video": "示例回放",
+    "video_stopped": "回放已停止",
     "disconnected": "未连接",
     "connecting": "连接中",
     "connected": "已连接",
@@ -81,14 +82,14 @@ CAMERA_STATE_LABELS = {
     "stopping": "停止中",
     "error": "错误",
     "missing": "相机缺失",
-    "demo": "演示（无相机）",
 }
 
 MODE_LABELS = {
     "null": "无模型（待接入）",
-    "simulated": "演示模式",
     "yolo": "模型检测",
 }
+
+LIVE_SOURCE = "__live__"
 
 
 class RegionCard(QFrame):
@@ -291,15 +292,19 @@ class MonitorPage(QWidget):
         self._rate_chip = self._make_chip("检测：-", "#374151")
         self._record_chip = self._make_chip("录制：关闭", "#374151")
 
+        self._source_combo = ComboBox()
+        self._reload_sources()
+
         self._btn_camera = PrimaryPushButton("开始")
-        self._btn_demo = PushButton("演示模式")
-        self._btn_demo.setCheckable(True)
         self._btn_reset = PushButton("重置状态")
         self._btn_snapshot = PushButton("截图")
 
         top = QHBoxLayout()
         top.addWidget(BodyLabel("工位"))
         top.addWidget(self._station_combo)
+        top.addSpacing(6)
+        top.addWidget(BodyLabel("画面源"))
+        top.addWidget(self._source_combo)
         top.addSpacing(8)
         top.addWidget(self._status_chip)
         top.addWidget(self._mode_chip)
@@ -307,7 +312,6 @@ class MonitorPage(QWidget):
         top.addWidget(self._record_chip)
         top.addStretch(1)
         top.addWidget(self._btn_camera)
-        top.addWidget(self._btn_demo)
         top.addWidget(self._btn_reset)
         top.addWidget(self._btn_snapshot)
 
@@ -389,8 +393,8 @@ class MonitorPage(QWidget):
         root.addLayout(top)
         root.addLayout(body, 1)
 
+        self._source_combo.currentIndexChanged.connect(self._on_source_changed)
         self._btn_camera.clicked.connect(self._on_camera_toggle)
-        self._btn_demo.toggled.connect(self._on_demo_toggled)
         self._btn_reset.clicked.connect(self._on_reset)
         self._btn_snapshot.clicked.connect(self._on_snapshot)
 
@@ -459,9 +463,7 @@ class MonitorPage(QWidget):
         self._last_events_version = -1
         self._event_table.setRowCount(0)
         self._last_frame_ts = 0.0
-        self._btn_demo.blockSignals(True)
-        self._btn_demo.setChecked(False)
-        self._btn_demo.blockSignals(False)
+        self._sync_source_combo()
 
         self._refresh_status()
         self._refresh_video()
@@ -480,7 +482,7 @@ class MonitorPage(QWidget):
         ) or self._service.camera_state(station.camera_id)
 
         frame = self._service.latest_frame(station.camera_id)
-        has_live_picture = camera_state in {"previewing", "demo"}
+        has_live_picture = camera_state in {"previewing", "video"}
         if not has_live_picture:
             if self._video.has_frame or self._last_frame_ts:
                 self._last_frame_ts = 0.0
@@ -490,47 +492,28 @@ class MonitorPage(QWidget):
         elif frame is not None and frame.ts > self._last_frame_ts:
             self._last_frame_ts = frame.ts
             self._video.set_frame(frame.bgr, frame.ts)
-            if camera_state == "demo":
+            if camera_state == "video":
+                info = self._service.video_status(station.station_id)
+                progress = float(info.get("progress") or 0.0) * 100.0
                 self._video_info.setText(
-                    f"画面 {frame.width}×{frame.height} · 演示合成画面（不写入训练录制）"
+                    f"画面 {frame.width}×{frame.height} · 示例回放"
+                    f" {info.get('name', '')} · {progress:.0f}%（不写入训练录制）"
                 )
             else:
                 self._video_info.setText(f"画面 {frame.width}×{frame.height}")
 
+        # 涂油盘区即模型检测出的 oil_station 框，不再重复画静态 ROI；
+        # 手持操作区只在内部判定使用，画面上只保留一个涂刷区。
         rois: list[RoiOverlay] = [
-            RoiOverlay("涂油盘区", station.tray_roi, "#ffd60a"),
-            RoiOverlay("手持操作区", station.hand_roi, "#64d2ff"),
             RoiOverlay("刷涂区", station.brush_roi, "#ff375f"),
         ]
         for roi in station.exclude_rois:
             rois.append(RoiOverlay("排除区", roi, "#8a8f98", dashed=True))
 
-        frame_size = snapshot.frame_size if snapshot is not None else (0, 0)
-        if snapshot is not None and snapshot.tray is not None:
-            tray = snapshot.tray
-            if tray.box is not None:
-                tray_roi = _box_to_roi(tray.box, frame_size)
-                if tray_roi is not None:
-                    rois.append(
-                        RoiOverlay(
-                            f"检测盘体 · {'可靠' if tray.reliable else '预测'}",
-                            tray_roi,
-                            "#f59e0b",
-                            dashed=True,
-                        )
-                    )
-
+        # 画面上的框全部来自配置里的类别名，未知类别也会被画出来。
         detections: tuple[Detection, ...] = ()
         if snapshot is not None:
-            excluded = {
-                station.detector.hand_label,
-                station.detector.brush_head_label,
-                station.detector.brush_rod_label,
-                station.detector.tray_label,
-            }
-            detections = tuple(
-                det for det in snapshot.detections if det.label not in excluded
-            ) + tuple(
+            detections = tuple(snapshot.detections) + tuple(
                 Detection(
                     label=f"{track.label}#{track.track_id}",
                     confidence=track.confidence,
@@ -546,22 +529,24 @@ class MonitorPage(QWidget):
         if snapshot is not None and snapshot.tray is not None:
             tray_state = " · 盘体可靠" if snapshot.tray.reliable else " · 盘体预测"
         active_task = ""
+        counts_text = ""
         if snapshot is not None:
             active_task = str(snapshot.stats.get("active_task_id", ""))
+            counts = snapshot.stats.get("label_counts") or {}
+            if counts:
+                counts_text = " · " + " ".join(
+                    f"{name}:{count}" for name, count in counts.items()
+                )
         task_state = f" · {active_task}" if active_task else ""
         banner = (
             f"{station.name} · {CAMERA_STATE_LABELS.get(camera_state, camera_state)}"
-            f" · {MODE_LABELS.get(mode, mode)}{tray_state}{task_state}"
+            f" · {MODE_LABELS.get(mode, mode)}{tray_state}{task_state}{counts_text}"
         )
         self._video.set_overlays(
             rois=tuple(rois),
             detections=detections,
             banner=banner,
-            hand_label=station.detector.hand_label,
-            screw_label=station.detector.screw_label,
-            brush_label=station.detector.brush_head_label,
-            brush_rod_label=station.detector.brush_rod_label,
-            tray_label=station.detector.tray_label,
+            label_colors=_label_colors(station.detector),
         )
 
     def _refresh_status(self) -> None:
@@ -569,6 +554,8 @@ class MonitorPage(QWidget):
         if station is None:
             return
         snapshot = self._service.station_snapshot(station.station_id)
+        # 画面源可能被服务层直接切换（配置重载、外部调用），下拉保持同步。
+        self._sync_source_combo()
         self._update_region_cards(station, snapshot)
         self._update_task_cards(snapshot)
         self._update_status_chips(station, snapshot)
@@ -579,8 +566,10 @@ class MonitorPage(QWidget):
         camera_state = (
             snapshot.stats.get("camera_state") if snapshot else None
         ) or self._service.camera_state(station.camera_id)
-        if camera_state == "demo":
-            self._btn_camera.setText("演示画面")
+        on_video = camera_state.startswith("video")
+        if on_video:
+            # 回放由“画面源”下拉控制，相机启停按钮此时无意义。
+            self._btn_camera.setText("示例回放中")
             self._btn_camera.setEnabled(False)
         else:
             self._btn_camera.setText("停止" if previewing else "开始")
@@ -590,21 +579,18 @@ class MonitorPage(QWidget):
     def _update_region_cards(self, station, snapshot: StationSnapshot | None) -> None:
         tray = snapshot.tray if snapshot is not None else None
         tracks = snapshot.tracks if snapshot is not None else ()
+        # raw_mode 下没有轨迹，直接按本帧检测计数，卡片仍有信息量。
+        counts = (snapshot.stats.get("label_counts") if snapshot else None) or {}
+        cfg = station.detector
         hand_count = sum(
-            1
-            for t in tracks
-            if t.label == station.detector.hand_label and t.observed
-        )
+            1 for t in tracks if t.label == cfg.hand_label and t.observed
+        ) or int(counts.get(cfg.hand_label, 0))
         brush_count = sum(
-            1
-            for t in tracks
-            if t.label == station.detector.brush_head_label and t.observed
-        )
+            1 for t in tracks if t.label == cfg.brush_label and t.observed
+        ) or int(counts.get(cfg.brush_label, 0))
         screw_count = sum(
-            1
-            for t in tracks
-            if t.label == station.detector.screw_label and t.observed
-        )
+            1 for t in tracks if t.label == cfg.screw_label and t.observed
+        ) or int(counts.get(cfg.screw_label, 0))
         if tray is not None and tray.visible:
             motion = {"MOVING": "移动中", "STILL": "静止"}.get(tray.motion, "未知")
             self._region_cards["tray"].set_state(
@@ -620,12 +606,12 @@ class MonitorPage(QWidget):
             )
         self._region_cards["hand"].set_state(
             f"{hand_count} 只手", "#15803d" if hand_count else "#374151",
-            f"丝杆轨迹 {screw_count} 条",
+            f"丝杆 {screw_count} 个",
         )
         self._region_cards["brush"].set_state(
-            f"{brush_count} 个刷头",
+            f"{brush_count} 个刷具",
             "#15803d" if brush_count else "#374151",
-            "刷头工作端接触与相对运动",
+            "刷具接触与相对运动",
         )
         self._region_cards["exclude"].set_state(
             f"{len(station.exclude_rois)} 个区域",
@@ -652,47 +638,24 @@ class MonitorPage(QWidget):
         )
 
         mode = "" if snapshot is None else snapshot.mode
-        mode_color = (
-            "#b45309"
-            if mode == "simulated"
-            else "#374151" if mode == "null" else "#15803d"
-        )
-        self._btn_demo.blockSignals(True)
-        self._btn_demo.setChecked(mode == "simulated")
-        self._btn_demo.blockSignals(False)
+        mode_color = "#374151" if mode in {"", "null"} else "#15803d"
         self._set_chip(
             self._mode_chip, f"模式：{MODE_LABELS.get(mode, mode)}", mode_color
         )
 
         stats = {} if snapshot is None else snapshot.stats
         processing = stats.get("processing_ms")
+        imgsz = stats.get("imgsz")
+        fps = stats.get("process_fps")
         if processing is None:
             rate_text = "检测：-"
         else:
-            rate_text = f"检测：{float(processing):.1f}ms · {int(stats.get('detections', 0))}目标"
-        if snapshot is not None:
-            tasks = snapshot.tasks
-            if tasks:
-                active = sum(
-                    1 for task in tasks if task.final_result == TaskResult.PROCESSING
-                )
-                ok = sum(1 for task in tasks if task.final_result == TaskResult.OK)
-                rate_text += f" · 任务 {len(tasks)}（进行中 {active}，OK {ok}）"
-            candidates = int(stats.get("pick_candidates", 0))
-            if candidates:
-                rate_text += f" · 候选 {candidates}"
-        health: list[str] = []
-        gap_events = int(stats.get("frame_gap_events", 0) or 0)
-        dropped = int(stats.get("dropped_frames", 0) or 0)
-        if gap_events:
-            health.append(f"时间跳变 {gap_events}")
-        if dropped:
-            health.append(f"丢帧 {dropped}")
-        if health:
-            rate_text += " · " + "，".join(health)
-        self._set_chip(
-            self._rate_chip, rate_text, "#b45309" if health else "#374151"
-        )
+            parts = [f"imgsz {int(imgsz)}"] if imgsz else []
+            parts.append(f"{float(processing):.1f}ms")
+            if fps is not None:
+                parts.append(f"{int(fps)}fps")
+            rate_text = "检测：" + " · ".join(parts)
+        self._set_chip(self._rate_chip, rate_text, "#374151")
 
         status = self._service.recording_status(station.camera_id)
         if status.active:
@@ -743,6 +706,15 @@ class MonitorPage(QWidget):
         station = self._current_station()
         if station is None:
             return
+        if self._service.active_video(station.station_id) is not None:
+            InfoBar.info(
+                "示例回放中",
+                "请先在上方“画面源”切回实时相机",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=2000,
+                parent=self,
+            )
+            return
         session = self._manager.get_session(station.camera_id)
         if session is None:
             InfoBar.error(
@@ -785,32 +757,68 @@ class MonitorPage(QWidget):
 
         future.add_done_callback(lambda _f: self._ui.invoke(_done))
 
-    def _on_demo_toggled(self, checked: bool) -> None:
+    # ------------------------------------------------------------------
+    # 画面源（实时相机 / 示例视频）
+    # ------------------------------------------------------------------
+    def _reload_sources(self) -> None:
+        """按配置里的 demo.videos 重建画面源下拉。"""
+
+        combo = getattr(self, "_source_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("实时相机", userData=LIVE_SOURCE)
+        for video in self._service.demo_videos():
+            combo.addItem(video.name, userData=video.name)
+        combo.blockSignals(False)
+
+    def _sync_source_combo(self) -> None:
+        """把下拉框同步到该工位当前实际使用的画面源。"""
+
+        combo = getattr(self, "_source_combo", None)
+        station = self._current_station()
+        if combo is None or station is None:
+            return
+        video = self._service.active_video(station.station_id)
+        target = LIVE_SOURCE if video is None else video.name
+
+        current = combo.currentData()
+        if current == target:
+            return
+        index = combo.findData(target)
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _on_source_changed(self, _index: int) -> None:
         station = self._current_station()
         if station is None:
             return
-        kind = "simulated" if checked else "default"
-        if self._service.set_station_detector_kind(station.station_id, kind) is None:
+        data = self._source_combo.currentData()
+        name = None if data in (None, "", LIVE_SOURCE) else str(data)
+        ok = self._service.set_station_video(station.station_id, name)
+        if not ok:
             InfoBar.error(
-                "切换失败",
-                "检测器初始化失败，请查看日志",
+                "切换画面源失败",
+                "示例视频未在配置中登记、文件不存在或启动失败，详见日志",
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000,
                 parent=self,
             )
-        else:
-            InfoBar.info(
-                "检测模式",
-                (
-                    "已切换到演示模式，事件仅用于流程联调"
-                    if checked
-                    else "已恢复配置的检测模式"
-                ),
-                position=InfoBarPosition.TOP_RIGHT,
-                duration=2000,
-                parent=self,
-            )
+            self._sync_source_combo()
+            return
+
+        self._last_frame_ts = 0.0
         self._last_events_version = -1
+        self._video.clear("示例回放启动中…" if name else "等待相机画面")
+        InfoBar.info(
+            "画面源",
+            f"已切换到：{name}" if name else "已切回实时相机",
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=2000,
+            parent=self,
+        )
         self._refresh_status()
 
     def _on_reset(self) -> None:
@@ -906,16 +914,21 @@ class MonitorPage(QWidget):
         self._apply_station(index)
 
 
-def _box_to_roi(box, frame_size: tuple[int, int]) -> Roi | None:
-    width, height = frame_size
-    if width <= 0 or height <= 0:
-        return None
-    return Roi.from_dict(
-        {
-            "kind": "rect",
-            "points": [
-                [box.x1 / width, box.y1 / height],
-                [box.x2 / width, box.y2 / height],
-            ],
-        }
+def _label_colors(detector) -> dict[str, str]:
+    """按配置里的类别名分配固定配色。
+
+    类别名全部取自 ``detector`` 配置，UI 不再硬编码 ``hand`` / ``brush``
+    等字符串；模型后续新增的类别由视频控件按调色板顺延取色。
+    """
+
+    names = (
+        detector.hand_label,
+        detector.brush_label,
+        detector.tray_label,
+        detector.screw_label,
     )
+    colors: dict[str, str] = {}
+    for index, name in enumerate(names):
+        if name and name not in colors:
+            colors[name] = PALETTE[index % len(PALETTE)]
+    return colors

@@ -37,32 +37,44 @@ class DetectorConfig:
 
     ``kind`` 支持：
 
-    - ``null``：不产生检测结果，用于无模型的第一阶段框架运行。
-    - ``simulated``：按时间脚本生成丝杆/手/刷头检测，用于 UI 与流程联调。
-    - ``yolo``：外部训练项目导出的模型（支持 Detect 与 OBB 输出）。
+    - ``null``：不产生检测结果，用于无模型时的框架自检。
+    - ``yolo``：Ultralytics YOLO 权重（普通 Detect 输出）。
 
-    类别按实现文档第 4 节：``screw``、``hand``、``brush_head`` 为核心，
-    ``brush_rod``、``oil_tray`` 为辅助。
+    类别名与训练导出模型保持一致（``best.pt`` 的 4 个类别）：
+
+    - ``0=hand``、``1=brush``、``2=oil_station``、``3=screw``。
+
+    ``imgsz=0`` 表示自适应：优先取权重 checkpoint 中训练时的 ``imgsz``，
+    取不到再回退 640，避免用 640 推理 1024 训练的模型而丢精度。
+
+    ``raw_mode=True`` 时流水线只做“把这一帧的全部检测结果交出来”，跳过
+    ROI 过滤、跟踪、取料/刷涂状态机与事件产出，用于先确认模型标签是否齐全。
+    默认关闭，按需在配置里打开；关闭时走完整的 SOP 判定流程。
     """
 
     kind: str = "null"
     model_path: str = ""
     confidence: float = 0.5
+    iou: float = 0.7
+    max_det: int = 100
+    imgsz: int = 0
+    device: str = "cpu"
+    half: bool = False
+    raw_mode: bool = False
     screw_label: str = "screw"
     hand_label: str = "hand"
-    brush_head_label: str = "brush_head"
-    brush_rod_label: str = "brush_rod"
-    tray_label: str = "oil_tray"
+    brush_label: str = "brush"
+    tray_label: str = "oil_station"
+    # 模型只输出刷具框、没有关键点时，用框内相对坐标估计工作端。
     brush_point_offset_x: float = 0.5
     brush_point_offset_y: float = 0.9
-    cycle_seconds: float = 18.0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> DetectorConfig:
         data = dict(data or {})
         d = cls()
         kind = str(data.get("kind", "null")).strip().lower()
-        if kind not in {"null", "simulated", "yolo"}:
+        if kind not in {"null", "yolo"}:
             kind = "null"
 
         def _f(key: str, default: float, lo: float, hi: float) -> float:
@@ -71,23 +83,39 @@ class DetectorConfig:
             except (TypeError, ValueError):
                 return default
 
+        def _i(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(data.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
+        def _b(key: str, default: bool) -> bool:
+            value = data.get(key, default)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+
         return cls(
             kind=kind,
             model_path=str(data.get("model_path", "")),
             confidence=_f("confidence", d.confidence, 0.0, 1.0),
-            # 旧配置：rod_label → screw_label，brush_label → brush_head_label。
+            iou=_f("iou", d.iou, 0.0, 1.0),
+            max_det=_i("max_det", d.max_det, 1, 1000),
+            # 0 表示自适应训练尺寸；非 0 时会被向上取整到 stride 的整数倍。
+            imgsz=_i("imgsz", d.imgsz, 0, 8192),
+            device=str(data.get("device") or d.device).strip() or d.device,
+            half=_b("half", d.half),
+            raw_mode=_b("raw_mode", d.raw_mode),
+            # 旧配置：rod_label → screw_label，brush_head_label → brush_label。
             screw_label=str(
-                data.get("screw_label")
-                or data.get("rod_label")
-                or d.screw_label
+                data.get("screw_label") or data.get("rod_label") or d.screw_label
             ),
             hand_label=str(data.get("hand_label") or d.hand_label),
-            brush_head_label=str(
-                data.get("brush_head_label")
-                or data.get("brush_label")
-                or d.brush_head_label
+            brush_label=str(
+                data.get("brush_label")
+                or data.get("brush_head_label")
+                or d.brush_label
             ),
-            brush_rod_label=str(data.get("brush_rod_label") or d.brush_rod_label),
             tray_label=str(data.get("tray_label") or d.tray_label),
             brush_point_offset_x=_f(
                 "brush_point_offset_x", d.brush_point_offset_x, 0.0, 1.0
@@ -95,7 +123,6 @@ class DetectorConfig:
             brush_point_offset_y=_f(
                 "brush_point_offset_y", d.brush_point_offset_y, 0.0, 1.0
             ),
-            cycle_seconds=_f("cycle_seconds", d.cycle_seconds, 4.0, 3600.0),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -103,14 +130,18 @@ class DetectorConfig:
             "kind": self.kind,
             "model_path": self.model_path,
             "confidence": self.confidence,
+            "iou": self.iou,
+            "max_det": self.max_det,
+            "imgsz": self.imgsz,
+            "device": self.device,
+            "half": self.half,
+            "raw_mode": self.raw_mode,
             "screw_label": self.screw_label,
             "hand_label": self.hand_label,
-            "brush_head_label": self.brush_head_label,
-            "brush_rod_label": self.brush_rod_label,
+            "brush_label": self.brush_label,
             "tray_label": self.tray_label,
             "brush_point_offset_x": self.brush_point_offset_x,
             "brush_point_offset_y": self.brush_point_offset_y,
-            "cycle_seconds": self.cycle_seconds,
         }
 
 
@@ -430,6 +461,81 @@ class RecordingConfig:
 
 
 @dataclass(frozen=True)
+class DemoVideo:
+    """一段示例视频：显示名 + 相对仓库根或绝对路径。"""
+
+    name: str
+    path: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> DemoVideo | None:
+        if isinstance(data, str):
+            name, path = "", data
+        elif isinstance(data, dict):
+            path = str(data.get("path", "")).strip()
+            name = str(data.get("name", "")).strip()
+        else:
+            return None
+        if not path:
+            return None
+        if not name:
+            name = Path(path).stem
+        return cls(name=name, path=path)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "path": self.path}
+
+
+@dataclass(frozen=True)
+class DemoConfig:
+    """演示视频源配置。
+
+    演示模式不再使用脚本伪造检测，而是直接回放 ``data/sample_video`` 下的
+    真实录像：画面来自视频文件，检测结果来自训练好的模型。
+    """
+
+    loop: bool = True
+    fps_limit: int = 15
+    videos: tuple[DemoVideo, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> DemoConfig:
+        data = dict(data or {})
+        d = cls()
+        loop = data.get("loop", d.loop)
+        if isinstance(loop, str):
+            loop = loop.strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            fps_limit = int(data.get("fps_limit", d.fps_limit))
+        except (TypeError, ValueError):
+            fps_limit = d.fps_limit
+
+        videos: list[DemoVideo] = []
+        for item in data.get("videos", ()) or ():
+            video = DemoVideo.from_dict(item)
+            if video is not None:
+                videos.append(video)
+        return cls(
+            loop=bool(loop),
+            fps_limit=max(1, min(60, fps_limit)),
+            videos=tuple(videos),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "loop": self.loop,
+            "fps_limit": self.fps_limit,
+            "videos": [video.to_dict() for video in self.videos],
+        }
+
+    def video(self, name: str) -> DemoVideo | None:
+        for video in self.videos:
+            if video.name == name:
+                return video
+        return None
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """一个工位的有效 ROI 与检测配置。
 
@@ -454,6 +560,8 @@ class StationConfig:
         hand_roi = Roi.from_dict(data.get("hand_roi") or data.get("oiling_roi"))
         if tray_roi is None or hand_roi is None:
             return None
+        # 刷涂区默认取人工涂油操作台范围（画面右下方），
+        # 与涂油盘区（tray_roi / oil_station）分开配置。
         brush_roi = Roi.from_dict(data.get("brush_roi")) or hand_roi
 
         exclude_rois: list[Roi] = []
@@ -505,6 +613,7 @@ class OilCheckConfig:
     version: str = "2.0"
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
+    demo: DemoConfig = field(default_factory=DemoConfig)
     stations: tuple[StationConfig, ...] = ()
 
     @classmethod
@@ -520,6 +629,7 @@ class OilCheckConfig:
             version=str(data.get("version", "2.0")),
             pipeline=PipelineConfig.from_dict(data.get("pipeline")),
             recording=RecordingConfig.from_dict(data.get("recording")),
+            demo=DemoConfig.from_dict(data.get("demo")),
             stations=tuple(stations),
         )
 
@@ -528,6 +638,7 @@ class OilCheckConfig:
             "version": self.version,
             "pipeline": self.pipeline.to_dict(),
             "recording": self.recording.to_dict(),
+            "demo": self.demo.to_dict(),
             "stations": [station.to_dict() for station in self.stations],
         }
 

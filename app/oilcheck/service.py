@@ -14,15 +14,16 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+from app.paths import resolve_runtime_file, runtime_root
 
-from .config import OilCheckConfig, OilCheckConfigService, StationConfig
+from .config import DemoVideo, OilCheckConfig, OilCheckConfigService, StationConfig
 from .detector import Detector, create_detector
 from .events import EventStore
 from .pipeline import StationPipeline
@@ -32,8 +33,8 @@ from .types import (
     FrameDetections,
     RecordingStatus,
     StationSnapshot,
-    SyntheticFrame,
 )
+from .video_source import VideoFileSource
 
 logger = logging.getLogger("oilcheck.service")
 
@@ -49,9 +50,12 @@ class _StationRuntime:
             max_workers=1, thread_name_prefix="oilcheck-station"
         )
     )
+    video_source: VideoFileSource | None = None
     busy: bool = False
     last_frame_ts: float = 0.0
     dropped_frames: int = 0
+    # 最近 1 秒内完成处理的帧时间戳，用于计算实际检测帧率。
+    processed_ts: deque[float] = field(default_factory=deque)
     last_snapshot: StationSnapshot | None = None
     last_error: str = ""
     closed: bool = False
@@ -79,8 +83,8 @@ class OilCheckService:
         self._thread: threading.Thread | None = None
         self._runtimes: dict[str, _StationRuntime] = {}
         self._recorders: dict[str, TrainingRecorder] = {}
-        self._demo_frames: dict[str, SyntheticFrame] = {}
         self._detector_overrides: dict[str, str] = {}
+        self._active_video: dict[str, DemoVideo] = {}
         self._cycle_id = f"RUN-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
         self._rebuild_runtimes_locked()
@@ -141,7 +145,7 @@ class OilCheckService:
             self._recorders.clear()
             runtimes = list(self._runtimes.values())
             self._runtimes.clear()
-            self._demo_frames.clear()
+            self._active_video.clear()
 
         for recorder in recorders:
             try:
@@ -187,23 +191,27 @@ class OilCheckService:
                 tasks=(),
             )
         snapshot = runtime.last_snapshot or runtime.pipeline.snapshot()
-        session = self._manager.get_session(snapshot.camera_id)
         online = False
         camera_state = "missing"
-        if session is not None:
-            camera_state = session.state.value
-            last_ts = session.frame_buffer.last_ts()
+        video = runtime.video_source
+        if video is not None:
+            last_ts = video.last_ts()
+            camera_state = "video" if video.playing else "video_stopped"
             online = (
-                camera_state == "previewing"
+                camera_state == "video"
                 and last_ts is not None
                 and (time.time() - last_ts < 5.0)
             )
-        if not online and runtime.detector_kind == "simulated":
-            with self._lock:
-                demo = self._demo_frames.get(snapshot.camera_id)
-            if demo is not None and time.time() - demo.ts < 2.0:
-                online = True
-                camera_state = "demo"
+        else:
+            session = self._manager.get_session(snapshot.camera_id)
+            if session is not None:
+                camera_state = session.state.value
+                last_ts = session.frame_buffer.last_ts()
+                online = (
+                    camera_state == "previewing"
+                    and last_ts is not None
+                    and (time.time() - last_ts < 5.0)
+                )
         stats = dict(snapshot.stats)
         stats["camera_state"] = camera_state
         stats["dropped_frames"] = runtime.dropped_frames
@@ -218,15 +226,15 @@ class OilCheckService:
         )
 
     def latest_frame(self, camera_id: str) -> Any | None:
+        video = self._video_for_camera(camera_id)
+        if video is not None:
+            return video.get()
         session = self._manager.get_session(camera_id)
         # 只在预览状态下返回相机帧；停止后 frame_buffer 可能已被清空，
         # 这里再做一次状态保护，避免 UI 把残留帧当作实时画面。
         if session is not None and session.state.value == "previewing":
-            frame = session.frame_buffer.get()
-            if frame is not None:
-                return frame
-        with self._lock:
-            return self._demo_frames.get(camera_id)
+            return session.frame_buffer.get()
+        return None
 
     def camera_state(self, camera_id: str) -> str:
         session = self._manager.get_session(camera_id)
@@ -278,10 +286,110 @@ class OilCheckService:
         self._logger.info("已请求重置工位流程状态: %s", station_id)
         return True
 
+    # ------------------------------------------------------------------
+    # 示例视频源
+    # ------------------------------------------------------------------
+    def demo_videos(self) -> tuple[DemoVideo, ...]:
+        return tuple(self._config.demo.videos)
+
+    def active_video(self, station_id: str) -> DemoVideo | None:
+        with self._lock:
+            return self._active_video.get(station_id)
+
+    def _make_video_source(
+        self,
+        video: DemoVideo,
+        station_id: str,
+        loop: bool,
+        fps_limit: float,
+    ) -> VideoFileSource | None:
+        path = Path(resolve_runtime_file(video.path, repo_root=runtime_root()))
+        if not path.exists():
+            self._logger.error("示例视频不存在: %s", path)
+            return None
+        return VideoFileSource(
+            path,
+            loop=loop,
+            fps_limit=fps_limit,
+            logger_=self._logger.getChild(station_id),
+        )
+
+    def set_station_video(
+        self, station_id: str, video_name: str | None
+    ) -> bool:
+        """把工位切换到示例视频（``None`` 表示回到实时相机）。
+
+        只替换帧源，不重建检测器：切换视频不会重新加载模型。
+        """
+
+        with self._lock:
+            runtime = self._runtimes.get(station_id)
+            if runtime is None:
+                return False
+            loop = self._config.demo.loop
+            fps_limit = float(self._config.demo.fps_limit)
+
+        old_source = runtime.video_source
+        new_video: DemoVideo | None = None
+        new_source: VideoFileSource | None = None
+
+        if video_name:
+            new_video = self._config.demo.video(video_name)
+            if new_video is None:
+                self._logger.warning(
+                    "示例视频未在配置中登记: %s（工位=%s）", video_name, station_id
+                )
+                return False
+            new_source = self._make_video_source(new_video, station_id, loop, fps_limit)
+            if new_source is None:
+                return False
+
+        runtime.video_source = None
+        runtime.last_frame_ts = 0.0
+        if old_source is not None:
+            try:
+                old_source.stop()
+            except Exception:
+                pass
+
+        if new_source is not None:
+            try:
+                new_source.start()
+            except Exception:
+                self._logger.exception("启动示例视频失败: %s", new_video)
+                with self._lock:
+                    self._active_video.pop(station_id, None)
+                return False
+            runtime.video_source = new_source
+            with self._lock:
+                self._active_video[station_id] = new_video
+            self._logger.info(
+                "工位 %s 切换到示例视频: %s", station_id, new_video.name
+            )
+        else:
+            with self._lock:
+                self._active_video.pop(station_id, None)
+            self._logger.info("工位 %s 已切回实时相机", station_id)
+
+        try:
+            runtime.executor.submit(runtime.pipeline.reset)
+        except RuntimeError:
+            pass
+        return True
+
+    def video_status(self, station_id: str) -> dict[str, Any]:
+        with self._lock:
+            runtime = self._runtimes.get(station_id)
+        if runtime is None or runtime.video_source is None:
+            return {"active": False}
+        status = runtime.video_source.status()
+        status["active"] = True
+        return status
+
     def set_station_detector_kind(
         self, station_id: str, kind: str
     ) -> StationSnapshot | None:
-        """临时切换某个工位的检测器（演示联调用），不写回配置文件。"""
+        """临时切换某个工位的检测器（联调用），不写回配置文件。"""
         with self._lock:
             station = self._config.station(station_id)
             if station is None:
@@ -300,9 +408,12 @@ class OilCheckService:
                 if old is not None:
                     self._runtimes[station_id] = old
                 return None
+            # 视频源交接给新 runtime：先把旧 runtime 的引用摘掉，
+            # 否则 _shutdown_runtime 会把刚接手解码线程停掉。
+            if old is not None:
+                runtime.video_source = old.video_source
+                old.video_source = None
             self._runtimes[station_id] = runtime
-            if effective != "simulated":
-                self._demo_frames.pop(station.camera_id, None)
         if old is not None:
             self._shutdown_runtime(old)
         self._logger.info("工位 %s 检测器切换为 %s", station_id, runtime.detector_kind)
@@ -392,21 +503,22 @@ class OilCheckService:
 
     def _poll_station(self, runtime: _StationRuntime) -> None:
         camera_id = runtime.station.camera_id
-        session = self._manager.get_session(camera_id)
-        frame = None if session is None else session.frame_buffer.get()
-        synthetic = False
+        video = runtime.video_source
+        synthetic = video is not None
+        if video is not None:
+            frame = video.get()
+        else:
+            session = self._manager.get_session(camera_id)
+            frame = None if session is None else session.frame_buffer.get()
         if frame is None:
-            if runtime.detector_kind != "simulated":
-                return
-            # 无相机演示：合成帧只驱动状态机与 UI，绝不写入训练录制。
-            frame = self._demo_frame(camera_id)
-            synthetic = True
+            return
         if frame.ts <= runtime.last_frame_ts:
             return
         runtime.last_frame_ts = frame.ts
 
         with self._lock:
             recorder = self._recorders.get(camera_id)
+        # 示例回放不写入训练录制：回放视频没有录制价值。
         if recorder is not None and recorder.active and not synthetic:
             recorder.submit(frame.ts, frame.bgr)
 
@@ -419,35 +531,24 @@ class OilCheckService:
         except RuntimeError:
             runtime.busy = False
 
-    def _demo_frame(self, camera_id: str) -> SyntheticFrame:
-        now = time.time()
-        with self._lock:
-            existing = self._demo_frames.get(camera_id)
-        if existing is None:
-            bgr = np.full((720, 1280, 3), 30, dtype=np.uint8)
-            bgr[::120, :, :] = 44
-            bgr[:, ::160, :] = 44
-            frame = SyntheticFrame(bgr=bgr, width=1280, height=720, ts=now)
-        else:
-            frame = SyntheticFrame(
-                bgr=existing.bgr,
-                width=existing.width,
-                height=existing.height,
-                ts=now,
-            )
-        with self._lock:
-            self._demo_frames[camera_id] = frame
-        return frame
-
     def _process_frame(self, runtime: _StationRuntime, bgr: Any, ts: float) -> None:
         started = time.perf_counter()
         try:
             detections: FrameDetections = runtime.detector.detect(bgr, ts)
             snapshot = runtime.pipeline.process(detections=detections)
             elapsed = (time.perf_counter() - started) * 1000.0
+            now = time.monotonic()
+            runtime.processed_ts.append(now)
+            while runtime.processed_ts and now - runtime.processed_ts[0] > 1.0:
+                runtime.processed_ts.popleft()
+
             stats = dict(snapshot.stats)
             stats["processing_ms"] = round(elapsed, 2)
+            stats["process_fps"] = len(runtime.processed_ts)
             stats["detections"] = len(detections.detections)
+            imgsz = getattr(runtime.detector, "imgsz", None)
+            if imgsz:
+                stats["imgsz"] = int(imgsz)
             snapshot = replace(snapshot, stats=stats)
             runtime.last_snapshot = snapshot
             runtime.last_error = ""
@@ -493,14 +594,40 @@ class OilCheckService:
             if not kind:
                 kind = station.detector.kind
             try:
-                self._runtimes[station.station_id] = self._build_runtime(station, kind)
+                runtime = self._build_runtime(station, kind)
             except Exception as exc:  # noqa: BLE001
                 self._logger.error(
                     "工位初始化失败 (工位=%s): %s", station.station_id, exc
                 )
+                continue
+            self._runtimes[station.station_id] = runtime
+            # 配置重载后恢复该工位之前选中的示例视频。
+            video = self._active_video.get(station.station_id)
+            if video is not None:
+                source = self._make_video_source(
+                    video,
+                    station.station_id,
+                    self._config.demo.loop,
+                    float(self._config.demo.fps_limit),
+                )
+                if source is not None:
+                    try:
+                        source.start()
+                        runtime.video_source = source
+                    except Exception:
+                        self._logger.exception(
+                            "恢复示例视频失败: %s", video.name
+                        )
 
     def _shutdown_runtime(self, runtime: _StationRuntime) -> None:
         runtime.closed = True
+        source = runtime.video_source
+        runtime.video_source = None
+        if source is not None:
+            try:
+                source.stop()
+            except Exception:
+                pass
         try:
             runtime.executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
@@ -509,6 +636,14 @@ class OilCheckService:
             runtime.detector.close()
         except Exception:
             pass
+
+    def _video_for_camera(self, camera_id: str) -> VideoFileSource | None:
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+        for runtime in runtimes:
+            if runtime.station.camera_id == camera_id and runtime.video_source:
+                return runtime.video_source
+        return None
 
     def _station_for_camera(self, camera_id: str) -> StationConfig | None:
         for station in self._config.stations:

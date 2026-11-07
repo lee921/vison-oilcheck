@@ -16,6 +16,19 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from app.oilcheck.roi import Roi
 from app.oilcheck.types import Detection
 
+# 检测框调色板：前四项对应配置里的 hand / brush / oil_station / screw，
+# 顺序由 monitor_page 决定；其余留给模型后续新增的类别。
+PALETTE: tuple[str, ...] = (
+    "#ff9f0a",
+    "#ff375f",
+    "#ffd60a",
+    "#32d74b",
+    "#bf5af2",
+    "#64d2ff",
+    "#5ac8fa",
+    "#ff2d55",
+)
+
 
 @dataclass(frozen=True)
 class RoiOverlay:
@@ -38,11 +51,8 @@ class OilCheckVideoView(QWidget):
         self._detections: tuple[Detection, ...] = ()
         self._banner = ""
         self._hint = "等待视频帧"
-        self._hand_label = "hand"
-        self._screw_label = "screw"
-        self._brush_label = "brush_head"
-        self._brush_rod_label = "brush_rod"
-        self._tray_label = "oil_tray"
+        self._label_colors: dict[str, str] = {}
+        self._fallback_colors = PALETTE
 
     def set_frame(self, bgr: np.ndarray, ts: float) -> bool:
         if bgr is None or getattr(bgr, "size", 0) == 0:
@@ -67,20 +77,19 @@ class OilCheckVideoView(QWidget):
         rois: tuple[RoiOverlay, ...],
         detections: tuple[Detection, ...],
         banner: str = "",
-        hand_label: str = "hand",
-        screw_label: str = "screw",
-        brush_label: str = "brush_head",
-        brush_rod_label: str = "brush_rod",
-        tray_label: str = "oil_tray",
+        label_colors: dict[str, str] | None = None,
     ) -> None:
+        """``label_colors`` 由调用方按配置里的类别名构造。
+
+        未登记的类别按调色板顺延取色，这样模型新增类别也能画出来，
+        不需要改 UI 代码。
+        """
+
         self._rois = rois
         self._detections = detections
         self._banner = banner
-        self._hand_label = hand_label
-        self._screw_label = screw_label
-        self._brush_label = brush_label
-        self._brush_rod_label = brush_rod_label
-        self._tray_label = tray_label
+        if label_colors:
+            self._label_colors = dict(label_colors)
         self.update()
 
     def clear(self, hint: str = "等待视频帧") -> None:
@@ -187,22 +196,20 @@ class OilCheckVideoView(QWidget):
                     item.name,
                 )
 
+    def _color_for(self, label: str) -> str:
+        """已配置的类别用配置颜色，未知类别按名字稳定散列取调色板色。"""
+
+        color = self._label_colors.get(label)
+        if color:
+            return color
+        index = sum(ord(ch) for ch in label) % len(self._fallback_colors)
+        return self._fallback_colors[index]
+
     def _draw_detections(self, painter: QPainter, image_rect: QRectF) -> None:
         painter.setFont(QFont("", 9))
         for det in self._detections:
             base_label = det.label.split("#", 1)[0]
-            if base_label == self._hand_label:
-                color = QColor("#ff9f0a")
-            elif base_label == self._screw_label:
-                color = QColor("#32d74b")
-            elif base_label == self._brush_label:
-                color = QColor("#ff375f")
-            elif base_label == self._brush_rod_label:
-                color = QColor("#bf5af2")
-            elif base_label == self._tray_label:
-                color = QColor("#ffd60a")
-            else:
-                color = QColor("#64d2ff")
+            color = QColor(self._color_for(base_label))
 
             top_left = self._map_point(det.box.x1, det.box.y1, image_rect)
             bottom_right = self._map_point(det.box.x2, det.box.y2, image_rect)

@@ -233,6 +233,8 @@ class StationPipeline:
         width, height = detections.frame_size
         if width <= 0 or height <= 0:
             return self.snapshot()
+        if self.station.detector.raw_mode:
+            return self._process_raw(detections)
 
         dt = 0.0
         if self._last_frame_ts is not None:
@@ -261,7 +263,7 @@ class StationPipeline:
         )
         hands = self._valid_detections(detections.by_label(cfg.hand_label), frame_size)
         brushes = self._valid_detections(
-            detections.by_label(cfg.brush_head_label), frame_size
+            detections.by_label(cfg.brush_label), frame_size
         )
 
         screw_out = self._screw_tracker.update(
@@ -284,6 +286,24 @@ class StationPipeline:
         self._update_candidates(ts=ts, dt=dt, tray_box=tray_box)
         self._update_tasks(ts=ts, dt=dt, tray_box=tray_box)
         self._cleanup(ts)
+        return self.snapshot()
+
+    def _process_raw(self, detections: FrameDetections) -> StationSnapshot:
+        """旁路模式：只交出这一帧的全部检测结果。
+
+        不做 ROI 过滤、不建轨迹、不判取料/刷涂、不产生事件。用于先确认
+        模型对画面的标签覆盖情况，SOP 状态机保持空闲。
+        """
+
+        self._last_frame_ts = float(detections.ts)
+        width, height = detections.frame_size
+        self._frame_size = (int(width), int(height))
+        self._last_detections = detections.detections
+        self._frames_processed += 1
+        self._screw_tracks = ()
+        self._hand_tracks = ()
+        self._brush_tracks = ()
+        self._tray = TrayTrack()
         return self.snapshot()
 
     def snapshot(self) -> StationSnapshot:
@@ -312,6 +332,8 @@ class StationPipeline:
                 "tray_reliable": self._tray_region_reliable(),
                 "frame_gap_events": self._frame_gap_events,
                 "last_frame_gap_s": round(self._last_frame_gap_s, 3),
+                "raw_mode": self.station.detector.raw_mode,
+                "label_counts": _label_counts(self._last_detections),
             },
         )
 
@@ -1355,7 +1377,7 @@ class StationPipeline:
         for label, tracks in (
             (self.station.detector.screw_label, self._screw_tracks),
             (self.station.detector.hand_label, self._hand_tracks),
-            (self.station.detector.brush_head_label, self._brush_tracks),
+            (self.station.detector.brush_label, self._brush_tracks),
         ):
             for track in tracks:
                 items.append(
@@ -1477,3 +1499,12 @@ def _segment_index(axial: float, count: int) -> int:
     ratio = (axial + 1.0) * 0.5
     ratio = max(0.0, min(0.999999, ratio))
     return int(ratio * count)
+
+
+def _label_counts(detections: tuple[Detection, ...]) -> dict[str, int]:
+    """按类别统计本帧目标数，供 UI 核对“所有标签是否都出来了”。"""
+
+    counts: dict[str, int] = {}
+    for det in detections:
+        counts[det.label] = counts.get(det.label, 0) + 1
+    return dict(sorted(counts.items()))

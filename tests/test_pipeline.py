@@ -4,10 +4,7 @@ import math
 from dataclasses import replace
 from itertools import count
 
-import numpy as np
-
 from app.oilcheck.config import PipelineConfig, StationConfig
-from app.oilcheck.detector import SimulatedDetector
 from app.oilcheck.pipeline import StationPipeline
 from app.oilcheck.roi import Roi
 from app.oilcheck.types import (
@@ -46,8 +43,8 @@ def make_station(exclude: bool = False) -> StationConfig:
             "kind": "null",
             "screw_label": "screw",
             "hand_label": "hand",
-            "brush_head_label": "brush_head",
-            "tray_label": "oil_tray",
+            "brush_label": "brush",
+            "tray_label": "oil_station",
         },
     }
     if exclude:
@@ -122,7 +119,7 @@ def held_screw_at(cx: float, cy: float) -> Detection:
 
 def brush_at(cx: float, cy: float) -> Detection:
     return Detection(
-        label="brush_head",
+        label="brush",
         confidence=0.88,
         box=BBox(cx - 10, cy - 10, cx + 10, cy + 10),
         point=(cx, cy),
@@ -386,23 +383,111 @@ def test_tray_motion_does_not_break_screw_tracks():
     assert pipeline.tasks == ()
 
 
-def test_simulated_detector_drives_full_flow():
-    station = make_station()
-    station = replace(station, detector=replace(station.detector, kind="simulated"))
-    pipeline, events = make_pipeline(station)
-    detector = SimulatedDetector(station, station.detector)
-    frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+def test_frame_detections_contract_drives_full_flow():
+    """按检测器契约（FrameDetections）喂帧即可跑完整流程。
 
-    ts = 100.0
-    for _ in range(400):
-        ts += 0.1
-        pipeline.process(detections=detector.detect(frame, ts))
+    这是原来 simulated 演示器测试的替代：不再依赖脚本伪造检测，
+    而是直接用测试构造的 Detection 序列验证流水线。
+    """
+
+    pipeline, events = make_pipeline(coverage_required=1.0)
+    ts_iter = timestamps()
+
+    def detector_frame(ts: float, items: tuple[Detection, ...]) -> FrameDetections:
+        return FrameDetections(
+            ts=ts, frame_size=(WIDTH, HEIGHT), detections=items, source="test"
+        )
+
+    ts = 0.0
+    for _ in range(3):
+        ts = next(ts_iter)
+        pipeline.process(
+            detections=detector_frame(ts, tuple(tray_screw(i) for i in range(4)))
+        )
+
+    others = tuple(tray_screw(i) for i in range(1, 4))
+    for step in range(1, 9):
+        ts = next(ts_iter)
+        t = step / 8
+        cx = SCREW_X[0] + (HAND_TARGET[0] - SCREW_X[0]) * t
+        cy = TRAY_CENTER_Y + (HAND_TARGET[1] - TRAY_CENTER_Y) * t
+        pipeline.process(
+            detections=detector_frame(
+                ts, (hand_at(cx, cy), held_screw_at(cx, cy)) + others
+            )
+        )
+    for _ in range(4):
+        ts = next(ts_iter)
+        pipeline.process(
+            detections=detector_frame(
+                ts, (hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET)) + others
+            )
+        )
+    for step in range(10):
+        ts = next(ts_iter)
+        offset = (-40, -20, 0, 20, 40, 20, 0, -20)[step % 8]
+        pipeline.process(
+            detections=detector_frame(
+                ts,
+                (
+                    hand_at(*HAND_TARGET),
+                    held_screw_at(*HAND_TARGET),
+                    brush_at(HAND_TARGET[0] + offset, HAND_TARGET[1]),
+                )
+                + others,
+            )
+        )
 
     kinds = {(event.event_type, event.result) for event in events}
     assert (EventType.PICK, EventResult.CONFIRMED) in kinds
     assert (EventType.BRUSH_CONTACT, EventResult.CONFIRMED) in kinds
     assert (EventType.MANUAL_OILING, EventResult.CONFIRMED) in kinds
     assert (EventType.TASK_RESULT, EventResult.CONFIRMED) in kinds
+
+
+def test_raw_mode_passes_all_detections_without_events():
+    """raw_mode：全量交出检测结果，不建轨迹、不产生事件。"""
+
+    station = make_station()
+    station = replace(station, detector=replace(station.detector, raw_mode=True))
+    pipeline, events = make_pipeline(station)
+
+    detections = (
+        Detection(label="hand", confidence=0.9, box=BBox(10, 10, 60, 60)),
+        Detection(label="brush", confidence=0.8, box=BBox(70, 70, 120, 120)),
+        Detection(label="oil_station", confidence=0.7, box=BBox(130, 130, 200, 200)),
+        Detection(
+            label="screw",
+            confidence=0.6,
+            box=BBox(210, 210, 260, 260),
+            angle=math.pi * 0.5,
+        ),
+    )
+    snapshot = feed(pipeline, 1.0, *detections)
+
+    assert snapshot.detections == detections
+    assert snapshot.tracks == ()
+    assert snapshot.tasks == ()
+    assert events == []
+    assert snapshot.stats["raw_mode"] is True
+    assert snapshot.stats["label_counts"] == {
+        "brush": 1,
+        "hand": 1,
+        "oil_station": 1,
+        "screw": 1,
+    }
+
+
+def test_raw_mode_skips_roi_filtering():
+    """raw_mode 不做 ROI/排除区过滤，画面外的框也照样交出。"""
+
+    station = make_station(exclude=True)
+    station = replace(station, detector=replace(station.detector, raw_mode=True))
+    pipeline, _ = make_pipeline(station)
+
+    outside = Detection(label="screw", confidence=0.5, box=BBox(0, 0, 20, 20))
+    snapshot = feed(pipeline, 1.0, outside)
+    assert snapshot.detections == (outside,)
 
 
 def test_roi_supports_rect_and_polygon():
@@ -425,5 +510,5 @@ def test_station_config_roundtrip_without_slots():
     assert restored.tray_roi == station.tray_roi
     assert restored.hand_roi == station.hand_roi
     assert restored.brush_roi == station.brush_roi
-    assert restored.detector.brush_head_label == "brush_head"
+    assert restored.detector.brush_label == "brush"
     assert not hasattr(restored, "slot_layout")

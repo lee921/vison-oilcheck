@@ -231,16 +231,6 @@ class Detection:
 
 
 @dataclass(frozen=True)
-class SyntheticFrame:
-    """无相机演示模式下的合成帧，仅用于驱动状态机与 UI。"""
-
-    bgr: Any
-    width: int
-    height: int
-    ts: float
-
-
-@dataclass(frozen=True)
 class FrameDetections:
     """检测器对一帧的完整输出。"""
 

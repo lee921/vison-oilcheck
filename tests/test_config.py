@@ -22,9 +22,9 @@ def test_repo_oilcheck_template_is_valid():
     assert station.hand_roi.kind == "rect"
     assert station.brush_roi.kind == "rect"
     assert station.exclude_rois == ()
-    assert station.detector.kind in {"null", "simulated", "yolo"}
+    assert station.detector.kind in {"null", "yolo"}
     assert station.detector.screw_label
-    assert station.detector.brush_head_label
+    assert station.detector.brush_label
     assert station.detector.tray_label
     assert cfg.pipeline.max_fps >= 1
     assert cfg.pipeline.brush_min_duration_s >= 0
@@ -59,7 +59,7 @@ def test_legacy_station_config_is_migrated():
     assert station.hand_roi.points == ((0.5, 0.5), (0.8, 0.8))
     assert station.brush_roi == station.hand_roi
     assert station.detector.screw_label == "rod"
-    assert station.detector.brush_head_label == "brush"
+    assert station.detector.brush_label == "brush"
 
     assert StationConfig.from_dict({**legacy, "camera_id": ""}) is None
     assert (

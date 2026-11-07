@@ -8,7 +8,7 @@ HEIGHT = 1000
 
 
 def tray(box: BBox) -> Detection:
-    return Detection(label="oil_tray", confidence=0.95, box=box)
+    return Detection(label="oil_station", confidence=0.95, box=box)
 
 
 def test_tray_tracker_reports_missing_and_reliability():

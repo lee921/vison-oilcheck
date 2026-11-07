@@ -11,7 +11,8 @@
 - **视觉 ID 与业务 ID 分离**：跟踪器给出短时 Track ID，业务层维护 `TASK-xxxxxx`
 - **证据不足不硬判**：遮挡、关联不确定、刷头不可见时输出
   `PENDING_CONFIRMATION`
-- 无模型可运行：`null` 检测器保证不伪造事件；`演示模式` 用脚本数据联调 UI/流程
+- 无模型可运行：`null` 检测器保证不伪造事件
+- 示例回放：`画面源` 下拉直接回放 `data/sample_video` 下的真实录像
 
 ## 快速开始
 
@@ -36,12 +37,14 @@ OILCHECK_DATA_ROOT=$(pwd) uv run python main.py
 
 ```text
 app/oilcheck/          业务核心：配置、ROI、检测器、跟踪、取料/刷涂引擎、任务、事件、录制
+app/oilcheck/video_source.py  示例视频帧源（回放 mp4，按视频节拍投放帧）
 app/camera_manager.py  相机会话与重连
 hik/                   海康 SDK 封装
 ui/pages/              监控、复核、训练录制、设备、设置、日志页面
 config/                配置模板（复制到数据目录后生效）
 docs/                  各模块设计/使用文档（必读）
 tests/                 取料证据、刷涂覆盖、跟踪、事件、配置单元测试
+tools/detect_video.py  离线跑示例视频，输出带框视频与逐帧检测 JSONL
 lib/                   海康 SDK 运行库与 Python 封装
 ```
 
@@ -49,16 +52,19 @@ lib/                   海康 SDK 运行库与 Python 封装
 
 模型训练在另一个项目中完成，本项目只消费导出权重。检测类别：
 
-| 类别 | 作用 | 优先级 |
+| id | 类别 | 作用 |
 | --- | --- | --- |
-| `screw` | 每根独立丝杆 | P0 |
-| `hand` | 左右手统一类别 | P0 |
-| `brush_head` | 刷具工作端（可提供关键点） | P0 |
-| `brush_rod` | 红色长杆刷具 | P1 |
-| `oil_tray` | 涂油盘定位参考 | P1 |
+| 0 | `hand` | 左右手统一类别 |
+| 1 | `brush` | 刷具（含工作端） |
+| 2 | `oil_station` | 涂油工位/盘体定位参考 |
+| 3 | `screw` | 每根独立丝杆 |
 
-`detector.kind=yolo` 支持普通 Detect、OBB 与关键点输出。没有模型时使用
-`null`；现场联调可使用 `simulated`。
+仓库自带权重：`model/detect/exp/weights/best.pt`（YOLO11n，`imgsz=1024`，
+mAP50 0.976）。`detector.imgsz=0` 会自适应训练尺寸。
+
+没有模型时使用 `null`。示例视频放在 `data/sample_video/`，在监控页
+“画面源”下拉里直接回放，检测仍由模型完成（`detector.raw_mode=true`
+时只输出全量检测结果，不做 SOP 判定）。
 
 ## 结果判定
 
