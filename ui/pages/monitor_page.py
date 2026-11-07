@@ -511,18 +511,10 @@ class MonitorPage(QWidget):
             rois.append(RoiOverlay("排除区", roi, "#8a8f98", dashed=True))
 
         # 画面上的框全部来自配置里的类别名，未知类别也会被画出来。
+        # 只画检测框：跟踪 ID 属于内部短时身份，不显示在画面上。
         detections: tuple[Detection, ...] = ()
         if snapshot is not None:
-            detections = tuple(snapshot.detections) + tuple(
-                Detection(
-                    label=f"{track.label}#{track.track_id}",
-                    confidence=track.confidence,
-                    box=track.box,
-                    angle=track.angle,
-                    point=track.point,
-                )
-                for track in snapshot.tracks
-            )
+            detections = tuple(snapshot.detections)
 
         mode = "" if snapshot is None else snapshot.mode
         tray_state = ""

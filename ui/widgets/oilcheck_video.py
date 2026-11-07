@@ -208,8 +208,7 @@ class OilCheckVideoView(QWidget):
     def _draw_detections(self, painter: QPainter, image_rect: QRectF) -> None:
         painter.setFont(QFont("", 9))
         for det in self._detections:
-            base_label = det.label.split("#", 1)[0]
-            color = QColor(self._color_for(base_label))
+            color = QColor(self._color_for(det.label))
 
             top_left = self._map_point(det.box.x1, det.box.y1, image_rect)
             bottom_right = self._map_point(det.box.x2, det.box.y2, image_rect)
