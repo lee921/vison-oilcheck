@@ -5,7 +5,7 @@ data: /home/zw/xanylabeling_data/trainer/ultralytics/datasets/oilcheck_4cls_2026
 epochs: 100
 time: 0.0
 patience: 100
-batch: 16
+batch: 32
 imgsz: 1024
 save: true
 save_period: -1

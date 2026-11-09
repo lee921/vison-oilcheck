@@ -11,7 +11,7 @@
   },
   "train": {
     "epochs": 100,
-    "batch": 16,
+    "batch": 32,
     "imgsz": 1024,
     "workers": 4,
     "single_cls": false,
