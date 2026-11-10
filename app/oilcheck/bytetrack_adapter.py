@@ -33,6 +33,73 @@ from .types import BBox, Detection
 
 logger = logging.getLogger("oilcheck.bytetrack")
 
+
+def _ensure_lap_available() -> None:
+    """``lap`` 缺失时注入等价实现，让 ultralytics 的 trackers 能正常导入。
+
+    ultralytics 的 ``trackers.utils.matching`` 在**模块导入时**就
+    ``import lap``，缺了会触发 ``check_requirements`` 联网安装——服务器
+    网络受限时这一段会打印整屏重试日志并失败，ByteTrack 随之不可用，
+    只能回退到自研 ``ObjectTracker``（快速小目标的 ID 保持明显更差）。
+
+    纯 Python 分派只需一个 ``lapjv(cost, extend_cost, cost_limit)``。这里用
+    ultralytics 自带的 ``linear_sum_assignment``（scipy 优先，否则纯 numpy）
+    实现同样的语义：最小代价一一匹配，代价超过 ``cost_limit`` 的视为未匹配。
+
+    只有在真实 ``lap`` 不可用时才注入，装了 ``lap`` 的机器行为完全不变。
+    """
+
+    import sys
+    import types
+
+    if "lap" in sys.modules:
+        return
+    try:
+        import lap  # noqa: F401  # 已安装：什么都不做
+
+        return
+    except ImportError:
+        pass
+
+    lap_mod = types.ModuleType("lap")
+    lap_mod.__version__ = "0.0.0+oilcheck-fallback"
+
+    def lapjv(
+        cost: Any, extend_cost: bool = False, cost_limit: float = float("inf")
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        from ultralytics.utils.ops import linear_sum_assignment
+
+        matrix = np.asarray(cost, dtype=np.float64)
+        rows, cols = matrix.shape
+        # lapjv 要求方阵；用大代价补齐，避免把补齐的虚拟行列选为有效匹配。
+        big = (
+            float(np.abs(matrix).max()) * 2.0 + 1.0
+            if matrix.size
+            else 1.0
+        )
+        size = max(rows, cols)
+        padded = np.full((size, size), big, dtype=np.float64)
+        padded[:rows, :cols] = matrix
+        row_ind, col_ind = linear_sum_assignment(padded)
+
+        x = np.full(rows, -1, dtype=int)
+        y = np.full(cols, -1, dtype=int)
+        total = 0.0
+        for r, c in zip(row_ind, col_ind, strict=False):
+            if r >= rows or c >= cols:
+                continue  # 补齐的虚拟节点
+            cost_value = matrix[r, c]
+            if not np.isfinite(cost_value) or cost_value > cost_limit:
+                continue  # 超过门限：留作未匹配
+            x[r] = c
+            y[c] = r
+            total += float(cost_value)
+        return total, x, y
+
+    lap_mod.lapjv = lapjv  # type: ignore[attr-defined]
+    sys.modules["lap"] = lap_mod
+    logger.info("未安装 lap，已注入 scipy/numpy 版分配实现供 ByteTrack 使用")
+
 _LOGGED_FORMAT_WARNING = False
 
 
@@ -92,6 +159,8 @@ def _build_impl(
 ) -> Any:
     """构造改写过的 BYTETracker；ultralytics 不可用时返回 None。"""
 
+    # 必须在导入 trackers 之前补上分配实现：matching 在模块导入时就 import lap。
+    _ensure_lap_available()
     try:
         from ultralytics.trackers.byte_tracker import BYTETracker
         from ultralytics.trackers.utils import matching

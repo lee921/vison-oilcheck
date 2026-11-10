@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+
+import numpy as np
 import pytest
 
 from app.oilcheck.bytetrack_adapter import ByteTrackObjectTracker
@@ -200,3 +203,91 @@ def test_get_returns_unmatched_track():
     track = tracker.get(track_id)
     assert track is not None
     assert track.matched is False
+
+
+# ----------------------------------------------------------------------
+# lap 缺失兜底
+# ----------------------------------------------------------------------
+def _block_lap(monkeypatch) -> None:
+    """模拟「没装 lap」：清缓存并让后续 import 抛 ImportError。"""
+
+    import sys
+
+    class _Block:
+        def find_spec(self, name, path=None, target=None):
+            if name == "lap" or name.startswith("lap."):
+                raise ImportError("No module named 'lap' (blocked by test)")
+            return None
+
+    monkeypatch.delitem(sys.modules, "lap", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_Block(), *sys.meta_path])
+
+
+def test_lap_fallback_produces_optimal_assignment(monkeypatch):
+    """没有 lap 时注入的 lapjv 与真实实现语义一致：最小代价一一匹配。"""
+
+    import sys
+
+    from app.oilcheck.bytetrack_adapter import _ensure_lap_available
+
+    _block_lap(monkeypatch)
+    _ensure_lap_available()
+    lap = sys.modules["lap"]
+    assert getattr(lap, "__version__", "").endswith("+oilcheck-fallback")
+
+    # 3x3 代价矩阵：最优分配是 (0→1, 1→0, 2→2)，总代价 1+1+1=3。
+    cost = np.array(
+        [[4.0, 1.0, 9.0], [1.0, 5.0, 8.0], [7.0, 6.0, 1.0]], dtype=np.float64
+    )
+    total, x, y = lap.lapjv(cost, extend_cost=True, cost_limit=1e9)
+    assert total == pytest.approx(3.0)
+    assert list(x) == [1, 0, 2]
+    assert list(y) == [1, 0, 2]
+
+
+def test_lap_fallback_respects_cost_limit(monkeypatch):
+    """超过 cost_limit 的匹配必须留作未匹配（返回 -1）。"""
+
+    import sys
+
+    from app.oilcheck.bytetrack_adapter import _ensure_lap_available
+
+    _block_lap(monkeypatch)
+    _ensure_lap_available()
+    lap = sys.modules["lap"]
+
+    cost = np.array([[0.1, 9.0], [9.0, 0.2]], dtype=np.float64)
+    _, x, y = lap.lapjv(cost, extend_cost=True, cost_limit=0.9)
+    assert list(x) == [0, 1]
+    assert list(y) == [0, 1]
+
+    # 门限收紧到 0.05 后两个都不该匹配。
+    _, x2, y2 = lap.lapjv(cost, extend_cost=True, cost_limit=0.05)
+    assert list(x2) == [-1, -1]
+    assert list(y2) == [-1, -1]
+
+
+def test_bytetrack_works_without_lap(monkeypatch):
+    """lap 缺失时仍走 ByteTrack（而不是回退 ObjectTracker），且 ID 稳定。"""
+
+    from app.oilcheck import bytetrack_adapter
+
+    _block_lap(monkeypatch)
+    monkeypatch.setattr(
+        bytetrack_adapter, "logger", logging.getLogger("test.bytetrack")
+    )
+    tracker = bytetrack_adapter.ByteTrackObjectTracker(
+        max_distance=0.15, backend="auto"
+    )
+    assert tracker.backend == "bytetrack"
+
+    ids = set()
+    for i in range(10):
+        cx = 100.0 + i * 60.0
+        out = tracker.update(
+            ts=i / 15.0,
+            detections=(_det(cx, 500.0),),
+            frame_size=(2560, 1440),
+        )
+        ids |= {t.track_id for t in out.active if t.matched}
+    assert len(ids) == 1, f"快速移动时 ID 应保持，实际 {sorted(ids)}"

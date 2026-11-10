@@ -13,6 +13,9 @@ dependencies = [
     "torch>=2.7",
     "torchvision>=0.26.0",
     "ultralytics>=8.4.202",
+    # ByteTrack 的匈牙利匹配依赖。ultralytics 只在 solutions 额外组里声明它，
+    # 不装会在导入 trackers 时联网自动安装（服务器无外网就会失败）。
+    "lap>=0.5.12",
 ]
 
 [dependency-groups]
