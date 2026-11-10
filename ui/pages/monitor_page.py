@@ -44,6 +44,7 @@ from app.config_service import ConfigService
 from app.models import AppConfig
 from app.oilcheck.service import OilCheckService
 from app.oilcheck.types import (
+    BBox,
     Detection,
     StationSnapshot,
     TaskResult,
@@ -614,23 +615,15 @@ class MonitorPage(QWidget):
         self._btn_snapshot.setEnabled(previewing)
 
     def _update_region_cards(self, station, snapshot: StationSnapshot | None) -> None:
-        tracks = snapshot.tracks if snapshot is not None else ()
-        # raw_mode 下没有轨迹，直接按本帧检测计数，卡片仍有信息量。
-        counts = (snapshot.stats.get("label_counts") if snapshot else None) or {}
-        cfg = station.detector
-        hand_count = sum(
-            1 for t in tracks if t.label == cfg.hand_label and t.observed
-        ) or int(counts.get(cfg.hand_label, 0))
-        brush_count = sum(
-            1 for t in tracks if t.label == cfg.brush_label and t.observed
-        ) or int(counts.get(cfg.brush_label, 0))
-        screw_count = sum(
-            1 for t in tracks if t.label == cfg.screw_label and t.observed
-        ) or int(counts.get(cfg.screw_label, 0))
+        counts, suffix = work_area_counts(station, snapshot)
+        screw_count = counts[station.detector.screw_label]
+        hand_count = counts[station.detector.hand_label]
+        brush_count = counts[station.detector.brush_label]
         self._region_cards["work"].set_state(
             f"丝杆 {screw_count} 个",
             "#15803d" if screw_count else "#374151",
-            f"手 {hand_count} 只 · 刷具 {brush_count} 个（区内跟踪）",
+            f"手 {hand_count} 只 · 刷具 {brush_count} 个"
+            + (suffix if suffix else "（区内跟踪）"),
         )
         self._region_cards["oiling"].set_state(
             "已标定" if station.oiling_roi is not None else "未标定",
@@ -985,6 +978,55 @@ class MonitorPage(QWidget):
         self._station_combo.setCurrentIndex(index)
         self._station_combo.blockSignals(False)
         self._apply_station(index)
+
+
+def work_area_counts(
+    station, snapshot: StationSnapshot | None
+) -> tuple[dict[str, int], str]:
+    """统计工作追踪区内的目标数，返回 ``({label: 数量}, 附加说明)``。
+
+    - **手/刷头**：按跟踪轨迹统计，只算本帧实际观测到、且中心在区内的；
+      ``snapshot.tracks`` 比「区内」宽——它还包括涂油盘区内的目标，以及移出区外
+      但仍在跟踪的目标（``roi_track_margin``）。
+    - **丝杆**：不建轨迹，只做逐帧检测，因此按本帧检测框在区内的个数统计。
+      不要用「跟踪数 or 全画面检测数」兜底——跟踪数为 0 时会静默回退成全画面
+      检测总数，卡片显示的就完全不是区内数了。
+    - **raw_mode**：没有轨迹且本来就不过滤区域，只能按全画面检测计数，
+      返回值里带上说明，避免误读。
+    """
+
+    cfg = station.detector
+    labels = (cfg.hand_label, cfg.brush_label, cfg.screw_label)
+    counts = (snapshot.stats.get("label_counts") if snapshot else None) or {}
+    if snapshot is None:
+        return ({label: int(counts.get(label, 0)) for label in labels}, "")
+    if bool(snapshot.stats.get("raw_mode")):
+        return (
+            {label: int(counts.get(label, 0)) for label in labels},
+            "（raw_mode 全画面计数）",
+        )
+
+    width, height = snapshot.frame_size
+    work_roi = station.work_roi
+
+    def in_work_area(box: BBox) -> bool:
+        return work_roi.contains_box_center(box, width, height)
+
+    inside_tracks = [
+        track
+        for track in snapshot.tracks
+        if track.observed and in_work_area(track.box)
+    ]
+    result = dict.fromkeys(labels, 0)
+    for track in inside_tracks:
+        if track.label in result:
+            result[track.label] += 1
+    result[cfg.screw_label] = sum(
+        1
+        for det in snapshot.detections
+        if det.label == cfg.screw_label and in_work_area(det.box)
+    )
+    return (result, "")
 
 
 def _frame_position(info: dict) -> str:
