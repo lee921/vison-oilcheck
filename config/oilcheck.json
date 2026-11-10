@@ -1,125 +1,190 @@
 {
+  // 配置结构版本，供自动迁移判断，不要手工改
   "version": "2.4",
+  // 时序判定参数。单位：时间=秒，距离=按画面对角线归一化
   "pipeline": {
+    // 检测最大帧率。也是帧率自适应的基准：实际帧间隔超过 1/max_fps 时，距离门限按倍率放大（见 frame_scale_max）
     "max_fps": 15,
+    // 手-丝杆关联时视为「够得着」的最大归一化中心距离
     "pick_hand_distance": 0.05,
+    // 手在涂油盘内的最短停留时长。低于该值视为从盘边划过，不判取料。纯时间阈值，不随帧率缩放
     "pick_confirm_s": 0.3,
+    // 手部轨迹匹配的最大归一化中心距离。低帧率时按帧间隔自动放大
     "hand_track_max_distance": 0.15,
-    "hand_track_max_missing_s": 0.8,
+    // 手部轨迹漏检后保留时长，超过即删除轨迹
+    "hand_track_max_missing_s": 1.5,
+    // 手部轨迹需命中多少帧才参与刷头靠近判定
     "hand_track_min_hits": 1,
+    // 同时保留的手部轨迹上限。漏检轨迹在保留期内仍占名额，设小了会让新的手检测框建不了轨迹（画面里常有手臂、盘边被误检成 hand）
     "hand_track_max_active": 8,
+    // 刷头轨迹匹配的最大归一化中心距离
     "brush_track_max_distance": 0.15,
+    // 刷头轨迹漏检后保留时长
     "brush_track_max_missing_s": 0.8,
+    // 刷头轨迹需命中多少帧才参与靠近判定
     "brush_track_min_hits": 1,
+    // 同时保留的刷头轨迹上限
     "brush_track_max_active": 4,
+    // 刷头工作点到手持丝杆中心的归一化距离小于该值，本帧计为「靠近」
     "brush_contact_distance": 0.06,
+    // 刷头靠近累计到该时长即判「人工二次涂油完成」。纯时间阈值，不随帧率缩放
     "brush_hold_s": 1.0,
+    // 手部轨迹消失后，进盘过程作废的时长（取料判定用）
     "holding_lost_timeout_s": 2.0,
+    // 预留项：当前判定逻辑本身就只维护一个活动周期，改这里不会变成多任务
     "single_active_task": true,
+    // 内存中最多保留多少个作业周期
     "task_max_active": 4,
+    // 周期完成后在 UI 上保留多久再清理
     "completed_retain_s": 10.0,
+    // 涂油盘跟踪的匹配距离（盘体上下移动时用）
     "tray_max_distance": 0.2,
+    // 涂油盘检测漏检后保留预测框的时长
     "tray_max_missing_s": 1.0,
+    // 低于该置信度的盘体检测不参与盘区更新
     "tray_min_confidence": 0.3,
+    // 手框与丝杆框的关联距离上限；还要求两者交叠才认作「握着」
     "hand_screw_max_distance": 0.1,
+    // 预留项：当前判定未使用，手-丝杆关联直接按交叠与距离判定
     "hand_interaction_margin": 0.02,
+    // 预留项：丝杆锚点跟踪上线后不再使用（锚点按位置连续性跟随）
     "held_infer_distance": 0.1,
+    // 手/丝杆短时遮挡时按预测位置继续的时长。按帧率自动放大
     "held_predict_hold_s": 0.5,
+    // 丝杆锚点单帧最大位移。取料后按最近邻连续性跟这根杆，既跟得住快速移动，又不会跳到相邻丝杆（盘里间距很小）
     "screw_anchor_max_step": 0.12,
+    // 锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则停止累计涂油
     "screw_anchor_hold_s": 0.5,
+    // 刷头整帧漏检时允许补回的最大空档。用于低帧率下不丢时间；刷子检测到了但离得远不补
     "brush_hold_max_gap_s": 0.5,
+    // 帧率自适应倍率上限。门限按「实际帧间隔 / (1/max_fps)」放大，但不超过该值，避免低帧率时门限大到失去区分度
     "frame_scale_max": 4.0,
+    // 已跟踪目标移出工作追踪区后继续跟踪的距离余量。区外目标不会新建轨迹
     "roi_track_margin": 0.2,
+    // auto=优先 ByteTrack，失败回退自研；可选 bytetrack / object
     "hand_tracker_backend": "auto",
+    // 同上，刷头专用
     "brush_tracker_backend": "auto",
+    // ByteTrack 高置信度检测阈值（第一阶段关联）
     "bytetrack_high_thresh": 0.3,
+    // ByteTrack 低置信度检测阈值（第二阶段补救关联）
     "bytetrack_low_thresh": 0.1,
+    // 达到该置信度才允许新建轨迹
     "bytetrack_new_thresh": 0.3,
+    // 关联代价阈值，超过即判为不匹配
     "bytetrack_match_thresh": 0.8,
+    // 轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）
     "bytetrack_buffer_s": 2.0,
+    // 关联代价权重：α·(1-IoU) + (1-α)·(中心距离/上限)。调大更看重框重叠，调小更看重中心距离
     "bytetrack_cost_alpha": 0.4
   },
+  // 训练视频录制参数
   "recording": {
+    // 录制输出目录，相对数据目录解析
     "training_dir": "recordings/training",
+    // 录制帧率
     "fps": 15,
+    // 单个分段视频的时长，超过即切新文件
     "segment_seconds": 300.0,
+    // OpenCV VideoWriter 编码，例如 mp4v / XVID
     "codec": "mp4v",
+    // 启动后是否自动开始录制
     "auto_start": false,
+    // 预留项：事件前后片段的开关，当前未实现
     "event_clips_enabled": false
   },
+  // 示例视频回放（画面来自 mp4，检测仍由模型完成）
   "demo": {
+    // 播放结束后是否从头循环
     "loop": true,
+    // 投放帧率上限，实际取 min(视频原帧率, 该值)
     "fps_limit": 15,
+    // 播放速率倍数（0.1~4）。只改播放快慢，判定按视频媒体时间计时，结果不受影响
     "speed": 1.0,
+    // 示例视频清单，监控页「画面源」下拉按这里的 name 生成
     "videos": [
       {
+        // 下拉里显示的名字
         "name": "示例① 105708",
+        // 视频路径，相对仓库根或绝对路径
         "path": "data/sample_video/cam_6ca47a_20261027_105708.mp4"
       },
       {
+        // 下拉里显示的名字
         "name": "示例② 140911",
+        // 视频路径，相对仓库根或绝对路径
         "path": "data/sample_video/cam_6ca47a_20261027_140911.mp4"
       }
     ]
   },
+  // 工位列表，每个工位一台相机
   "stations": [
     {
+      // 工位 ID，事件与日志里用它区分
       "station_id": "ST01",
+      // 工位显示名
       "name": "1号取料工位",
+      // 对应 cameras.json 里的相机 ID
       "camera_id": "cam_6ca47a",
+      // 是否启用该工位
       "enabled": true,
+      // 涂油盘区的手工底区，用于判断「手进盘/离盘」。必须把盘体连同下方手臂活动范围一起框进去：模型只框得出盘体本身，运行时两者取并集
       "tray_roi": {
+        // 区域类型，目前只支持 rect
         "kind": "rect",
+        // 归一化坐标 0~1：左上角、右下角两个点
         "points": [
-          [
-            0.5,
-            0.1
-          ],
-          [
-            0.72,
-            0.44
-          ]
+          [0.5, 0.1],
+          [0.72, 0.44]
         ]
       },
+      // 工作追踪区，跟踪与判定的有效范围。只有中心落在该区（或涂油盘区）内的目标才新建轨迹
       "work_roi": {
+        // 区域类型，目前只支持 rect
         "kind": "rect",
+        // 归一化坐标 0~1：左上角、右下角两个点
         "points": [
-          [
-            0.3543,
-            0.0
-          ],
-          [
-            0.9979,
-            0.9488
-          ]
+          [0.3543, 0.0],
+          [0.9979, 0.9488]
         ]
       },
+      // 涂油区，标定与显示用，本轮不参与判定，预留给后续涂油范围约束
       "oiling_roi": {
+        // 区域类型，目前只支持 rect
         "kind": "rect",
+        // 归一化坐标 0~1：左上角、右下角两个点
         "points": [
-          [
-            0.3543,
-            0.0
-          ],
-          [
-            0.9979,
-            0.9488
-          ]
+          [0.3543, 0.0],
+          [0.9979, 0.9488]
         ]
       },
+      // 检测模型与类别名
       "detector": {
+        // null=不检出（框架自检）；yolo=用 Ultralytics 权重
         "kind": "yolo",
+        // 权重路径，相对仓库根或绝对路径
         "model_path": "model/detect/exp/weights/best.pt",
+        // 检测置信度阈值
         "confidence": 0.5,
+        // NMS 的 IoU 阈值
         "iou": 0.7,
+        // 单帧最多输出多少个检测框
         "max_det": 100,
+        // 推理输入尺寸。0=自适应：优先用权重里训练时的尺寸，取不到回退 640
         "imgsz": 0,
+        // auto/空=有 CUDA 用 cuda:0；也可显式 cpu / cuda:0 / 0
         "device": "auto",
+        // 是否用 FP16 推理（只在 CUDA 上生效）
         "half": false,
+        // 旁路排查模式：只交出全量检测结果，不建轨迹、不判定、不产生事件
         "raw_mode": false,
+        // 模型输出的丝杆类别名
         "screw_label": "screw",
+        // 模型输出的手部类别名
         "hand_label": "hand",
+        // 模型输出的刷具类别名
         "brush_label": "brush",
+        // 模型输出的涂油盘类别名
         "tray_label": "oil_station"
       }
     }

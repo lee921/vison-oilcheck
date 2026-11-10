@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Iterable
@@ -856,8 +857,7 @@ class OilCheckConfigService:
         """
 
         try:
-            with self.config_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = load_json_with_comments(self.config_path)
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("检测配置无法解析，跳过迁移 (%s): %s", self.config_path, exc)
             return
@@ -884,7 +884,8 @@ class OilCheckConfigService:
             demo = None
             if template.exists():
                 try:
-                    tpl = json.loads(template.read_text(encoding="utf-8"))
+                    # 模板带注释（JSONC），不能用 json.loads 直接读。
+                    tpl = load_json_with_comments(template)
                     demo = tpl.get("demo")
                 except (OSError, json.JSONDecodeError):
                     demo = None
@@ -1015,7 +1016,7 @@ class OilCheckConfigService:
 
         data["version"] = _CONFIG_VERSION
         try:
-            _write_json_atomic(self.config_path, data)
+            _write_json_atomic(self.config_path, data, comments=CONFIG_COMMENTS)
         except OSError as exc:
             logger.error("写回迁移后的检测配置失败: %s", exc)
             return
@@ -1032,8 +1033,7 @@ class OilCheckConfigService:
         if not self.config_path.exists():
             return OilCheckConfig()
         try:
-            with self.config_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = load_json_with_comments(self.config_path)
         except (OSError, json.JSONDecodeError) as exc:
             logger.error("加载检测配置失败 (%s): %s", self.config_path, exc)
             return OilCheckConfig()
@@ -1042,7 +1042,171 @@ class OilCheckConfigService:
         return OilCheckConfig.from_dict(data)
 
     def save(self, cfg: OilCheckConfig) -> None:
-        _write_json_atomic(self.config_path, cfg.to_dict())
+        _write_json_atomic(
+            self.config_path, cfg.to_dict(), comments=CONFIG_COMMENTS
+        )
+
+
+# 配置文件里的注释表。保存时自动写回，UI 改参数不会把注释弄丢。
+# 键是用点分隔的路径，对象数组用下标（例如 stations[0].tray_roi）。
+CONFIG_COMMENTS: dict[str, str] = {
+    "version": "配置结构版本，供自动迁移判断，不要手工改",
+    # ---- pipeline：取料判定 ----
+    "pipeline": "时序判定参数。单位：时间=秒，距离=按画面对角线归一化",
+    "pipeline.max_fps": (
+        "检测最大帧率。也是帧率自适应的基准：实际帧间隔超过 1/max_fps 时，"
+        "距离门限按倍率放大（见 frame_scale_max）"
+    ),
+    "pipeline.pick_hand_distance": (
+        "手-丝杆关联时视为「够得着」的最大归一化中心距离"
+    ),
+    "pipeline.pick_confirm_s": (
+        "手在涂油盘内的最短停留时长。低于该值视为从盘边划过，不判取料。"
+        "纯时间阈值，不随帧率缩放"
+    ),
+    # ---- pipeline：手部跟踪 ----
+    "pipeline.hand_track_max_distance": (
+        "手部轨迹匹配的最大归一化中心距离。低帧率时按帧间隔自动放大"
+    ),
+    "pipeline.hand_track_max_missing_s": "手部轨迹漏检后保留时长，超过即删除轨迹",
+    "pipeline.hand_track_max_active": (
+        "同时保留的手部轨迹上限。漏检轨迹在保留期内仍占名额，设小了会让新的"
+        "手检测框建不了轨迹（画面里常有手臂、盘边被误检成 hand）"
+    ),
+    "pipeline.hand_track_min_hits": "手部轨迹需命中多少帧才参与刷头靠近判定",
+    # ---- pipeline：刷头跟踪 ----
+    "pipeline.brush_track_max_distance": "刷头轨迹匹配的最大归一化中心距离",
+    "pipeline.brush_track_max_missing_s": "刷头轨迹漏检后保留时长",
+    "pipeline.brush_track_max_active": "同时保留的刷头轨迹上限",
+    "pipeline.brush_track_min_hits": "刷头轨迹需命中多少帧才参与靠近判定",
+    # ---- pipeline：二次涂油判定 ----
+    "pipeline.brush_contact_distance": (
+        "刷头工作点到手持丝杆中心的归一化距离小于该值，本帧计为「靠近」"
+    ),
+    "pipeline.brush_hold_s": (
+        "刷头靠近累计到该时长即判「人工二次涂油完成」。纯时间阈值，"
+        "不随帧率缩放"
+    ),
+    "pipeline.brush_hold_max_gap_s": (
+        "刷头整帧漏检时允许补回的最大空档。用于低帧率下不丢时间；"
+        "刷子检测到了但离得远不补"
+    ),
+    # ---- pipeline：周期 ----
+    "pipeline.holding_lost_timeout_s": (
+        "手部轨迹消失后，进盘过程作废的时长（取料判定用）"
+    ),
+    "pipeline.single_active_task": (
+        "预留项：当前判定逻辑本身就只维护一个活动周期，改这里不会变成多任务"
+    ),
+    "pipeline.task_max_active": "内存中最多保留多少个作业周期",
+    "pipeline.completed_retain_s": "周期完成后在 UI 上保留多久再清理",
+    # ---- pipeline：涂油盘定位 ----
+    "pipeline.tray_max_distance": "涂油盘跟踪的匹配距离（盘体上下移动时用）",
+    "pipeline.tray_max_missing_s": "涂油盘检测漏检后保留预测框的时长",
+    "pipeline.tray_min_confidence": "低于该置信度的盘体检测不参与盘区更新",
+    # ---- pipeline：手-丝杆与丝杆锚点 ----
+    "pipeline.hand_screw_max_distance": (
+        "手框与丝杆框的关联距离上限；还要求两者交叠才认作「握着」"
+    ),
+    "pipeline.hand_interaction_margin": (
+        "预留项：当前判定未使用，手-丝杆关联直接按交叠与距离判定"
+    ),
+    "pipeline.held_infer_distance": (
+        "预留项：丝杆锚点跟踪上线后不再使用（锚点按位置连续性跟随）"
+    ),
+    "pipeline.held_predict_hold_s": (
+        "手/丝杆短时遮挡时按预测位置继续的时长。按帧率自动放大"
+    ),
+    "pipeline.screw_anchor_max_step": (
+        "丝杆锚点单帧最大位移。取料后按最近邻连续性跟这根杆，"
+        "既跟得住快速移动，又不会跳到相邻丝杆（盘里间距很小）"
+    ),
+    "pipeline.screw_anchor_hold_s": (
+        "锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则停止累计涂油"
+    ),
+    "pipeline.frame_scale_max": (
+        "帧率自适应倍率上限。门限按「实际帧间隔 / (1/max_fps)」放大，"
+        "但不超过该值，避免低帧率时门限大到失去区分度"
+    ),
+    "pipeline.roi_track_margin": (
+        "已跟踪目标移出工作追踪区后继续跟踪的距离余量。区外目标不会新建轨迹"
+    ),
+    # ---- pipeline：跟踪后端 ----
+    "pipeline.hand_tracker_backend": "auto=优先 ByteTrack，失败回退自研；可选 bytetrack / object",
+    "pipeline.brush_tracker_backend": "同上，刷头专用",
+    "pipeline.bytetrack_high_thresh": "ByteTrack 高置信度检测阈值（第一阶段关联）",
+    "pipeline.bytetrack_low_thresh": "ByteTrack 低置信度检测阈值（第二阶段补救关联）",
+    "pipeline.bytetrack_new_thresh": "达到该置信度才允许新建轨迹",
+    "pipeline.bytetrack_match_thresh": "关联代价阈值，超过即判为不匹配",
+    "pipeline.bytetrack_buffer_s": (
+        "轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）"
+    ),
+    "pipeline.bytetrack_cost_alpha": (
+        "关联代价权重：α·(1-IoU) + (1-α)·(中心距离/上限)。"
+        "调大更看重框重叠，调小更看重中心距离"
+    ),
+    # ---- recording ----
+    "recording": "训练视频录制参数",
+    "recording.training_dir": "录制输出目录，相对数据目录解析",
+    "recording.fps": "录制帧率",
+    "recording.segment_seconds": "单个分段视频的时长，超过即切新文件",
+    "recording.codec": "OpenCV VideoWriter 编码，例如 mp4v / XVID",
+    "recording.auto_start": "启动后是否自动开始录制",
+    "recording.event_clips_enabled": "预留项：事件前后片段的开关，当前未实现",
+    # ---- demo ----
+    "demo": "示例视频回放（画面来自 mp4，检测仍由模型完成）",
+    "demo.loop": "播放结束后是否从头循环",
+    "demo.fps_limit": "投放帧率上限，实际取 min(视频原帧率, 该值)",
+    "demo.speed": (
+        "播放速率倍数（0.1~4）。只改播放快慢，判定按视频媒体时间计时，"
+        "结果不受影响"
+    ),
+    "demo.videos": "示例视频清单，监控页「画面源」下拉按这里的 name 生成",
+    "demo.videos[].name": "下拉里显示的名字",
+    "demo.videos[].path": "视频路径，相对仓库根或绝对路径",
+    # ---- stations ----
+    "stations": "工位列表，每个工位一台相机",
+    "stations[].station_id": "工位 ID，事件与日志里用它区分",
+    "stations[].name": "工位显示名",
+    "stations[].camera_id": "对应 cameras.json 里的相机 ID",
+    "stations[].enabled": "是否启用该工位",
+    "stations[].tray_roi": (
+        "涂油盘区的手工底区，用于判断「手进盘/离盘」。必须把盘体连同"
+        "下方手臂活动范围一起框进去：模型只框得出盘体本身，运行时两者取并集"
+    ),
+    "stations[].work_roi": (
+        "工作追踪区，跟踪与判定的有效范围。只有中心落在该区（或涂油盘区）内"
+        "的目标才新建轨迹"
+    ),
+    "stations[].oiling_roi": (
+        "涂油区，标定与显示用，本轮不参与判定，预留给后续涂油范围约束"
+    ),
+    "stations[].tray_roi.kind": "区域类型，目前只支持 rect",
+    "stations[].tray_roi.points": "归一化坐标 0~1：左上角、右下角两个点",
+    "stations[].work_roi.kind": "区域类型，目前只支持 rect",
+    "stations[].work_roi.points": "归一化坐标 0~1：左上角、右下角两个点",
+    "stations[].oiling_roi.kind": "区域类型，目前只支持 rect",
+    "stations[].oiling_roi.points": "归一化坐标 0~1：左上角、右下角两个点",
+    # ---- detector ----
+    "stations[].detector": "检测模型与类别名",
+    "stations[].detector.kind": "null=不检出（框架自检）；yolo=用 Ultralytics 权重",
+    "stations[].detector.model_path": "权重路径，相对仓库根或绝对路径",
+    "stations[].detector.confidence": "检测置信度阈值",
+    "stations[].detector.iou": "NMS 的 IoU 阈值",
+    "stations[].detector.max_det": "单帧最多输出多少个检测框",
+    "stations[].detector.imgsz": (
+        "推理输入尺寸。0=自适应：优先用权重里训练时的尺寸，取不到回退 640"
+    ),
+    "stations[].detector.device": "auto/空=有 CUDA 用 cuda:0；也可显式 cpu / cuda:0 / 0",
+    "stations[].detector.half": "是否用 FP16 推理（只在 CUDA 上生效）",
+    "stations[].detector.raw_mode": (
+        "旁路排查模式：只交出全量检测结果，不建轨迹、不判定、不产生事件"
+    ),
+    "stations[].detector.screw_label": "模型输出的丝杆类别名",
+    "stations[].detector.hand_label": "模型输出的手部类别名",
+    "stations[].detector.brush_label": "模型输出的刷具类别名",
+    "stations[].detector.tray_label": "模型输出的涂油盘类别名",
+}
 
 
 def _default_demo_speed() -> float:
@@ -1051,14 +1215,135 @@ def _default_demo_speed() -> float:
     return DemoConfig().speed
 
 
-def _write_json_atomic(path: Path, payload: object) -> None:
+def strip_json_comments(text: str) -> str:
+    """去掉 JSONC 里的 ``//`` 与 ``/* */`` 注释，供 ``json.loads`` 使用。
+
+    配置文件带中文注释，标准 JSON 解析器不认。这里只处理**字符串之外**的
+    注释，避免把 ``"http://..."`` 这类值里的双斜杠当成注释。
+    """
+
+    out: list[str] = []
+    i = 0
+    length = len(text)
+    in_string = False
+    escaped = False
+    while i < length:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < length:
+            nxt = text[i + 1]
+            if nxt == "/":
+                # 行注释：跳到行尾，换行符保留（行号不偏移）。
+                while i < length and text[i] != "\n":
+                    i += 1
+                continue
+            if nxt == "*":
+                i += 2
+                while i + 1 < length and not (text[i] == "*" and text[i + 1] == "/"):
+                    i += 1
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def add_json_comments(payload: object, comments: dict[str, str]) -> str:
+    """按 ``{"a.b": "说明"}`` 的注释表序列化 JSON，把注释写在对应键的上一行。
+
+    自己实现序列化而不是先在文本里找行，是因为配置里有嵌套对象和数组
+    （``stations`` 是对象数组），靠行扫描判断「当前处在哪个键下」很容易错位。
+    这里递归下降，路径天然正确。
+    """
+
+    def lookup(path: str) -> str | None:
+        """先查精确路径，再查 ``stations[].xxx`` 这种通配写法。"""
+
+        note = comments.get(path)
+        if note is not None:
+            return note
+        wildcard = re.sub(r"\[\d+\]", "[]", path)
+        return comments.get(wildcard)
+
+    def dump(value: object, path: str, indent: int) -> list[str]:
+        pad = " " * indent
+        if isinstance(value, dict):
+            if not value:
+                return ["{}"]
+            lines = ["{"]
+            items = list(value.items())
+            for pos, (key, item) in enumerate(items):
+                child = f"{path}.{key}" if path else key
+                note = lookup(child)
+                if note:
+                    lines.append(f"{pad}  // {note}")
+                rendered = dump(item, child, indent + 2)
+                body = rendered[0] if len(rendered) == 1 else None
+                if body is not None:
+                    suffix = "," if pos < len(items) - 1 else ""
+                    lines.append(f'{pad}  "{key}": {body}{suffix}')
+                else:
+                    rendered[-1] += "," if pos < len(items) - 1 else ""
+                    lines.append(f'{pad}  "{key}": {rendered[0]}')
+                    lines.extend(rendered[1:])
+            lines.append(f"{pad}}}")
+            return lines
+        if isinstance(value, list):
+            if not value:
+                return ["[]"]
+            # 简单标量数组写成一行，对象数组逐项展开。
+            if all(not isinstance(v, (dict, list)) for v in value):
+                return ["[" + ", ".join(json.dumps(v, ensure_ascii=False) for v in value) + "]"]
+            lines = ["["]
+            items = list(value)
+            for pos, item in enumerate(items):
+                child = f"{path}[{pos}]"
+                rendered = dump(item, child, indent + 2)
+                rendered[-1] += "," if pos < len(items) - 1 else ""
+                lines.extend(f"{pad}  {line}" if i == 0 else line for i, line in enumerate(rendered))
+            lines.append(f"{pad}]")
+            return lines
+        return [json.dumps(value, ensure_ascii=False)]
+
+    return "\n".join(dump(payload, "", 0))
+
+
+def load_json_with_comments(path: Path) -> Any:
+    """读取带注释的 JSON 文件。"""
+
+    text = path.read_text(encoding="utf-8")
+    return json.loads(strip_json_comments(text))
+
+
+def _write_json_atomic(
+    path: Path, payload: object, *, comments: dict[str, str] | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f"{path.name}.", suffix=".tmp", dir=str(path.parent)
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            text = (
+                add_json_comments(payload, comments)
+                if comments
+                else json.dumps(payload, ensure_ascii=False, indent=2)
+            )
+            f.write(text)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())

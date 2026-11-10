@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 
-from app.oilcheck.config import OilCheckConfig, PipelineConfig, StationConfig
+from app.oilcheck.config import (
+    OilCheckConfig,
+    PipelineConfig,
+    StationConfig,
+    strip_json_comments,
+)
 from app.oilcheck.roi import Roi
 from app.paths import runtime_root
 
@@ -10,7 +15,8 @@ from app.paths import runtime_root
 def test_repo_oilcheck_template_is_valid():
     path = runtime_root() / "config" / "oilcheck.json"
     assert path.exists()
-    data = json.loads(path.read_text(encoding="utf-8"))
+    # 模板带注释（JSONC），用容忍注释的读取方式。
+    data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
     assert cfg.version == "2.4"
@@ -264,7 +270,8 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     # 槽位/遮挡区补成涂油区，工作追踪区原样保留
     assert station.oiling_roi.points == station.work_roi.points
 
-    data = json.loads(path.read_text(encoding="utf-8"))
+    # 模板带注释（JSONC），用容忍注释的读取方式。
+    data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     raw_station = data["stations"][0]
     for key in ("slot_rois", "occlusion_rois", "slot_auto_count", "slot_follow_tray"):
         assert key not in raw_station
@@ -363,11 +370,91 @@ def test_legacy_config_gets_demo_speed(tmp_path):
 
     service = OilCheckConfigService(tmp_path)
     service.load()
-    data = json.loads((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    )
     assert data["demo"]["speed"] == 1.0
 
     data["demo"]["speed"] = 0.5
     (config_dir / "oilcheck.json").write_text(json.dumps(data), encoding="utf-8")
     service.load()
-    data = json.loads((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    )
     assert data["demo"]["speed"] == 0.5
+
+
+# ----------------------------------------------------------------------
+# 配置注释（JSONC）
+# ----------------------------------------------------------------------
+def test_strip_json_comments_keeps_strings_intact():
+    """只去掉字符串之外的注释，值里的 // 不能被当成注释。"""
+
+    text = """{
+      // 行注释
+      "url": "http://example.com/a",   // 尾注释
+      "note": "含 // 和 /* 的值",
+      /* 块注释
+         跨多行 */
+      "n": 1
+    }"""
+    parsed = json.loads(strip_json_comments(text))
+    assert parsed == {
+        "url": "http://example.com/a",
+        "note": "含 // 和 /* 的值",
+        "n": 1,
+    }
+
+
+def test_repo_template_is_commented():
+    """仓库模板每个参数都有注释，便于现场改配置。"""
+
+    path = runtime_root() / "config" / "oilcheck.json"
+    text = path.read_text(encoding="utf-8")
+    assert "//" in text, "模板应带注释"
+    # 注释不破坏可解析性
+    assert json.loads(strip_json_comments(text))["version"] == "2.4"
+
+
+def test_save_preserves_comments(tmp_path):
+    """UI 保存配置后注释不能丢。"""
+
+    from app.oilcheck.config import CONFIG_COMMENTS, OilCheckConfigService
+
+    svc = OilCheckConfigService(tmp_path)
+    cfg = svc.load()
+    svc.save(cfg)
+
+    text = svc.config_path.read_text(encoding="utf-8")
+    assert "//" in text
+    assert len(CONFIG_COMMENTS) > 50
+    # 保存后的文件仍可正常读回，且内容与保存前一致
+    assert json.loads(strip_json_comments(text)) == cfg.to_dict()
+    assert svc.load().to_dict() == cfg.to_dict()
+
+
+def test_comment_table_covers_every_config_key():
+    """注释表应覆盖实际出现的全部配置键（防止新增参数忘了写注释）。"""
+
+    import re as _re
+
+    from app.oilcheck.config import CONFIG_COMMENTS
+
+    path = runtime_root() / "config" / "oilcheck.json"
+    data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
+
+    missing: list[str] = []
+
+    def walk(value, path_str: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                child = f"{path_str}.{key}" if path_str else key
+                wildcard = _re.sub(r"\[\d+\]", "[]", child)
+                if child not in CONFIG_COMMENTS and wildcard not in CONFIG_COMMENTS:
+                    missing.append(child)
+                walk(item, child)
+        elif isinstance(value, list) and value and isinstance(value[0], dict):
+            walk(value[0], f"{path_str}[]")
+
+    walk(data, "")
+    assert not missing, f"以下配置项缺少注释: {missing}"
