@@ -10,7 +10,9 @@
 
 配置文件默认位于数据目录的 ``config/oilcheck.json``。仓库
 ``config/oilcheck.json`` 只作为首次运行的模板，实际运行配置由
-:class:`OilCheckConfigService` 复制并维护。旧版配置中的 ``pick_roi``、
+:class:`OilCheckConfigService` 复制并维护。启动时会把代码里有默认值、
+文件里却缺的键补写回文件（只补不删、不改已有值），让文件里的键与实际
+生效的参数始终一致。旧版配置中的 ``pick_roi``、
 ``oiling_roi``、``hand_roi``、``brush_roi``、``slot_layout`` 等旧字段在读取时
 会自动迁移为 ``work_roi`` / ``oiling_roi``。涂油盘区 = 手工标定的
 ``tray_roi`` 与模型检出的 ``oil_station`` 框的并集：手工区覆盖盘体下方的
@@ -158,8 +160,9 @@ class DetectorConfig:
     iou: float = 0.7
     max_det: int = 100
     imgsz: int = 0
-    # 空串/auto = 有 CUDA 用 cuda:0，否则 cpu；可显式写 cpu / cuda:0 / 0。
-    device: str = ""
+    # auto/空 = 有 CUDA 用 cuda:0，否则 cpu；可显式写 cpu / cuda:0 / 0。
+    # 默认写 auto 而不是空串：迁移与模板都用 auto，补键写回时才一致。
+    device: str = "auto"
     half: bool = False
     raw_mode: bool = False
     screw_label: str = "screw"
@@ -537,14 +540,15 @@ class PipelineConfig:
             "pick_confirm_s": self.pick_confirm_s,
             "pick_sample_every_frames": self.pick_sample_every_frames,
             "pick_history_samples": self.pick_history_samples,
+            # 键顺序与 dataclass 声明一致：写回文件时按它重排，模板也照此排。
             "hand_track_max_distance": self.hand_track_max_distance,
             "hand_track_max_missing_s": self.hand_track_max_missing_s,
-            "hand_track_max_active": self.hand_track_max_active,
             "hand_track_min_hits": self.hand_track_min_hits,
+            "hand_track_max_active": self.hand_track_max_active,
             "brush_track_max_distance": self.brush_track_max_distance,
             "brush_track_max_missing_s": self.brush_track_max_missing_s,
-            "brush_track_max_active": self.brush_track_max_active,
             "brush_track_min_hits": self.brush_track_min_hits,
+            "brush_track_max_active": self.brush_track_max_active,
             "brush_contact_distance": self.brush_contact_distance,
             "brush_hold_s": self.brush_hold_s,
             "holding_lost_timeout_s": self.holding_lost_timeout_s,
@@ -821,6 +825,110 @@ def _union_roi(first: Roi, others: Iterable[Roi]) -> Roi:
             (max(b.x2 for b in boxes), max(b.y2 for b in boxes)),
         ),
     )
+
+
+def _paired(raw: Any, effective: Any) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """把 ``raw`` 与 ``effective`` 里的对象数组按元素配对。
+
+    优先按 ``station_id`` 配对，其次按下标：解析时会跳过不合法工位
+    （缺 ``tray_roi`` 或 ID），下标会错位，补错工位比不补更糟。
+    """
+
+    if not isinstance(raw, list) or not isinstance(effective, list):
+        return []
+    raw_dicts = [item for item in raw if isinstance(item, dict)]
+    eff_dicts = [item for item in effective if isinstance(item, dict)]
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in raw_dicts:
+        station_id = str(item.get("station_id", "")).strip()
+        if station_id:
+            by_id.setdefault(station_id, item)
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for index, item in enumerate(eff_dicts):
+        station_id = str(item.get("station_id", "")).strip()
+        match = by_id.get(station_id) if station_id else None
+        if match is None and index < len(raw_dicts):
+            candidate = raw_dicts[index]
+            if not station_id and not str(candidate.get("station_id", "")).strip():
+                match = candidate
+        if match is not None:
+            pairs.append((match, item))
+    return pairs
+
+
+def _sync_keys(
+    raw: dict[str, Any], effective: dict[str, Any], prefix: str
+) -> list[str]:
+    """把 ``effective`` 里有、``raw`` 里缺的键补进 ``raw``（就地修改）。
+
+    只补不删、不改已有值：现场调过的参数必须原样保留，废弃键由各自的
+    迁移分支删除。返回被补上的键路径，供日志与去重使用。
+    """
+
+    changed: list[str] = []
+    for key, value in effective.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in raw:
+            raw[key] = value
+            changed.append(path)
+            continue
+        existing = raw[key]
+        if isinstance(value, dict) and isinstance(existing, dict):
+            changed.extend(_sync_keys(existing, value, path))
+        elif isinstance(value, list) and isinstance(existing, list):
+            for child_raw, child_eff in _paired(existing, value):
+                changed.extend(_sync_keys(child_raw, child_eff, f"{path}[]"))
+    return changed
+
+
+def _ordered_like(raw: Any, effective: Any) -> Any:
+    """按 ``effective`` 的键顺序重排 ``raw``，未知键排到末尾。
+
+    写回的文件键顺序与仓库模板一致，`diff` 运行配置和模板时只会剩下
+    「值不同」的部分，不会因为键序或缺失键产生噪声。
+    """
+
+    if isinstance(raw, dict) and isinstance(effective, dict):
+        ordered: dict[str, Any] = {}
+        for key, value in effective.items():
+            ordered[key] = (
+                _ordered_like(raw[key], value) if key in raw else value
+            )
+        for key, value in raw.items():
+            if key not in ordered:
+                ordered[key] = value
+        return ordered
+    if isinstance(raw, list) and isinstance(effective, list):
+        # 保持文件里的元素顺序，只重排每个对象内部的键。
+        synced = {
+            id(child_raw): _ordered_like(child_raw, child_eff)
+            for child_raw, child_eff in _paired(raw, effective)
+        }
+        return [synced.get(id(item), item) for item in raw]
+    return raw
+
+
+def _unknown_keys(
+    raw: Any, effective: Any, prefix: str = ""
+) -> list[str]:
+    """列出 ``raw`` 里当前代码不认识的键（不删除，只提示）。
+
+    删掉未知键风险更大：同版本的旧/新程序交替运行时，对方写的键会被当成
+    垃圾清掉。这里只报出来，由人决定。
+    """
+
+    found: list[str] = []
+    if isinstance(raw, dict) and isinstance(effective, dict):
+        for key, value in raw.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if key not in effective:
+                found.append(path)
+            else:
+                found.extend(_unknown_keys(value, effective[key], path))
+    elif isinstance(raw, list) and isinstance(effective, list):
+        for child_raw, child_eff in _paired(raw, effective):
+            found.extend(_unknown_keys(child_raw, child_eff, f"{prefix}[]"))
+    return found
 
 
 @dataclass(frozen=True)
@@ -1107,6 +1215,22 @@ class OilCheckConfigService:
                         detector[key] = _DETECTOR_DEFAULTS_2_1[key]
                         changed.append(f"detector.{key}")
 
+        # 6) 键集合同步：代码里有默认值、文件里缺的键补写回去，让「配置文件
+        #    里看到的键」和「实际生效的参数」一致。只补不删、不改已有值——
+        #    现场调过的 ROI 与阈值一律保留；废弃键由上面各版本分支删除。
+        #
+        #    不对齐这一步的话，缺键的参数走代码默认值却不在文件里，现场对着
+        #    配置排查时会以为「还是老参数」，例如 pick_sample_every_frames /
+        #    pick_history_samples 和 screw_reacquire_timeout_s。
+        effective = OilCheckConfig.from_dict(data).to_dict()
+        changed.extend(_sync_keys(data, effective, ""))
+        unknown = _unknown_keys(data, effective)
+        if unknown:
+            logger.warning(
+                "检测配置里有当前版本不认识的键（原样保留）: %s",
+                ", ".join(unknown),
+            )
+
         if not changed:
             return
 
@@ -1117,17 +1241,31 @@ class OilCheckConfigService:
             logger.warning("备份检测配置失败: %s", exc)
 
         data["version"] = _CONFIG_VERSION
+        # 写回前按生效结构重排：键顺序与模板一致，diff 时只剩值差异。
+        data = _ordered_like(data, effective)
         try:
             _write_json_atomic(self.config_path, data, comments=CONFIG_COMMENTS)
         except OSError as exc:
             logger.error("写回迁移后的检测配置失败: %s", exc)
             return
-        logger.warning(
-            "检测配置已升级到 %s，字段变更: %s（-前缀为删除，原文件备份为 %s）",
-            _CONFIG_VERSION,
-            ", ".join(dict.fromkeys(changed)),
-            backup.name,
-        )
+        fields = ", ".join(dict.fromkeys(changed))
+        if old_version == _CONFIG_VERSION:
+            # 版本没变、只是把文件里缺的键补齐（例如换了一台机器或回滚过）。
+            logger.warning(
+                "检测配置已按当前默认值补齐缺失的键: %s（原文件备份为 %s）",
+                fields,
+                backup.name,
+            )
+        else:
+            logger.warning(
+                "检测配置已升级到 %s（%s → %s），字段变更: %s"
+                "（-前缀为删除，原文件备份为 %s）",
+                _CONFIG_VERSION,
+                old_version,
+                _CONFIG_VERSION,
+                fields,
+                backup.name,
+            )
 
     def load(self, *, create_if_missing: bool = True) -> OilCheckConfig:
         if create_if_missing:
@@ -1167,8 +1305,8 @@ CONFIG_COMMENTS: dict[str, str] = {
         "手里是否有杆」的状态"
     ),
     "pipeline.pick_history_samples": (
-        "取料判定保留的采样点数：用最近这么多个采样点投票决定状态，"
-        "避免单帧抖动导致漏判或误判"
+        "取料判定保留的采样点数：用最近这么多个采样点投票，避免单帧抖动导致漏判或误判。\n"
+        "与上一项相乘决定离盘后攒够多少个盘外采样才定论（= 发取料事件的延迟）"
     ),
     "pipeline.pick_confirm_s": (
         "手在涂油盘内的最短停留时长。低于该值视为从盘边划过，不判取料。"
@@ -1232,15 +1370,16 @@ CONFIG_COMMENTS: dict[str, str] = {
         "既跟得住快速移动，又不会跳到相邻丝杆（盘里间距很小）"
     ),
     "pipeline.screw_anchor_max_step_abs": (
-        "锚点单帧位移的绝对上限，不随帧率放大。盘里丝杆间距只有 0.02~0.03，"
-        "低帧率下必须靠它防止锚点跳到相邻丝杆"
+        "锚点单帧位移的绝对上限，不随帧率放大。用于低帧率下防止锚点跳到相邻丝杆；\n"
+        "必须不小于 screw_anchor_max_step（取料瞬间手带杆打出画面，单帧位移可达 0.11）"
     ),
     "pipeline.screw_anchor_hold_s": (
-        "锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则尝试重新捕获"
+        "锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则在下面时限内"
+        "尝试重新捕获"
     ),
     "pipeline.screw_reacquire_timeout_s": (
-        "手持丝杆离开画面后允许重新捕获的时长。工人拿着杆走出画面、过一会儿"
-        "再回来涂油仍算完成；0=不限时，只要周期没结束就一直等"
+        "手持丝杆离开画面后允许重新捕获的时长。工人取完料可能拿着杆走出画面、\n"
+        "过一会儿再回来涂油，这段时间内周期保持已取料并继续等；0=不限时"
     ),
     "pipeline.frame_scale_max": (
         "帧率自适应倍率上限。门限按「实际帧间隔 / (1/max_fps)」放大，"
@@ -1256,8 +1395,8 @@ CONFIG_COMMENTS: dict[str, str] = {
     "pipeline.bytetrack_low_thresh": "ByteTrack 低置信度检测阈值（第二阶段补救关联）",
     "pipeline.bytetrack_new_thresh": "达到该置信度才允许新建轨迹",
     "pipeline.bytetrack_match_thresh": (
-        "关联代价阈值。未进门限的代价固定 1.5，故 1.0 表示只看距离/IoU 门限；"
-        "调小可加严"
+        "关联代价阈值。未进门限的代价固定为 1.5，所以 1.0 表示「只看距离/IoU 门限」；\n"
+        "调小可加严（现场标定用）"
     ),
     "pipeline.bytetrack_buffer_s": (
         "轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）"
@@ -1312,7 +1451,10 @@ CONFIG_COMMENTS: dict[str, str] = {
     "stations[].detector": "检测模型与类别名",
     "stations[].detector.kind": "null=不检出（框架自检）；yolo=用 Ultralytics 权重",
     "stations[].detector.model_path": "权重路径，相对仓库根或绝对路径",
-    "stations[].detector.confidence": "检测置信度阈值",
+    "stations[].detector.confidence": (
+        "检测置信度阈值。要低于 bytetrack_high_thresh（0.3），否则低于该值的框\n"
+        "在检测层就被丢掉，ByteTrack 的低分补救关联（第二阶段）永远收不到输入"
+    ),
     "stations[].detector.iou": "NMS 的 IoU 阈值",
     "stations[].detector.max_det": "单帧最多输出多少个检测框",
     "stations[].detector.imgsz": (
@@ -1327,6 +1469,12 @@ CONFIG_COMMENTS: dict[str, str] = {
     "stations[].detector.hand_label": "模型输出的手部类别名",
     "stations[].detector.brush_label": "模型输出的刷具类别名",
     "stations[].detector.tray_label": "模型输出的涂油盘类别名",
+    "stations[].detector.brush_point_offset_x": (
+        "刷子没有关键点时，用框内相对坐标（0~1）估计工作端：横向位置"
+    ),
+    "stations[].detector.brush_point_offset_y": (
+        "刷子没有关键点时，用框内相对坐标（0~1）估计工作端：纵向位置"
+    ),
 }
 
 
@@ -1411,7 +1559,10 @@ def add_json_comments(payload: object, comments: dict[str, str]) -> str:
                 child = f"{path}.{key}" if path else key
                 note = lookup(child)
                 if note:
-                    lines.append(f"{pad}  // {note}")
+                    # 说明里可以带换行：按行各写一条 // 注释，避免出现超长行，
+                    # 也让注释表与仓库模板逐字一致（模板由注释表渲染生成）。
+                    for note_line in note.splitlines() or [""]:
+                        lines.append(f"{pad}  // {note_line}".rstrip())
                 rendered = dump(item, child, indent + 2)
                 body = rendered[0] if len(rendered) == 1 else None
                 if body is not None:

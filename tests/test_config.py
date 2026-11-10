@@ -300,18 +300,29 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
 
 
 def test_migration_is_idempotent(tmp_path):
-    """重复加载不应反复改写配置。"""
+    """重复加载不应反复改写配置。
+
+    第一次加载会把文件里缺的键补齐（让文件与生效参数一致），之后每次加载
+    都不应再改动文件。
+    """
 
     config_dir = tmp_path / "config"
     config_dir.mkdir(parents=True)
-    (config_dir / "oilcheck.json").write_text(
+    path = config_dir / "oilcheck.json"
+    path.write_text(
         json.dumps({"version": "2.5", "stations": []}), encoding="utf-8"
     )
     from app.oilcheck.config import OilCheckConfigService
 
-    service = OilCheckConfigService(tmp_path)
-    service.load()
-    assert not (config_dir / "oilcheck.json.bak").exists()
+    OilCheckConfigService(tmp_path).load()
+    first = path.read_bytes()
+    # 缺键已补齐
+    assert (config_dir / "oilcheck.json.bak").exists()
+
+    OilCheckConfigService(tmp_path).load()
+    assert path.read_bytes() == first, "第二次加载不应再改写配置"
+    OilCheckConfigService(tmp_path).load()
+    assert path.read_bytes() == first, "第三次加载不应再改写配置"
 
 
 def test_explicit_cpu_device_is_kept(tmp_path):
@@ -464,3 +475,203 @@ def test_comment_table_covers_every_config_key():
 
     walk(data, "")
     assert not missing, f"以下配置项缺少注释: {missing}"
+
+
+# ----------------------------------------------------------------------
+# 运行配置与生效参数对齐
+# ----------------------------------------------------------------------
+def test_missing_keys_are_written_back_to_the_config_file(tmp_path):
+    """代码里有默认值、文件里缺的键，启动时要补写回文件。
+
+    缺键的参数走代码默认值却不出现在文件里，现场对着配置排查时会以为
+    「还是老参数」——例如 pick_sample_every_frames / pick_history_samples。
+    """
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    path = config_dir / "oilcheck.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "2.5",
+                "pipeline": {"max_fps": 15},
+                "stations": [
+                    {
+                        "station_id": "ST01",
+                        "name": "1号取料工位",
+                        "camera_id": "cam",
+                        "enabled": True,
+                        "tray_roi": {"kind": "rect", "points": [[0.5, 0.1], [0.7, 0.4]]},
+                        "work_roi": {"kind": "rect", "points": [[0.3, 0.0], [0.9, 0.9]]},
+                        "detector": {"kind": "yolo", "model_path": "x.pt"},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = OilCheckConfigService(tmp_path).load()
+    data = load_json_with_comments(path)
+
+    # 文件里的键集合 == 实际生效的参数集合（工位按 station_id 对齐）。
+    assert set(data["pipeline"]) == set(cfg.pipeline.to_dict())
+    assert set(data["recording"]) == set(cfg.recording.to_dict())
+    assert set(data["demo"]) == set(cfg.demo.to_dict())
+    assert set(data["stations"][0]) == set(cfg.stations[0].to_dict())
+    assert set(data["stations"][0]["detector"]) == set(
+        cfg.stations[0].detector.to_dict()
+    )
+    # 补进去的值就是实际生效的值。
+    assert data["pipeline"]["pick_sample_every_frames"] == (
+        cfg.pipeline.pick_sample_every_frames
+    )
+    assert data["pipeline"]["pick_history_samples"] == (
+        cfg.pipeline.pick_history_samples
+    )
+
+
+def test_key_sync_never_touches_field_values_or_rois(tmp_path):
+    """补键只补缺失的键：现场调过的 ROI 与其他值原样保留。"""
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    path = config_dir / "oilcheck.json"
+    original = {
+        "version": "2.5",
+        "pipeline": {"max_fps": 12, "pick_confirm_s": 0.45},
+        "stations": [
+            {
+                "station_id": "ST01",
+                "name": "1号取料工位",
+                "camera_id": "cam",
+                "enabled": True,
+                # 现场标定值（6 位小数），绝不能被模板或默认值覆盖。
+                "tray_roi": {"kind": "rect", "points": [[0.515893, 0.006849], [0.678671, 0.398973]]},
+                "work_roi": {"kind": "rect", "points": [[0.344446, 0.003425], [0.932952, 0.998288]]},
+                "oiling_roi": {"kind": "rect", "points": [[0.344446, 0.446918], [0.932952, 0.994863]]},
+                "detector": {"kind": "yolo", "model_path": "x.pt", "confidence": 0.33},
+            }
+        ],
+    }
+    path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+
+    OilCheckConfigService(tmp_path).load()
+    data = load_json_with_comments(path)
+
+    station = data["stations"][0]
+    for key in ("tray_roi", "work_roi", "oiling_roi"):
+        assert station[key] == original["stations"][0][key], key
+    assert data["pipeline"]["max_fps"] == 12
+    assert data["pipeline"]["pick_confirm_s"] == 0.45
+    assert station["detector"]["confidence"] == 0.33
+
+
+def test_unknown_keys_are_kept(tmp_path):
+    """当前版本不认识的键只提示，不删除。"""
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    path = config_dir / "oilcheck.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "2.5",
+                "pipeline": {"max_fps": 15, "field_tuned_note": "现场手记"},
+                "stations": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    OilCheckConfigService(tmp_path).load()
+    data = load_json_with_comments(path)
+    assert data["pipeline"]["field_tuned_note"] == "现场手记"
+
+
+def test_key_sync_pairs_stations_by_id_not_index(tmp_path):
+    """工位数组按 station_id 对齐：不合法的工位被解析跳过时不能补错对象。"""
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    path = config_dir / "oilcheck.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "2.5",
+                "stations": [
+                    # 缺 tray_roi，解析时被跳过，但必须原样留在文件里。
+                    {"station_id": "BROKEN", "camera_id": "cam0"},
+                    {
+                        "station_id": "ST01",
+                        "camera_id": "cam",
+                        "tray_roi": {"kind": "rect", "points": [[0.5, 0.1], [0.7, 0.4]]},
+                        "work_roi": {"kind": "rect", "points": [[0.3, 0.0], [0.9, 0.9]]},
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    OilCheckConfigService(tmp_path).load()
+    data = load_json_with_comments(path)
+    broken, station = data["stations"]
+
+    assert broken["station_id"] == "BROKEN"
+    assert "tray_roi" not in broken, "不能把 ST01 的键补到坏工位上"
+    assert "detector" in station
+    assert set(station["detector"]) >= {"kind", "model_path", "confidence"}
+
+
+def test_repo_template_matches_comment_table_rendering():
+    """仓库模板必须由注释表渲染得出。
+
+    运行配置写回时按注释表加注释，模板若手改过就会和运行配置产生纯注释
+    差异，`diff` 时看不出哪些是真正调过的参数。
+    """
+
+    from app.oilcheck.config import (
+        CONFIG_COMMENTS,
+        add_json_comments,
+        load_json_with_comments,
+    )
+
+    path = runtime_root() / "config" / "oilcheck.json"
+    rendered = add_json_comments(load_json_with_comments(path), CONFIG_COMMENTS)
+    assert path.read_text(encoding="utf-8").rstrip("\n") == rendered
+
+
+def test_runtime_config_and_template_differ_only_in_values(tmp_path):
+    """按模板生成的运行配置，与模板的差异只能是值，不能是缺键或缺注释。"""
+
+    from app.oilcheck.config import (
+        CONFIG_COMMENTS,
+        OilCheckConfigService,
+        add_json_comments,
+        load_json_with_comments,
+    )
+
+    template = load_json_with_comments(runtime_root() / "config" / "oilcheck.json")
+    expected = add_json_comments(template, CONFIG_COMMENTS).splitlines()
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "oilcheck.json").write_text(
+        add_json_comments(template, CONFIG_COMMENTS) + "\n", encoding="utf-8"
+    )
+    OilCheckConfigService(tmp_path).load()
+
+    actual = (config_dir / "oilcheck.json").read_text(encoding="utf-8").splitlines()
+    assert actual == expected
