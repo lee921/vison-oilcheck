@@ -14,7 +14,7 @@ from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from app.oilcheck.roi import Roi
-from app.oilcheck.types import Detection
+from app.oilcheck.types import BBox, Detection, TrackSnapshot
 
 # 检测框调色板：前四项对应配置里的 hand / brush / oil_station / screw，
 # 顺序由 monitor_page 决定；其余留给模型后续新增的类别。
@@ -49,6 +49,8 @@ class OilCheckVideoView(QWidget):
         self._source_size: tuple[int, int] = (0, 0)
         self._rois: tuple[RoiOverlay, ...] = ()
         self._detections: tuple[Detection, ...] = ()
+        self._tracks: tuple[TrackSnapshot, ...] = ()
+        self._show_track_ids = True
         self._banner = ""
         self._hint = "等待视频帧"
         self._label_colors: dict[str, str] = {}
@@ -76,6 +78,7 @@ class OilCheckVideoView(QWidget):
         *,
         rois: tuple[RoiOverlay, ...],
         detections: tuple[Detection, ...],
+        tracks: tuple[TrackSnapshot, ...] = (),
         banner: str = "",
         label_colors: dict[str, str] | None = None,
     ) -> None:
@@ -83,13 +86,25 @@ class OilCheckVideoView(QWidget):
 
         未登记的类别按调色板顺延取色，这样模型新增类别也能画出来，
         不需要改 UI 代码。
+
+        ``tracks`` 是管线在跟踪范围内的轨迹（手/刷头的视觉轨迹 ID）。
+        是否标出 ID 由 :meth:`set_show_track_ids` 控制。
         """
 
         self._rois = rois
         self._detections = detections
+        self._tracks = tracks
         self._banner = banner
         if label_colors:
             self._label_colors = dict(label_colors)
+        self.update()
+
+    def set_show_track_ids(self, show: bool) -> None:
+        """是否在画面上标出跟踪 ID。"""
+
+        if self._show_track_ids == show:
+            return
+        self._show_track_ids = bool(show)
         self.update()
 
     def clear(self, hint: str = "等待视频帧") -> None:
@@ -98,6 +113,7 @@ class OilCheckVideoView(QWidget):
         self._banner = ""
         self._rois = ()
         self._detections = ()
+        self._tracks = ()
         self.update()
 
     @property
@@ -115,6 +131,8 @@ class OilCheckVideoView(QWidget):
             painter.drawImage(image_rect, self._image)
             self._draw_rois(painter, image_rect)
             self._draw_detections(painter, image_rect)
+            if self._show_track_ids:
+                self._draw_track_ids(painter, image_rect)
         else:
             painter.setPen(QColor("#8a8f98"))
             painter.setFont(QFont("", 12))
@@ -242,6 +260,79 @@ class OilCheckVideoView(QWidget):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                 label,
             )
+
+    def _draw_track_ids(self, painter: QPainter, image_rect: QRectF) -> None:
+        """在跟踪目标上标出 ID。
+
+        手标 ``#100004``、刷头标 ``#200001``——前缀区分对象类型，后缀是
+        跟踪器分配的视觉轨迹 ID。
+
+        实测轨迹不再重复画框——检测框已经画过同一个目标，重复描边会形成重影；
+        只在框外侧贴一个 ID 徽标。丢失中的轨迹没有检测框可依附，画虚线框
+        并给 ID 加 ``?``，避免把预测位置当成实测。
+        """
+
+        painter.setFont(QFont("", 9))
+        for track in self._tracks:
+            color = QColor(self._color_for(track.label))
+            box_rect = self._track_rect(track, image_rect)
+
+            if not track.observed:
+                pen = QPen(color)
+                pen.setWidth(1)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(box_rect)
+
+            text = self._track_label(track)
+            metrics = painter.fontMetrics()
+            text_w = metrics.horizontalAdvance(text) + 10
+            text_rect = self._track_badge_rect(
+                box_rect, image_rect, text_w
+            )
+            # 深底彩色字：检测框标签是彩色底黑字，两者一眼可分——
+            # 彩底黑字是“模型看到了什么”，深底彩字是“管线在跟踪谁”。
+            painter.fillRect(text_rect, QColor(0, 0, 0, 190))
+            painter.setPen(color)
+            painter.drawText(
+                text_rect,
+                Qt.AlignmentFlag.AlignCenter,
+                text,
+            )
+
+    @staticmethod
+    def _track_badge_rect(
+        box_rect: QRectF, image_rect: QRectF, text_w: float
+    ) -> QRectF:
+        """ID 徽标位置：优先贴在框右侧外面，贴到画面外时退回框内左上角。
+
+        夹具里的丝杆是逐行紧排的窄目标，徽标贴在框下方会压住下一根的检测框；
+        贴到右侧空白处既不遮挡、也不和左上角的类别标签打架。
+        """
+
+        height = 15.0
+        x = box_rect.right() + 2.0
+        if x + text_w > image_rect.right():
+            x = max(image_rect.x(), box_rect.right() - text_w)
+        y = box_rect.y()
+        if y + height > image_rect.bottom():
+            y = max(image_rect.y(), image_rect.bottom() - height)
+        return QRectF(x, y, text_w, height)
+
+    @staticmethod
+    def _track_label(track: TrackSnapshot) -> str:
+        text = f"#{track.track_id}"
+        if not track.observed:
+            text = f"{text} ?"
+        return text
+
+    def _track_rect(self, track: TrackSnapshot, image_rect: QRectF) -> QRectF:
+        box: BBox = track.box
+        return QRectF(
+            self._map_point(box.x1, box.y1, image_rect),
+            self._map_point(box.x2, box.y2, image_rect),
+        ).normalized()
 
     def _draw_banner(self, painter: QPainter) -> None:
         if not self._banner:

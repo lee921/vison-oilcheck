@@ -292,6 +292,11 @@ class OilCheckService:
     def demo_videos(self) -> tuple[DemoVideo, ...]:
         return tuple(self._config.demo.videos)
 
+    def demo_speed(self) -> float:
+        """配置里的示例回放默认速率。"""
+
+        return float(self._config.demo.speed)
+
     def active_video(self, station_id: str) -> DemoVideo | None:
         with self._lock:
             return self._active_video.get(station_id)
@@ -302,6 +307,7 @@ class OilCheckService:
         station_id: str,
         loop: bool,
         fps_limit: float,
+        speed: float = 1.0,
     ) -> VideoFileSource | None:
         path = Path(resolve_runtime_file(video.path, repo_root=runtime_root()))
         if not path.exists():
@@ -311,6 +317,7 @@ class OilCheckService:
             path,
             loop=loop,
             fps_limit=fps_limit,
+            speed=speed,
             logger_=self._logger.getChild(station_id),
         )
 
@@ -328,6 +335,7 @@ class OilCheckService:
                 return False
             loop = self._config.demo.loop
             fps_limit = float(self._config.demo.fps_limit)
+            speed = float(self._config.demo.speed)
 
         old_source = runtime.video_source
         new_video: DemoVideo | None = None
@@ -340,7 +348,9 @@ class OilCheckService:
                     "示例视频未在配置中登记: %s（工位=%s）", video_name, station_id
                 )
                 return False
-            new_source = self._make_video_source(new_video, station_id, loop, fps_limit)
+            new_source = self._make_video_source(
+                new_video, station_id, loop, fps_limit, speed
+            )
             if new_source is None:
                 return False
 
@@ -375,6 +385,20 @@ class OilCheckService:
             runtime.executor.submit(runtime.pipeline.reset)
         except RuntimeError:
             pass
+        return True
+
+    def set_station_video_speed(self, station_id: str, speed: float) -> bool:
+        """调整示例回放速率（仅对该工位当前播放的视频生效）。"""
+
+        with self._lock:
+            runtime = self._runtimes.get(station_id)
+        source = None if runtime is None else runtime.video_source
+        if source is None:
+            return False
+        source.set_speed(speed)
+        self._logger.info(
+            "工位 %s 示例回放速率设为 %.2f×", station_id, source.speed
+        )
         return True
 
     def video_status(self, station_id: str) -> dict[str, Any]:
@@ -526,8 +550,14 @@ class OilCheckService:
             runtime.dropped_frames += 1
             return
         runtime.busy = True
+        # 判定用媒体时间：示例回放变速时它仍按视频自身帧周期前进，
+        # 因此“盘内停留多久”“刷子靠近累计多久”与播放速度无关。
+        # 实时相机没有媒体时间，回退到墙钟时间。
+        pipelines_ts = frame.ts if frame.media_ts is None else frame.media_ts
         try:
-            runtime.executor.submit(self._process_frame, runtime, frame.bgr, frame.ts)
+            runtime.executor.submit(
+                self._process_frame, runtime, frame.bgr, pipelines_ts
+            )
         except RuntimeError:
             runtime.busy = False
 
@@ -609,6 +639,7 @@ class OilCheckService:
                     station.station_id,
                     self._config.demo.loop,
                     float(self._config.demo.fps_limit),
+                    float(self._config.demo.speed),
                 )
                 if source is not None:
                     try:
@@ -669,8 +700,7 @@ def _station_meta(station: StationConfig | None) -> dict[str, Any]:
         "station_name": station.name,
         "rois": {
             "tray_roi": station.tray_roi.to_dict(),
-            "hand_roi": station.hand_roi.to_dict(),
-            "brush_roi": station.brush_roi.to_dict(),
-            "exclude_rois": [roi.to_dict() for roi in station.exclude_rois],
+            "work_roi": station.work_roi.to_dict(),
+            "oiling_roi": station.oiling_roi.to_dict(),
         },
     }

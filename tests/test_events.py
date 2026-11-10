@@ -114,3 +114,40 @@ def test_clear_removes_events_and_reviews(tmp_path):
 
     reloaded = EventStore(tmp_path)
     assert reloaded.load_recent(days=1) == 0
+
+
+def test_legacy_event_types_keep_readable_labels():
+    """旧事件文件里的 PUT/BRUSH_CONTACT/TASK_RESULT 不能被误标成「取料」。"""
+
+    from app.oilcheck.types import EventRecord
+
+    for legacy in ("PUT", "BRUSH_CONTACT", "TASK_RESULT"):
+        record = EventRecord.from_dict(
+            {
+                "event_id": "x",
+                "event_type": legacy,
+                "result": "CONFIRMED",
+                "task_id": "TASK-1",
+                "timestamp_start": "2026-11-06T10:00:00+08:00",
+                "timestamp_end": "2026-11-06T10:00:01+08:00",
+            }
+        )
+        assert record.event_type == legacy
+        expected = {
+            "PUT": "放料（历史）",
+            "BRUSH_CONTACT": "刷头接触（历史）",
+            "TASK_RESULT": "任务结果（历史）",
+        }[legacy]
+        assert record.event_label == expected
+        assert record.to_dict()["event_type"] == legacy
+
+
+def test_known_event_types_roundtrip():
+    from app.oilcheck.types import EventRecord
+
+    for kind, label in (("PICK", "取料"), ("MANUAL_OILING", "人工二次涂油")):
+        record = EventRecord.from_dict(
+            {"event_id": "x", "event_type": kind, "result": "CONFIRMED", "task_id": "T"}
+        )
+        assert record.event_type.value == kind
+        assert record.event_label == label

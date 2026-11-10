@@ -149,6 +149,30 @@ def test_video_source_streams_frames_and_loops(tmp_path):
     assert source.get() is None
 
 
+def test_video_source_reports_frame_position(tmp_path):
+    """播放时能报出当前帧序号与总帧数（UI 左上角显示“第 N/M 帧”）。"""
+
+    path = tmp_path / "clip.mp4"
+    if not _make_video(path, frames=20):
+        pytest.skip("当前环境无法写出测试视频")
+
+    source = VideoFileSource(path, loop=True, fps_limit=30)
+    assert source.frame_index == 0
+    source.start()
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline and source.frame_index == 0:
+            time.sleep(0.02)
+        status = source.status()
+        assert status["frame_count"] > 0
+        assert 0 < status["frame_index"] < status["frame_count"]
+    finally:
+        source.stop()
+
+    # 停止后回到开头。
+    assert source.frame_index == 0
+
+
 def test_video_source_rejects_missing_file(tmp_path):
     source = VideoFileSource(tmp_path / "nope.mp4")
     with pytest.raises(FileNotFoundError):
@@ -172,3 +196,79 @@ def test_resolve_device_auto_falls_back_to_cpu_without_cuda():
     device = _resolve_device("auto")
     assert device in {"cpu", "cuda:0"}
     assert _resolve_device("") == device
+
+
+# ----------------------------------------------------------------------
+# 播放速率
+# ----------------------------------------------------------------------
+def test_video_source_speed_controls_media_timeline(tmp_path):
+    """0.5× 慢放时媒体时间仍按视频帧周期前进，判定计时不受影响。"""
+
+    path = tmp_path / "clip.mp4"
+    if not _make_video(path, fps=10, frames=20):
+        pytest.skip("当前环境无法写出测试视频")
+
+    slow = VideoFileSource(path, loop=True, fps_limit=30, speed=0.5)
+    fast = VideoFileSource(path, loop=True, fps_limit=30, speed=1.0)
+    slow.start()
+    fast.start()
+    try:
+        time.sleep(1.2)
+        slow_frame = slow.get()
+        fast_frame = fast.get()
+        assert slow_frame is not None and fast_frame is not None
+        assert slow_frame.media_ts is not None
+        assert fast_frame.media_ts is not None
+        # 媒体时间按送出的帧数推进：慢放送出的帧少，媒体时间也少，
+        # 但每帧间隔始终是 1/native_fps（0.1s），不是墙钟节奏。
+        st = slow.status()
+        deltas = st["native_fps"]
+        assert deltas == pytest.approx(10.0, rel=0.2)
+        assert st["speed"] == 0.5
+        assert slow.status()["speed"] == 0.5
+        assert fast.status()["speed"] == 1.0
+    finally:
+        slow.stop()
+        fast.stop()
+
+
+def test_video_source_media_ts_advances_by_frame_period(tmp_path):
+    path = tmp_path / "clip.mp4"
+    if not _make_video(path, fps=10, frames=40):
+        pytest.skip("当前环境无法写出测试视频")
+
+    source = VideoFileSource(path, loop=True, fps_limit=30, speed=0.5)
+    source.start()
+    try:
+        samples = []
+        deadline = time.time() + 4.0
+        last_index = -1
+        while time.time() < deadline and len(samples) < 4:
+            frame = source.get()
+            index = source.frame_index
+            if frame is not None and index != last_index:
+                last_index = index
+                samples.append(frame.media_ts)
+            time.sleep(0.01)
+    finally:
+        source.stop()
+
+    assert len(samples) >= 3
+    deltas = [b - a for a, b in zip(samples, samples[1:], strict=False)]
+    # 每帧 0.1s（10fps）。慢放只拉长墙钟间隔，媒体间隔不变。
+    for delta in deltas:
+        assert delta == pytest.approx(0.1, abs=1e-6)
+
+
+def test_video_source_set_speed_takes_effect(tmp_path):
+    path = tmp_path / "clip.mp4"
+    if not _make_video(path):
+        pytest.skip("当前环境无法写出测试视频")
+
+    source = VideoFileSource(path, speed=1.0)
+    assert source.speed == 1.0
+    source.set_speed(0.5)
+    assert source.speed == 0.5
+    assert source.status()["speed"] == 0.5
+    source.set_speed(0)  # 非法值回退 1×
+    assert source.speed == 1.0

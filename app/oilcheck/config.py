@@ -2,15 +2,19 @@
 
 配置结构对应《涂油工位视觉检测项目实现文档》第 3、10 节：
 
-- 每个工位配置涂油盘、手持操作、刷涂三个有效 ROI，以及需要完全排除的
-  物料盒 ROI；
+- 每个工位配置工作追踪区（``work_roi``）与
+  涂油区（``oiling_roi``）；跟踪与判定只处理前两个区域内的目标，
+  涂油区本轮只做标定与显示；
 - 不配置槽位，也不做槽位绑定；
 - 判定参数按“取料事件 / 跟踪 / 刷涂 / 任务”分组。
 
 配置文件默认位于数据目录的 ``config/oilcheck.json``。仓库
 ``config/oilcheck.json`` 只作为首次运行的模板，实际运行配置由
 :class:`OilCheckConfigService` 复制并维护。旧版配置中的 ``pick_roi``、
-``oiling_roi``、``slot_layout`` 等字段在读取时会自动迁移为新的 ROI。
+``oiling_roi``、``hand_roi``、``brush_roi``、``slot_layout`` 等旧字段在读取时
+会自动迁移为 ``work_roi`` / ``oiling_roi``。涂油盘区 = 手工标定的
+``tray_roi`` 与模型检出的 ``oil_station`` 框的并集：手工区覆盖盘体下方的
+手臂活动范围，检测框跟随盘体上下移动。
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,10 +36,84 @@ from .roi import Roi
 logger = logging.getLogger("oilcheck.config")
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.1"
+_CONFIG_VERSION = "2.4"
+
+# 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
+_TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
+
+# 旧配置既没有 work_roi 也没有 hand_roi/brush_roi 时的兜底工作追踪区。
+_DEFAULT_WORK_ROI = Roi(kind="rect", points=((0.0, 0.0), (1.0, 1.0)))
 
 # 仓库自带的权重（相对仓库根解析）。
 _DEFAULT_MODEL_PATH = "model/detect/exp/weights/best.pt"
+
+# 2.3 新增、且在当前版本仍在使用的管线字段及默认值，迁移时只补缺失键。
+_PIPELINE_DEFAULTS_2_3: dict[str, Any] = {
+    "hand_screw_max_distance": 0.10,
+    "hand_interaction_margin": 0.02,
+    "held_infer_distance": 0.10,
+    "held_predict_hold_s": 0.50,
+    "hand_tracker_backend": "auto",
+    "brush_tracker_backend": "auto",
+    "bytetrack_high_thresh": 0.30,
+    "bytetrack_low_thresh": 0.10,
+    "bytetrack_new_thresh": 0.30,
+    "bytetrack_match_thresh": 0.80,
+    "bytetrack_buffer_s": 2.00,
+    "bytetrack_cost_alpha": 0.40,
+}
+
+# 2.4 删除的管线字段：简化判定后不再有任何消费方，迁移时清掉，
+# 避免现场配置里留一堆永不生效的键。
+_PIPELINE_REMOVED_2_4: tuple[str, ...] = (
+    "pick_motion_min",
+    "pick_relative_max",
+    "pick_comotion_min_s",
+    "pick_abort_s",
+    "pick_occlusion_timeout_s",
+    "pick_ambiguity_margin",
+    "pick_window_s",
+    "screw_track_max_distance",
+    "screw_track_max_missing_s",
+    "screw_track_min_hits",
+    "screw_track_max_active",
+    "brush_min_duration_s",
+    "brush_max_gap_s",
+    "brush_min_motion",
+    "brush_require_hand",
+    "coverage_segments",
+    "coverage_required",
+    "identity_timeout_s",
+    "identity_ambiguity_margin",
+    "oiling_wait_timeout_s",
+    "association_ambiguity_margin",
+    "association_sustain_s",
+    "association_lock_confidence",
+    "association_unmatched_cost",
+    "slot_occupied_confirm_s",
+    "slot_empty_confirm_s",
+    "slot_restock_confirm_s",
+    "slot_cooldown_s",
+    "slot_empty_stable_s",
+    "slot_assign_margin",
+    "slot_occlusion_hold_s",
+    "slot_min_visible_ratio",
+    "slot_layout_anchor_ratio",
+    "slot_layout_shrink_ratio",
+    "brush_hand_distance",
+    "brush_hand_confirm_s",
+    "brush_hand_link_grace_s",
+    "brush_require_hand_link",
+    "brush_hand_cross_hand_ok",
+)
+
+# 2.4 删除的工位字段（槽位与遮挡区）。
+_STATION_REMOVED_2_4: tuple[str, ...] = (
+    "slot_rois",
+    "occlusion_rois",
+    "slot_auto_count",
+    "slot_follow_tray",
+)
 
 # 2.1 新增的检测器字段及其默认值，迁移时补齐。
 _DETECTOR_DEFAULTS_2_1: dict[str, Any] = {
@@ -43,7 +122,9 @@ _DETECTOR_DEFAULTS_2_1: dict[str, Any] = {
     "imgsz": 0,
     "device": "auto",
     "half": False,
-    "raw_mode": True,
+    # 迁移补默认值时应直接进入完整判定；旁路模式只作为现场临时排查手段，
+    # 由用户显式打开，不能作为新旧配置的默认行为。
+    "raw_mode": False,
     "brush_label": "brush",
     "tray_label": "oil_station",
 }
@@ -170,43 +251,29 @@ class PipelineConfig:
 
     max_fps: int = 15
 
-    # 取料事件（文档 5）
+    # 取料事件：空手进盘 → 带料离盘
     pick_hand_distance: float = 0.05
-    pick_motion_min: float = 0.010
-    pick_relative_max: float = 0.030
-    pick_comotion_min_s: float = 0.25
+    # 手必须在盘内停留这么久才算一次取料（滤掉从盘边划过的手）。
     pick_confirm_s: float = 0.30
-    pick_abort_s: float = 0.50
-    pick_occlusion_timeout_s: float = 2.0
-    pick_ambiguity_margin: float = 0.02
-    pick_window_s: float = 2.0
 
-    # 目标跟踪（文档 6）
-    screw_track_max_distance: float = 0.08
-    screw_track_max_missing_s: float = 0.70
-    screw_track_min_hits: int = 2
-    screw_track_max_active: int = 16
+    # 目标跟踪（手/刷头使用 ByteTrack）
     hand_track_max_distance: float = 0.15
     hand_track_max_missing_s: float = 0.80
     hand_track_min_hits: int = 1
+    # 同时保留的轨迹上限。漏检轨迹在 max_missing_s 内仍占名额，设小了会让
+    # 新的手检测框建不了轨迹（画面里常有手臂/盘边等被误检成 hand 的框）。
+    hand_track_max_active: int = 8
     brush_track_max_distance: float = 0.15
     brush_track_max_missing_s: float = 0.80
     brush_track_min_hits: int = 1
+    brush_track_max_active: int = 4
 
-    # 刷涂行为（文档 7）
+    # 人工二次涂油：刷头工作点持续在丝杆接触邻域内累计到该时长即判完成
     brush_contact_distance: float = 0.060
-    brush_min_duration_s: float = 1.0
-    brush_max_gap_s: float = 0.60
-    brush_min_motion: float = 0.15
-    brush_require_hand: bool = False
-    coverage_segments: int = 5
-    coverage_required: float = 0.60
+    brush_hold_s: float = 1.00
 
-    # 业务身份与任务（文档 6、8、10）
-    identity_timeout_s: float = 2.0
-    identity_ambiguity_margin: float = 0.02
+    # 周期与保留
     holding_lost_timeout_s: float = 2.0
-    oiling_wait_timeout_s: float = 0.0
     single_active_task: bool = True
     task_max_active: int = 4
     completed_retain_s: float = 10.0
@@ -215,6 +282,46 @@ class PipelineConfig:
     tray_max_distance: float = 0.20
     tray_max_missing_s: float = 1.0
     tray_min_confidence: float = 0.30
+
+    # 手-丝杆关联（空间距离 + 交互关系）
+    hand_screw_max_distance: float = 0.10
+    hand_interaction_margin: float = 0.02
+    held_infer_distance: float = 0.10
+    held_predict_hold_s: float = 0.50
+
+    # 丝杆锚点跟踪：取料那一刻把手里那根丝杆记下来，之后按最近邻连续性
+    # 跟这根杆。丝杆是静置物、位移小，比手部视觉 ID 稳得多。
+    # 单帧最大位移（按画面对角线归一化，按实际帧率缩放）。
+    # 单帧最大位移。实测手持杆单帧位移中位 0.003、p90 0.081，取 0.12
+    # 覆盖约 p95：既跟得住快速移动，又不会跳到相邻的静置杆上
+    # （盘里丝杆间距只有 0.02~0.03）。
+    screw_anchor_max_step: float = 0.12
+    # 锚点丢失后靠预测位置继续跟的时长（按实际帧率缩放）。
+    screw_anchor_hold_s: float = 0.50
+
+    # 刷子靠近累计允许跨过的最大空档：低帧率下一个漏检帧会吞掉整帧时间，
+    # 用空档桥接把这段补回来（按实际帧率缩放）。
+    brush_hold_max_gap_s: float = 0.50
+
+    # 帧率自适应：以配置 max_fps 为基准，按实测帧间隔放大上面所有
+    # 距离门限与容差窗口。倍率上限避免低帧率时门限大到失去区分度。
+    frame_scale_max: float = 4.0
+
+    # 目标移出工作追踪区后，继续跟踪的额外门限余量（按画面对角线归一化）。
+    # 区外目标不会新建轨迹，但如果它离已有轨迹足够近，说明是同一个目标
+    # 走出了区，继续喂给跟踪器以保持轨迹不断。取 0.20：示例①上区外
+    # 跟踪帧 429（占 51%），再放大只增加轨迹碎片，判定结果不变。
+    roi_track_margin: float = 0.20
+
+    # 跟踪后端（手/刷头使用 ByteTrack）
+    hand_tracker_backend: str = "auto"
+    brush_tracker_backend: str = "auto"
+    bytetrack_high_thresh: float = 0.30
+    bytetrack_low_thresh: float = 0.10
+    bytetrack_new_thresh: float = 0.30
+    bytetrack_match_thresh: float = 0.80
+    bytetrack_buffer_s: float = 2.00
+    bytetrack_cost_alpha: float = 0.40
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> PipelineConfig:
@@ -241,6 +348,10 @@ class PipelineConfig:
                 value = default
             return max(lo, min(hi, value))
 
+        def _backend(key: str, default: str) -> str:
+            value = str(data.get(key, default)).strip().lower()
+            return value if value in _TRACKER_BACKENDS else "auto"
+
         def _legacy(new_key: str, *old_keys: str, default: float) -> float:
             """新字段缺失时回退到旧配置字段，便于现场配置平滑迁移。"""
 
@@ -259,46 +370,7 @@ class PipelineConfig:
                 "hand_proximity_margin",
                 default=d.pick_hand_distance,
             ),
-            pick_motion_min=_f("pick_motion_min", d.pick_motion_min, 0.0),
-            pick_relative_max=_f("pick_relative_max", d.pick_relative_max, 0.0),
-            pick_comotion_min_s=_f(
-                "pick_comotion_min_s", d.pick_comotion_min_s, 0.0
-            ),
             pick_confirm_s=_f("pick_confirm_s", d.pick_confirm_s, 0.0),
-            pick_abort_s=_f("pick_abort_s", d.pick_abort_s, 0.0),
-            pick_occlusion_timeout_s=_legacy(
-                "pick_occlusion_timeout_s",
-                "occlusion_timeout_s",
-                default=d.pick_occlusion_timeout_s,
-            ),
-            pick_ambiguity_margin=_legacy(
-                "pick_ambiguity_margin",
-                "identity_ambiguity_margin",
-                default=d.pick_ambiguity_margin,
-            ),
-            pick_window_s=_f("pick_window_s", d.pick_window_s, 0.0),
-            screw_track_max_distance=_legacy(
-                "screw_track_max_distance",
-                "track_max_distance",
-                default=d.screw_track_max_distance,
-            ),
-            screw_track_max_missing_s=_legacy(
-                "screw_track_max_missing_s",
-                "track_max_missing_s",
-                default=d.screw_track_max_missing_s,
-            ),
-            screw_track_min_hits=_i(
-                "screw_track_min_hits",
-                _int_or(data.get("track_min_hits"), d.screw_track_min_hits),
-                1,
-                20,
-            ),
-            screw_track_max_active=_i(
-                "screw_track_max_active",
-                _int_or(data.get("track_max_active"), d.screw_track_max_active),
-                1,
-                64,
-            ),
             hand_track_max_distance=_f(
                 "hand_track_max_distance", d.hand_track_max_distance, 0.005
             ),
@@ -307,6 +379,9 @@ class PipelineConfig:
             ),
             hand_track_min_hits=_i(
                 "hand_track_min_hits", d.hand_track_min_hits, 1, 20
+            ),
+            hand_track_max_active=_i(
+                "hand_track_max_active", d.hand_track_max_active, 1, 32
             ),
             brush_track_max_distance=_f(
                 "brush_track_max_distance", d.brush_track_max_distance, 0.005
@@ -317,49 +392,24 @@ class PipelineConfig:
             brush_track_min_hits=_i(
                 "brush_track_min_hits", d.brush_track_min_hits, 1, 20
             ),
+            brush_track_max_active=_i(
+                "brush_track_max_active", d.brush_track_max_active, 1, 32
+            ),
             brush_contact_distance=_legacy(
                 "brush_contact_distance",
                 "brush_part_distance",
                 default=d.brush_contact_distance,
             ),
-            brush_min_duration_s=_legacy(
+            brush_hold_s=_legacy(
+                "brush_hold_s",
                 "brush_min_duration_s",
                 "oiling_min_duration_s",
-                default=d.brush_min_duration_s,
-            ),
-            brush_max_gap_s=_legacy(
-                "brush_max_gap_s",
-                "oiling_max_gap_s",
-                default=d.brush_max_gap_s,
-            ),
-            brush_min_motion=_legacy(
-                "brush_min_motion",
-                "oiling_min_motion",
-                default=d.brush_min_motion,
-            ),
-            brush_require_hand=_b("brush_require_hand", d.brush_require_hand),
-            coverage_segments=_i(
-                "coverage_segments", d.coverage_segments, 1, 16
-            ),
-            coverage_required=max(
-                0.0,
-                min(1.0, _f("coverage_required", d.coverage_required, 0.0)),
-            ),
-            identity_timeout_s=_f(
-                "identity_timeout_s", d.identity_timeout_s, 0.0
-            ),
-            identity_ambiguity_margin=_f(
-                "identity_ambiguity_margin", d.identity_ambiguity_margin, 0.0
+                default=d.brush_hold_s,
             ),
             holding_lost_timeout_s=_f(
                 "holding_lost_timeout_s", d.holding_lost_timeout_s, 0.0
             ),
-            oiling_wait_timeout_s=_f(
-                "oiling_wait_timeout_s", d.oiling_wait_timeout_s, 0.0
-            ),
-            single_active_task=_b(
-                "single_active_task", d.single_active_task
-            ),
+            single_active_task=_b("single_active_task", d.single_active_task),
             task_max_active=_i(
                 "task_max_active",
                 int(data.get("operation_max_active", d.task_max_active))
@@ -381,47 +431,98 @@ class PipelineConfig:
                 0.0,
                 min(1.0, _f("tray_min_confidence", d.tray_min_confidence, 0.0)),
             ),
+            hand_screw_max_distance=_f(
+                "hand_screw_max_distance", d.hand_screw_max_distance, 0.005
+            ),
+            hand_interaction_margin=_f(
+                "hand_interaction_margin", d.hand_interaction_margin, 0.0
+            ),
+            held_infer_distance=_f(
+                "held_infer_distance", d.held_infer_distance, 0.005
+            ),
+            held_predict_hold_s=_f(
+                "held_predict_hold_s", d.held_predict_hold_s, 0.0
+            ),
+            screw_anchor_max_step=_f(
+                "screw_anchor_max_step", d.screw_anchor_max_step, 0.005
+            ),
+            screw_anchor_hold_s=_f(
+                "screw_anchor_hold_s", d.screw_anchor_hold_s, 0.0
+            ),
+            brush_hold_max_gap_s=_f(
+                "brush_hold_max_gap_s", d.brush_hold_max_gap_s, 0.0
+            ),
+            frame_scale_max=_f("frame_scale_max", d.frame_scale_max, 1.0),
+            roi_track_margin=_f(
+                "roi_track_margin", d.roi_track_margin, 0.0
+            ),
+
+            hand_tracker_backend=_backend(
+                "hand_tracker_backend", d.hand_tracker_backend
+            ),
+            brush_tracker_backend=_backend(
+                "brush_tracker_backend", d.brush_tracker_backend
+            ),
+            bytetrack_high_thresh=_f(
+                "bytetrack_high_thresh", d.bytetrack_high_thresh, 0.0
+            ),
+            bytetrack_low_thresh=_f(
+                "bytetrack_low_thresh", d.bytetrack_low_thresh, 0.0
+            ),
+            bytetrack_new_thresh=_f(
+                "bytetrack_new_thresh", d.bytetrack_new_thresh, 0.0
+            ),
+            bytetrack_match_thresh=_f(
+                "bytetrack_match_thresh", d.bytetrack_match_thresh, 0.01
+            ),
+            bytetrack_buffer_s=_f(
+                "bytetrack_buffer_s", d.bytetrack_buffer_s, 0.0
+            ),
+            bytetrack_cost_alpha=max(
+                0.0,
+                min(1.0, _f("bytetrack_cost_alpha", d.bytetrack_cost_alpha, 0.0)),
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_fps": self.max_fps,
             "pick_hand_distance": self.pick_hand_distance,
-            "pick_motion_min": self.pick_motion_min,
-            "pick_relative_max": self.pick_relative_max,
-            "pick_comotion_min_s": self.pick_comotion_min_s,
             "pick_confirm_s": self.pick_confirm_s,
-            "pick_abort_s": self.pick_abort_s,
-            "pick_occlusion_timeout_s": self.pick_occlusion_timeout_s,
-            "pick_ambiguity_margin": self.pick_ambiguity_margin,
-            "pick_window_s": self.pick_window_s,
-            "screw_track_max_distance": self.screw_track_max_distance,
-            "screw_track_max_missing_s": self.screw_track_max_missing_s,
-            "screw_track_min_hits": self.screw_track_min_hits,
-            "screw_track_max_active": self.screw_track_max_active,
             "hand_track_max_distance": self.hand_track_max_distance,
             "hand_track_max_missing_s": self.hand_track_max_missing_s,
+            "hand_track_max_active": self.hand_track_max_active,
             "hand_track_min_hits": self.hand_track_min_hits,
             "brush_track_max_distance": self.brush_track_max_distance,
             "brush_track_max_missing_s": self.brush_track_max_missing_s,
+            "brush_track_max_active": self.brush_track_max_active,
             "brush_track_min_hits": self.brush_track_min_hits,
             "brush_contact_distance": self.brush_contact_distance,
-            "brush_min_duration_s": self.brush_min_duration_s,
-            "brush_max_gap_s": self.brush_max_gap_s,
-            "brush_min_motion": self.brush_min_motion,
-            "brush_require_hand": self.brush_require_hand,
-            "coverage_segments": self.coverage_segments,
-            "coverage_required": self.coverage_required,
-            "identity_timeout_s": self.identity_timeout_s,
-            "identity_ambiguity_margin": self.identity_ambiguity_margin,
+            "brush_hold_s": self.brush_hold_s,
             "holding_lost_timeout_s": self.holding_lost_timeout_s,
-            "oiling_wait_timeout_s": self.oiling_wait_timeout_s,
             "single_active_task": self.single_active_task,
             "task_max_active": self.task_max_active,
             "completed_retain_s": self.completed_retain_s,
             "tray_max_distance": self.tray_max_distance,
             "tray_max_missing_s": self.tray_max_missing_s,
             "tray_min_confidence": self.tray_min_confidence,
+            "hand_screw_max_distance": self.hand_screw_max_distance,
+            "hand_interaction_margin": self.hand_interaction_margin,
+            "held_infer_distance": self.held_infer_distance,
+            "held_predict_hold_s": self.held_predict_hold_s,
+            "screw_anchor_max_step": self.screw_anchor_max_step,
+            "screw_anchor_hold_s": self.screw_anchor_hold_s,
+            "brush_hold_max_gap_s": self.brush_hold_max_gap_s,
+            "frame_scale_max": self.frame_scale_max,
+            "roi_track_margin": self.roi_track_margin,
+            "hand_tracker_backend": self.hand_tracker_backend,
+            "brush_tracker_backend": self.brush_tracker_backend,
+            "bytetrack_high_thresh": self.bytetrack_high_thresh,
+            "bytetrack_low_thresh": self.bytetrack_low_thresh,
+            "bytetrack_new_thresh": self.bytetrack_new_thresh,
+            "bytetrack_match_thresh": self.bytetrack_match_thresh,
+            "bytetrack_buffer_s": self.bytetrack_buffer_s,
+            "bytetrack_cost_alpha": self.bytetrack_cost_alpha,
         }
 
 
@@ -515,6 +616,8 @@ class DemoConfig:
 
     loop: bool = True
     fps_limit: int = 15
+    # 示例回放默认速率倍数（0.5 为慢放）。判定计时用视频媒体时间，与速率无关。
+    speed: float = 1.0
     videos: tuple[DemoVideo, ...] = ()
 
     @classmethod
@@ -528,6 +631,12 @@ class DemoConfig:
             fps_limit = int(data.get("fps_limit", d.fps_limit))
         except (TypeError, ValueError):
             fps_limit = d.fps_limit
+        try:
+            speed = float(data.get("speed", d.speed))
+        except (TypeError, ValueError):
+            speed = d.speed
+        if speed <= 0:
+            speed = d.speed
 
         videos: list[DemoVideo] = []
         for item in data.get("videos", ()) or ():
@@ -537,6 +646,7 @@ class DemoConfig:
         return cls(
             loop=bool(loop),
             fps_limit=max(1, min(60, fps_limit)),
+            speed=max(0.1, min(4.0, speed)),
             videos=tuple(videos),
         )
 
@@ -544,6 +654,7 @@ class DemoConfig:
         return {
             "loop": self.loop,
             "fps_limit": self.fps_limit,
+            "speed": self.speed,
             "videos": [video.to_dict() for video in self.videos],
         }
 
@@ -556,10 +667,19 @@ class DemoConfig:
 
 @dataclass(frozen=True)
 class StationConfig:
-    """一个工位的有效 ROI 与检测配置。
+    """一个工位的 ROI 与检测配置。
 
-    ``exclude_rois`` 内的区域完全屏蔽推理（物料盒等）。ROI 使用归一化坐标，
-    现场调整后无需改代码。
+    工位有三个区域：
+
+    - ``tray_roi``：涂油盘区的**手工底区**，用于判断“手进盘/离盘”。
+      它覆盖盘体下方的手臂活动范围——模型只框得出盘体本身，手伸下去取料时
+      会在盘体下方 100~280px，只靠检测框会把取料全部漏掉。运行时与模型检出
+      的 ``oil_station`` 框取并集，跟随盘体上下移动。
+    - ``work_roi``：工作追踪区，跟踪与判定只处理中心落在该区域
+      （或涂油盘区内）的目标。
+    - ``oiling_roi``：涂油区，标定与显示用，预留给后续涂油范围约束。
+
+    ROI 使用归一化坐标，现场调整后无需改代码。
     """
 
     station_id: str
@@ -567,34 +687,40 @@ class StationConfig:
     camera_id: str
     enabled: bool
     tray_roi: Roi
-    hand_roi: Roi
-    brush_roi: Roi
-    exclude_rois: tuple[Roi, ...] = ()
+    work_roi: Roi
+    oiling_roi: Roi = _DEFAULT_WORK_ROI
     detector: DetectorConfig = field(default_factory=DetectorConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> StationConfig | None:
-        # 兼容旧配置：pick_roi → tray_roi，oiling_roi → hand_roi。
+        # 涂油盘区（手工底区）：兼容旧配置的 pick_roi。
         tray_roi = Roi.from_dict(data.get("tray_roi") or data.get("pick_roi"))
-        hand_roi = Roi.from_dict(data.get("hand_roi") or data.get("oiling_roi"))
-        if tray_roi is None or hand_roi is None:
+        if tray_roi is None:
             return None
-        # 刷涂区默认取人工涂油操作台范围（画面右下方），
-        # 与涂油盘区（tray_roi / oil_station）分开配置。
-        brush_roi = Roi.from_dict(data.get("brush_roi")) or hand_roi
 
-        exclude_rois: list[Roi] = []
-        raw_exclude = data.get("exclude_rois")
-        if raw_exclude is None:
-            raw_exclude = data.get("material_box_rois")
-        if raw_exclude is None and data.get("material_box_roi") is not None:
-            raw_exclude = [data.get("material_box_roi")]
-        if isinstance(raw_exclude, dict):
-            raw_exclude = [raw_exclude]
-        for item in raw_exclude or ():
-            roi = Roi.from_dict(item)
-            if roi is not None:
-                exclude_rois.append(roi)
+        # 工作追踪区：新字段优先；旧版手持区/刷涂区取并集迁移。
+        # 2.2 之前的 ``oiling_roi`` 就是手持操作区，同样按旧键处理。
+        work_roi = Roi.from_dict(data.get("work_roi"))
+        if work_roi is None:
+            legacy = [
+                roi
+                for roi in (
+                    Roi.from_dict(data.get("hand_roi")),
+                    Roi.from_dict(data.get("oiling_roi")),
+                    Roi.from_dict(data.get("brush_roi")),
+                )
+                if roi is not None
+            ]
+            work_roi = (
+                _union_roi(legacy[0], legacy[1:]) if legacy else _DEFAULT_WORK_ROI
+            )
+
+        # 涂油区：新字段优先，缺省沿用工作追踪区（旧配置没有这个概念）。
+        # 2.2 之前的 ``oiling_roi`` 是“手持操作区”的历史名字，含义完全不同；
+        # 那个年代的配置没有 ``work_roi``，因此只在已有 work_roi 时才认这个键。
+        oiling_roi = (
+            Roi.from_dict(data.get("oiling_roi")) if "work_roi" in data else None
+        ) or work_roi
 
         station_id = str(data.get("station_id", "")).strip()
         camera_id = str(data.get("camera_id", "")).strip()
@@ -607,9 +733,8 @@ class StationConfig:
             camera_id=camera_id,
             enabled=bool(data.get("enabled", True)),
             tray_roi=tray_roi,
-            hand_roi=hand_roi,
-            brush_roi=brush_roi,
-            exclude_rois=tuple(exclude_rois),
+            work_roi=work_roi,
+            oiling_roi=oiling_roi,
             detector=DetectorConfig.from_dict(data.get("detector")),
         )
 
@@ -620,16 +745,37 @@ class StationConfig:
             "camera_id": self.camera_id,
             "enabled": self.enabled,
             "tray_roi": self.tray_roi.to_dict(),
-            "hand_roi": self.hand_roi.to_dict(),
-            "brush_roi": self.brush_roi.to_dict(),
-            "exclude_rois": [roi.to_dict() for roi in self.exclude_rois],
+            "work_roi": self.work_roi.to_dict(),
+            "oiling_roi": self.oiling_roi.to_dict(),
             "detector": self.detector.to_dict(),
         }
 
 
+def _legacy_work_roi(raw_rois: list[Any]) -> dict[str, Any] | None:
+    """旧配置的手持区/刷涂区取包围矩形，作为工作追踪区。"""
+
+    rois = [roi for roi in (Roi.from_dict(item) for item in raw_rois) if roi is not None]
+    if not rois:
+        return None
+    return _union_roi(rois[0], rois[1:]).to_dict()
+
+
+def _union_roi(first: Roi, others: Iterable[Roi]) -> Roi:
+    """把若干 ROI 合成一个包围矩形，用于旧配置迁移。"""
+
+    boxes = [first.pixel_bbox(1, 1), *(roi.pixel_bbox(1, 1) for roi in others)]
+    return Roi(
+        kind="rect",
+        points=(
+            (min(b.x1 for b in boxes), min(b.y1 for b in boxes)),
+            (max(b.x2 for b in boxes), max(b.y2 for b in boxes)),
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class OilCheckConfig:
-    version: str = "2.1"
+    version: str = _CONFIG_VERSION
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
@@ -720,9 +866,14 @@ class OilCheckConfigService:
 
         old_version = str(data.get("version", "2.0"))
         try:
-            outdated = tuple(int(x) for x in old_version.split(".")) < (2, 1)
+            old_parts = tuple(int(x) for x in old_version.split("."))
         except ValueError:
-            outdated = True
+            old_parts = (2, 0)
+        outdated = old_parts < (2, 1)
+        # 2.2 之前每个工位配置手持操作区/刷涂区/排除区，改为涂油盘区 + 工作追踪区。
+        rois_outdated = old_parts < (2, 2)
+        # 2.3 引入槽位身份、手-丝杆关联、刷-手关联与 ByteTrack 后端。
+        slots_outdated = old_parts < (2, 3)
 
         changed: list[str] = []
 
@@ -742,7 +893,87 @@ class OilCheckConfigService:
                 data["demo"] = demo
                 changed.append("demo")
 
-        # 2) detector：旧配置的 null / 空路径不会自动用上仓库权重
+        # 2) 工位 ROI：只保留涂油盘区，新增工作追踪区，删除旧的
+        #    手持操作区/刷涂区/排除区。
+        if rois_outdated:
+            for station in data.get("stations", ()) or ():
+                if not isinstance(station, dict):
+                    continue
+                if not isinstance(station.get("work_roi"), dict):
+                    legacy = [
+                        station.get(key)
+                        for key in ("hand_roi", "oiling_roi", "brush_roi")
+                        if isinstance(station.get(key), dict)
+                    ]
+                    work = _legacy_work_roi(legacy)
+                    if work is not None:
+                        station["work_roi"] = work
+                        changed.append("stations.work_roi")
+                for legacy_key in (
+                    "hand_roi",
+                    "oiling_roi",
+                    "brush_roi",
+                    "exclude_rois",
+                    "material_box_roi",
+                    "material_box_rois",
+                    "pick_roi",
+                ):
+                    if legacy_key in station:
+                        station.pop(legacy_key)
+                        changed.append(f"-stations.{legacy_key}")
+
+        # 3) 槽位身份与关联参数：只补缺失键，不改现场已调过的值。
+        if slots_outdated:
+            pipeline = data.get("pipeline")
+            if not isinstance(pipeline, dict):
+                pipeline = data["pipeline"] = {}
+                changed.append("pipeline")
+            for key, value in _PIPELINE_DEFAULTS_2_3.items():
+                if key not in pipeline:
+                    pipeline[key] = value
+                    changed.append(f"pipeline.{key}")
+
+        # 4) 2.4 简化判定：删除槽位/遮挡区与一大批不再生效的管线参数，
+        #    给工位补上「涂油区」（缺省沿用工作追踪区）。
+        simplified_outdated = old_parts < (2, 4)
+        if simplified_outdated:
+            pipeline = data.get("pipeline")
+            if isinstance(pipeline, dict):
+                # 旧字段名 → 新的「刷子靠近判完成时长」。
+                # 必须在删除废弃键之前取值，否则 legacy 键已被清掉。
+                if "brush_hold_s" not in pipeline:
+                    for legacy_key in ("brush_min_duration_s", "oiling_min_duration_s"):
+                        legacy_value = pipeline.get(legacy_key)
+                        if isinstance(legacy_value, (int, float)):
+                            pipeline["brush_hold_s"] = float(legacy_value)
+                            changed.append("pipeline.brush_hold_s")
+                            break
+                for key in _PIPELINE_REMOVED_2_4:
+                    if key in pipeline:
+                        pipeline.pop(key)
+                        changed.append(f"-pipeline.{key}")
+            for station in data.get("stations", ()) or ():
+                if not isinstance(station, dict):
+                    continue
+                if not isinstance(station.get("oiling_roi"), dict):
+                    # 没有涂油区时沿用工位的工作追踪区作为初值，现场可再标定。
+                    work = station.get("work_roi")
+                    if isinstance(work, dict):
+                        station["oiling_roi"] = work
+                        changed.append("stations.oiling_roi")
+                for key in _STATION_REMOVED_2_4:
+                    if key in station:
+                        station.pop(key)
+                        changed.append(f"-stations.{key}")
+
+        # 4.5) demo：旧配置没有示例回放速率时补默认值，不改现场已设的值。
+        demo = data.get("demo")
+        if isinstance(demo, dict):
+            if "speed" not in demo:
+                demo["speed"] = _default_demo_speed()
+                changed.append("demo.speed")
+
+        # 5) detector：旧配置的 null / 空路径不会自动用上仓库权重
         for station in data.get("stations", ()) or ():
             if not isinstance(station, dict):
                 continue
@@ -789,7 +1020,7 @@ class OilCheckConfigService:
             logger.error("写回迁移后的检测配置失败: %s", exc)
             return
         logger.warning(
-            "检测配置已升级到 %s，补充字段: %s（原文件备份为 %s）",
+            "检测配置已升级到 %s，字段变更: %s（-前缀为删除，原文件备份为 %s）",
             _CONFIG_VERSION,
             ", ".join(dict.fromkeys(changed)),
             backup.name,
@@ -814,11 +1045,10 @@ class OilCheckConfigService:
         _write_json_atomic(self.config_path, cfg.to_dict())
 
 
-def _int_or(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(default)
+def _default_demo_speed() -> float:
+    """示例回放默认速率（与 :class:`DemoConfig` 保持一致）。"""
+
+    return DemoConfig().speed
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:

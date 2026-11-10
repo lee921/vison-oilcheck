@@ -11,15 +11,13 @@ from app.oilcheck.roi import Roi
 
 ROI_COLORS = {
     "tray": QColor("#ffd60a"),
-    "hand": QColor("#64d2ff"),
-    "brush": QColor("#ff375f"),
-    "exclude": QColor("#8a8f98"),
+    "work": QColor("#64d2ff"),
+    "oiling": QColor("#32d74b"),
 }
 ROI_NAMES = {
     "tray": "涂油盘区",
-    "hand": "手持操作区",
-    "brush": "刷涂区",
-    "exclude": "排除区（物料盒）",
+    "work": "工作追踪区",
+    "oiling": "涂油区",
 }
 ROI_KEYS = tuple(ROI_NAMES)
 
@@ -177,7 +175,7 @@ class RoiCanvas(QWidget):
             color = ROI_COLORS.get(key, QColor("#ffffff"))
             pen = QPen(color)
             pen.setWidth(3 if key == self._mode else 2)
-            if key == "exclude":
+            if key == "oiling":
                 pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)

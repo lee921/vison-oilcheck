@@ -81,18 +81,9 @@ class SettingsPage(QWidget):
         self._max_fps = QSpinBox()
         self._max_fps.setRange(1, 60)
         self._pick_hand_distance = _double_spin(0.005, 0.5, 0.005, 3)
-        self._pick_comotion = _double_spin(0.0, 10.0, 0.05, 2)
         self._pick_confirm = _double_spin(0.0, 10.0, 0.05, 2)
-        self._pick_abort = _double_spin(0.0, 30.0, 0.1, 2)
-        self._occlusion_timeout = _double_spin(0.0, 60.0, 0.1, 2)
-        self._pick_window = _double_spin(0.0, 30.0, 0.1, 2)
-        self._brush_min = _double_spin(0.0, 60.0, 0.1, 2)
-        self._brush_gap = _double_spin(0.0, 30.0, 0.1, 2)
-        self._brush_motion = _double_spin(0.0, 10.0, 0.01, 3)
         self._brush_distance = _double_spin(0.005, 0.5, 0.005, 3)
-        self._coverage_required = _double_spin(0.0, 1.0, 0.05, 2)
-        self._brush_require_hand = QCheckBox("要求同时检测到手部")
-        self._identity_timeout = _double_spin(0.0, 30.0, 0.1, 2)
+        self._brush_hold = _double_spin(0.0, 60.0, 0.1, 2)
         self._holding_lost_timeout = _double_spin(0.0, 30.0, 0.1, 2)
 
         # 盘体跟踪参数
@@ -100,11 +91,17 @@ class SettingsPage(QWidget):
         self._tray_missing = _double_spin(0.0, 10.0, 0.1, 2)
         self._tray_confidence = _double_spin(0.0, 1.0, 0.05, 2)
 
-        # 丝杆/手部/刷头跟踪参数
-        self._screw_track_distance = _double_spin(0.005, 0.5, 0.005, 3)
-        self._screw_track_missing = _double_spin(0.0, 10.0, 0.1, 2)
-        self._screw_track_min_hits = QSpinBox()
-        self._screw_track_min_hits.setRange(1, 20)
+        # 手与丝杆关联
+        self._hand_screw_distance = _double_spin(0.005, 1.0, 0.005, 3)
+        self._held_infer_distance = _double_spin(0.005, 1.0, 0.005, 3)
+        # 高级
+        self._held_predict_hold = _double_spin(0.0, 5.0, 0.05, 2)
+        self._hand_backend = ComboBox()
+        self._hand_backend.addItems(["auto", "bytetrack", "object"])
+        self._brush_backend = ComboBox()
+        self._brush_backend.addItems(["auto", "bytetrack", "object"])
+
+        # 手部/刷头跟踪参数
         self._hand_track_distance = _double_spin(0.005, 0.5, 0.005, 3)
         self._hand_track_missing = _double_spin(0.0, 10.0, 0.1, 2)
         self._hand_track_min_hits = QSpinBox()
@@ -142,25 +139,25 @@ class SettingsPage(QWidget):
         app_form.addRow("日志目录", self._log_dir)
 
         roi_form = QFormLayout()
-        roi_form.addRow("涂油盘区 / 手持区 / 刷涂区 / 排除区", self._btn_roi)
+        roi_form.addRow("涂油盘区 / 工作追踪区 / 涂油区", self._btn_roi)
         roi_form.addRow("", self._roi_summary)
 
         pipeline_form = QFormLayout()
         pipeline_form.addRow("检测最大帧率", self._max_fps)
         pipeline_form.addRow("手-丝杆接近距离（归一化）", self._pick_hand_distance)
-        pipeline_form.addRow("共同运动最短时长（秒）", self._pick_comotion)
-        pipeline_form.addRow("进入手持区确认时长（秒）", self._pick_confirm)
-        pipeline_form.addRow("手离开后取料取消（秒）", self._pick_abort)
-        pipeline_form.addRow("遮挡转待确认超时（秒）", self._occlusion_timeout)
-        pipeline_form.addRow("取料证据关联窗口（秒）", self._pick_window)
-        pipeline_form.addRow("二次涂油最短刷动时长（秒）", self._brush_min)
-        pipeline_form.addRow("刷动动作最大间隙（秒）", self._brush_gap)
-        pipeline_form.addRow("刷头最小轴向相对位移", self._brush_motion)
+        pipeline_form.addRow("盘内停留确认时长（秒）", self._pick_confirm)
         pipeline_form.addRow("刷头-丝杆接触距离（归一化）", self._brush_distance)
-        pipeline_form.addRow("要求覆盖区段比例", self._coverage_required)
-        pipeline_form.addRow("", self._brush_require_hand)
-        pipeline_form.addRow("身份关联丢失超时（秒）", self._identity_timeout)
+        pipeline_form.addRow("刷子靠近判完成时长（秒）", self._brush_hold)
         pipeline_form.addRow("手持丢失判定超时（秒）", self._holding_lost_timeout)
+
+        assoc_form = QFormLayout()
+        assoc_form.addRow("手-丝杆最大关联距离（归一化）", self._hand_screw_distance)
+        assoc_form.addRow("手持丝杆推断距离（归一化）", self._held_infer_distance)
+
+        advanced_form = QFormLayout()
+        advanced_form.addRow("手持位置预测保持（秒）", self._held_predict_hold)
+        advanced_form.addRow("手部跟踪后端", self._hand_backend)
+        advanced_form.addRow("刷头跟踪后端", self._brush_backend)
 
         tray_form = QFormLayout()
         tray_form.addRow("盘体最大关联距离（归一化）", self._tray_distance)
@@ -168,9 +165,6 @@ class SettingsPage(QWidget):
         tray_form.addRow("盘体最低置信度", self._tray_confidence)
 
         tracking_form = QFormLayout()
-        tracking_form.addRow("丝杆最大关联距离（归一化）", self._screw_track_distance)
-        tracking_form.addRow("丝杆短时漏检保留（秒）", self._screw_track_missing)
-        tracking_form.addRow("丝杆最少命中帧数", self._screw_track_min_hits)
         tracking_form.addRow("手部最大关联距离（归一化）", self._hand_track_distance)
         tracking_form.addRow("手部短时漏检保留（秒）", self._hand_track_missing)
         tracking_form.addRow("手部最少命中帧数", self._hand_track_min_hits)
@@ -202,7 +196,13 @@ class SettingsPage(QWidget):
         content_layout.addWidget(_section("涂油盘定位"))
         content_layout.addLayout(tray_form)
         content_layout.addSpacing(12)
-        content_layout.addWidget(_section("丝杆 / 手部 / 刷头跟踪"))
+        content_layout.addWidget(_section("手与丝杆关联"))
+        content_layout.addLayout(assoc_form)
+        content_layout.addSpacing(12)
+        content_layout.addWidget(_section("高级：手持预测 / 跟踪后端"))
+        content_layout.addLayout(advanced_form)
+        content_layout.addSpacing(12)
+        content_layout.addWidget(_section("手部 / 刷头跟踪"))
         content_layout.addLayout(tracking_form)
         content_layout.addSpacing(12)
         content_layout.addWidget(_section("训练视频录制"))
@@ -245,31 +245,22 @@ class SettingsPage(QWidget):
         pipeline = cfg.pipeline
         self._max_fps.setValue(int(pipeline.max_fps))
         self._pick_hand_distance.setValue(float(pipeline.pick_hand_distance))
-        self._pick_comotion.setValue(float(pipeline.pick_comotion_min_s))
         self._pick_confirm.setValue(float(pipeline.pick_confirm_s))
-        self._pick_abort.setValue(float(pipeline.pick_abort_s))
-        self._occlusion_timeout.setValue(float(pipeline.pick_occlusion_timeout_s))
-        self._pick_window.setValue(float(pipeline.pick_window_s))
-        self._brush_min.setValue(float(pipeline.brush_min_duration_s))
-        self._brush_gap.setValue(float(pipeline.brush_max_gap_s))
-        self._brush_motion.setValue(float(pipeline.brush_min_motion))
         self._brush_distance.setValue(float(pipeline.brush_contact_distance))
-        self._coverage_required.setValue(float(pipeline.coverage_required))
-        self._brush_require_hand.setChecked(bool(pipeline.brush_require_hand))
-        self._identity_timeout.setValue(float(pipeline.identity_timeout_s))
+        self._brush_hold.setValue(float(pipeline.brush_hold_s))
         self._holding_lost_timeout.setValue(float(pipeline.holding_lost_timeout_s))
 
         self._tray_distance.setValue(float(pipeline.tray_max_distance))
         self._tray_missing.setValue(float(pipeline.tray_max_missing_s))
         self._tray_confidence.setValue(float(pipeline.tray_min_confidence))
+        self._hand_screw_distance.setValue(
+            float(pipeline.hand_screw_max_distance)
+        )
+        self._held_infer_distance.setValue(float(pipeline.held_infer_distance))
+        self._held_predict_hold.setValue(float(pipeline.held_predict_hold_s))
+        self._hand_backend.setCurrentText(str(pipeline.hand_tracker_backend))
+        self._brush_backend.setCurrentText(str(pipeline.brush_tracker_backend))
 
-        self._screw_track_distance.setValue(
-            float(pipeline.screw_track_max_distance)
-        )
-        self._screw_track_missing.setValue(
-            float(pipeline.screw_track_max_missing_s)
-        )
-        self._screw_track_min_hits.setValue(int(pipeline.screw_track_min_hits))
         self._hand_track_distance.setValue(float(pipeline.hand_track_max_distance))
         self._hand_track_missing.setValue(float(pipeline.hand_track_max_missing_s))
         self._hand_track_min_hits.setValue(int(pipeline.hand_track_min_hits))
@@ -293,9 +284,9 @@ class SettingsPage(QWidget):
             suffix = "" if station.enabled else "（未启用）"
             lines.append(
                 f"{station.name}{suffix}：涂油盘区 "
-                f"{_format_roi(station.tray_roi)}；手持区 "
-                f"{_format_roi(station.hand_roi)}；刷涂区 "
-                f"{_format_roi(station.brush_roi)}"
+                f"{_format_roi(station.tray_roi)}；工作追踪区 "
+                f"{_format_roi(station.work_roi)}；涂油区 "
+                f"{_format_roi(station.oiling_roi)}"
             )
         self._roi_summary.setText(
             "\n".join(lines) or "未配置工位，请先在 oilcheck.json 中添加"
@@ -331,32 +322,22 @@ class SettingsPage(QWidget):
                 "log_dir": self._log_dir.text().strip() or "logs",
             }
         )
-        brush_min_duration = float(self._brush_min.value())
-        brush_max_gap = float(self._brush_gap.value())
-        brush_min_motion = float(self._brush_motion.value())
         pipeline = replace(
             self._oil_cfg.pipeline,
             max_fps=int(self._max_fps.value()),
             pick_hand_distance=float(self._pick_hand_distance.value()),
-            pick_comotion_min_s=float(self._pick_comotion.value()),
             pick_confirm_s=float(self._pick_confirm.value()),
-            pick_abort_s=float(self._pick_abort.value()),
-            pick_occlusion_timeout_s=float(self._occlusion_timeout.value()),
-            pick_window_s=float(self._pick_window.value()),
-            brush_min_duration_s=brush_min_duration,
-            brush_max_gap_s=brush_max_gap,
-            brush_min_motion=brush_min_motion,
             brush_contact_distance=float(self._brush_distance.value()),
-            coverage_required=float(self._coverage_required.value()),
-            brush_require_hand=self._brush_require_hand.isChecked(),
-            identity_timeout_s=float(self._identity_timeout.value()),
+            brush_hold_s=float(self._brush_hold.value()),
             holding_lost_timeout_s=float(self._holding_lost_timeout.value()),
             tray_max_distance=float(self._tray_distance.value()),
             tray_max_missing_s=float(self._tray_missing.value()),
             tray_min_confidence=float(self._tray_confidence.value()),
-            screw_track_max_distance=float(self._screw_track_distance.value()),
-            screw_track_max_missing_s=float(self._screw_track_missing.value()),
-            screw_track_min_hits=int(self._screw_track_min_hits.value()),
+            hand_screw_max_distance=float(self._hand_screw_distance.value()),
+            held_infer_distance=float(self._held_infer_distance.value()),
+            held_predict_hold_s=float(self._held_predict_hold.value()),
+            hand_tracker_backend=self._hand_backend.currentText(),
+            brush_tracker_backend=self._brush_backend.currentText(),
             hand_track_max_distance=float(self._hand_track_distance.value()),
             hand_track_max_missing_s=float(self._hand_track_missing.value()),
             hand_track_min_hits=int(self._hand_track_min_hits.value()),

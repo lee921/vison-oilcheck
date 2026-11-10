@@ -6,8 +6,8 @@
 - 左侧：视频 + ROI + 检测/跟踪结果；
 - 右侧：检测区域状态、最近任务、最近事件、复核入口。
 
-检测逻辑改为“单根丝杆任务”模型：取料状态、手持状态、刷涂状态与覆盖进度
-直接来自 :class:`TaskSnapshot`。
+检测逻辑只有两条判定：取料完成（空手进盘、带料离盘）与人工二次涂油完成
+（手持丝杆时刷子靠近累计到阈值）。阶段与进度直接来自 :class:`TaskSnapshot`。
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     BodyLabel,
+    CheckBox,
     ComboBox,
     InfoBar,
     InfoBarPosition,
@@ -52,24 +53,23 @@ from app.oilcheck.types import (
 from ui.utils import UiInvoker
 from ui.widgets.oilcheck_video import PALETTE, OilCheckVideoView, RoiOverlay
 
+# 回放速率选项：0.5× 是现场逐帧核对用的慢放，1× 原速。
+SPEED_OPTIONS: tuple[tuple[str, float], ...] = (
+    ("0.5×", 0.5),
+    ("1×", 1.0),
+    ("2×", 2.0),
+)
+
 STAGE_COLORS: dict[TaskStage, str] = {
     TaskStage.WAITING_PICK: "#6b7280",
-    TaskStage.PICK_CANDIDATE: "#d97706",
-    TaskStage.LEAVING_TRAY: "#d97706",
-    TaskStage.PICK_CONFIRMED: "#2563eb",
-    TaskStage.HOLDING: "#2563eb",
-    TaskStage.BRUSH_CONTACT: "#0891b2",
-    TaskStage.BRUSHING: "#7c3aed",
-    TaskStage.OILING_COMPLETED: "#15803d",
-    TaskStage.PENDING_CONFIRMATION: "#b91c1c",
-    TaskStage.NG: "#b91c1c",
+    TaskStage.PICKED: "#2563eb",
+    TaskStage.OILED: "#15803d",
 }
 
 RESULT_COLORS: dict[TaskResult, str] = {
     TaskResult.PROCESSING: "#374151",
-    TaskResult.OK: "#15803d",
+    TaskResult.COMPLETED: "#15803d",
     TaskResult.NG: "#b91c1c",
-    TaskResult.PENDING_CONFIRMATION: "#b45309",
 }
 
 CAMERA_STATE_LABELS = {
@@ -166,7 +166,7 @@ class TaskCard(QFrame):
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setTextVisible(True)
-        self._progress.setFormat("覆盖 %p%")
+        self._progress.setFormat("刷子靠近 %p%")
         self._progress.setFixedHeight(14)
         self._progress.setStyleSheet(
             "QProgressBar{background:#25272c;color:#d1d5db;border:none;"
@@ -215,10 +215,11 @@ class TaskCard(QFrame):
             "padding:2px 10px;font-size:12px;"
         )
         self._detail.setText(
-            f"取料 {task.pick_label} · 手持 {task.holding_label} · "
-            f"涂油 {task.oiling_label}"
+            f"手部轨迹 {task.hand_track_id or '-'} · "
+            f"刷子靠近 {task.brush_hold_s:.2f}s / "
+            f"{task.brush_hold_target_s:.2f}s"
         )
-        self._progress.setValue(task.coverage_percent)
+        self._progress.setValue(task.brush_hold_percent)
         timeline = " → ".join(
             f"{name}@{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}"
             for name, ts in task.timeline
@@ -226,11 +227,10 @@ class TaskCard(QFrame):
         self.setToolTip(
             f"{task.task_id}\n"
             f"阶段：{task.stage.value}（{task.reason_code or '-'}）\n"
-            f"丝杆轨迹：{task.screw_track_id}  手部轨迹：{task.hand_track_id}  "
-            f"刷头轨迹：{task.brush_track_id}\n"
-            f"有效刷涂：{task.effective_brush_duration_s:.2f}s  "
-            f"相对运动：{task.brush_motion:.3f}\n"
-            f"覆盖区段：{list(task.axis_segments)}\n"
+            f"手部轨迹：{task.hand_track_id or '-'}  "
+            f"刷头轨迹：{task.brush_track_id or '-'}\n"
+            f"刷子靠近累计：{task.brush_hold_s:.2f}s / "
+            f"{task.brush_hold_target_s:.2f}s\n"
             f"证据：{', '.join(task.evidence) or '-'}\n"
             f"时间线：{timeline or '-'}"
         )
@@ -263,6 +263,8 @@ class MonitorPage(QWidget):
         self._task_cards: dict[int, TaskCard] = {}
         self._event_ids: list[str] = []
         self._last_frame_ts = 0.0
+        # 当前画面对应的示例视频帧号文本（实时相机为空）。
+        self._frame_pos_text = ""
         self._last_events_version = -1
 
         self._build_ui()
@@ -295,9 +297,28 @@ class MonitorPage(QWidget):
         self._source_combo = ComboBox()
         self._reload_sources()
 
+        # 回放速率：只在示例视频下显示。默认取 demo.speed，切换视频后沿用
+        # 用户当前选择。
+        self._speed_combo = ComboBox()
+        self._speed_combo.setFixedWidth(78)
+        self._speed_combo.setToolTip("示例回放速率：只影响播放快慢，不影响判定")
+        for text, value in SPEED_OPTIONS:
+            self._speed_combo.addItem(text, userData=value)
+        self._demo_speed = float(self._service.demo_speed())
+        self._select_speed(self._demo_speed)
+        self._speed_combo.currentIndexChanged.connect(self._on_speed_changed)
+
         self._btn_camera = PrimaryPushButton("开始")
         self._btn_reset = PushButton("重置状态")
         self._btn_snapshot = PushButton("截图")
+        self._chk_track_ids = CheckBox("显示追踪 ID")
+        self._chk_track_ids.setChecked(True)
+        self._chk_track_ids.setToolTip(
+            "在画面上标出工作追踪区内的跟踪目标 ID：\n"
+            "手/刷头为视觉轨迹 ID（#100004），丝杆为丝杆视觉轨迹 ID（#300001）。\n"
+            "丢失中的轨迹以虚线框和 ? 标出。"
+        )
+        self._chk_track_ids.toggled.connect(self._on_track_ids_toggled)
 
         top = QHBoxLayout()
         top.addWidget(BodyLabel("工位"))
@@ -305,12 +326,19 @@ class MonitorPage(QWidget):
         top.addSpacing(6)
         top.addWidget(BodyLabel("画面源"))
         top.addWidget(self._source_combo)
+        top.addSpacing(6)
+        self._speed_label = BodyLabel("速率")
+        top.addWidget(self._speed_label)
+        top.addWidget(self._speed_combo)
+        # 默认隐藏，_refresh_status 会按当前画面源决定是否显示。
+        self._sync_speed_visibility("", "")
         top.addSpacing(8)
         top.addWidget(self._status_chip)
         top.addWidget(self._mode_chip)
         top.addWidget(self._rate_chip)
         top.addWidget(self._record_chip)
         top.addStretch(1)
+        top.addWidget(self._chk_track_ids)
         top.addWidget(self._btn_camera)
         top.addWidget(self._btn_reset)
         top.addWidget(self._btn_snapshot)
@@ -442,14 +470,12 @@ class MonitorPage(QWidget):
         self._region_cards.clear()
         self._task_cards.clear()
 
-        for pos, (key, title) in enumerate(
-            (
-                ("tray", "涂油盘参考区"),
-                ("hand", "手持操作区"),
-                ("brush", "刷涂区"),
-                ("exclude", "物料盒排除区"),
-            )
-        ):
+        # 涂油盘区不在监控页展示：它是判定用的内部参考区，不是操作对象。
+        cards = [
+            ("work", "工作追踪区"),
+            ("oiling", "涂油区"),
+        ]
+        for pos, (key, title) in enumerate(cards):
             card = RegionCard(title)
             self._region_cards[key] = card
             self._region_grid.addWidget(card, pos // 2, pos % 2)
@@ -463,6 +489,7 @@ class MonitorPage(QWidget):
         self._last_events_version = -1
         self._event_table.setRowCount(0)
         self._last_frame_ts = 0.0
+        self._frame_pos_text = ""
         self._sync_source_combo()
 
         self._refresh_status()
@@ -489,37 +516,41 @@ class MonitorPage(QWidget):
                 label = CAMERA_STATE_LABELS.get(camera_state, camera_state)
                 self._video.clear(f"相机{label}，点击“开始”启动预览")
                 self._video_info.setText("画面已停止")
+                self._frame_pos_text = ""
         elif frame is not None and frame.ts > self._last_frame_ts:
             self._last_frame_ts = frame.ts
             self._video.set_frame(frame.bgr, frame.ts)
             if camera_state == "video":
                 info = self._service.video_status(station.station_id)
                 progress = float(info.get("progress") or 0.0) * 100.0
+                # 帧号与这一帧画面同时记录，横幅才不会比画面快一帧。
+                self._frame_pos_text = _frame_position(info)
+                speed = float(info.get("speed") or 1.0)
+                speed_text = "" if abs(speed - 1.0) < 1e-6 else f" · {speed:g}×"
                 self._video_info.setText(
                     f"画面 {frame.width}×{frame.height} · 示例回放"
-                    f" {info.get('name', '')} · {progress:.0f}%（不写入训练录制）"
+                    f" {info.get('name', '')} · {self._frame_pos_text}"
+                    f"{speed_text} · {progress:.0f}%（不写入训练录制）"
                 )
             else:
+                self._frame_pos_text = ""
                 self._video_info.setText(f"画面 {frame.width}×{frame.height}")
 
-        # 涂油盘区即模型检测出的 oil_station 框，不再重复画静态 ROI；
-        # 手持操作区只在内部判定使用，画面上只保留一个涂刷区。
+        # 涂油盘区的实际位置由模型检出的 oil_station 框体现，画面上叠加
+        # 工作追踪区（判定范围）与涂油区（标定/显示用，虚线）。
         rois: list[RoiOverlay] = [
-            RoiOverlay("刷涂区", station.brush_roi, "#ff375f"),
+            RoiOverlay("工作追踪区", station.work_roi, "#64d2ff"),
+            RoiOverlay("涂油区", station.oiling_roi, "#32d74b", dashed=True),
         ]
-        for roi in station.exclude_rois:
-            rois.append(RoiOverlay("排除区", roi, "#8a8f98", dashed=True))
 
         # 画面上的框全部来自配置里的类别名，未知类别也会被画出来。
-        # 只画检测框：跟踪 ID 属于内部短时身份，不显示在画面上。
+        # 检测框与跟踪 ID 分开绘制：检测框表达“模型看到了什么”，
+        # 跟踪 ID 表达“管线正在跟踪谁”，两者可以单独关闭。
         detections: tuple[Detection, ...] = ()
         if snapshot is not None:
             detections = tuple(snapshot.detections)
 
         mode = "" if snapshot is None else snapshot.mode
-        tray_state = ""
-        if snapshot is not None and snapshot.tray is not None:
-            tray_state = " · 盘体可靠" if snapshot.tray.reliable else " · 盘体预测"
         active_task = ""
         counts_text = ""
         if snapshot is not None:
@@ -530,16 +561,26 @@ class MonitorPage(QWidget):
                     f"{name}:{count}" for name, count in counts.items()
                 )
         task_state = f" · {active_task}" if active_task else ""
+        # 示例回放时把帧号放在横幅最前面，现场对照录像定位问题最直接。
+        frame_state = f" · {self._frame_pos_text}" if self._frame_pos_text else ""
         banner = (
             f"{station.name} · {CAMERA_STATE_LABELS.get(camera_state, camera_state)}"
-            f" · {MODE_LABELS.get(mode, mode)}{tray_state}{task_state}{counts_text}"
+            f"{frame_state} · {MODE_LABELS.get(mode, mode)}"
+            f"{task_state}{counts_text}"
         )
+        # 跟踪结果只包含工作追踪区/涂油盘区内的目标（管线已做过区域过滤），
+        # 因此画面上的 ID 就是“被跟踪的目标”。
+        tracks = () if snapshot is None else tuple(snapshot.tracks)
         self._video.set_overlays(
             rois=tuple(rois),
             detections=detections,
+            tracks=tracks,
             banner=banner,
             label_colors=_label_colors(station.detector),
         )
+
+    def _on_track_ids_toggled(self, enabled: bool) -> None:
+        self._video.set_show_track_ids(bool(enabled))
 
     def _refresh_status(self) -> None:
         station = self._current_station()
@@ -552,6 +593,10 @@ class MonitorPage(QWidget):
         self._update_task_cards(snapshot)
         self._update_status_chips(station, snapshot)
         self._update_events(station.station_id)
+        camera_state = (
+            snapshot.stats.get("camera_state") if snapshot else None
+        ) or self._service.camera_state(station.camera_id)
+        self._sync_speed_visibility(camera_state, station.station_id)
 
         session = self._manager.get_session(station.camera_id)
         previewing = session is not None and session.state.value == "previewing"
@@ -569,7 +614,6 @@ class MonitorPage(QWidget):
         self._btn_snapshot.setEnabled(previewing)
 
     def _update_region_cards(self, station, snapshot: StationSnapshot | None) -> None:
-        tray = snapshot.tray if snapshot is not None else None
         tracks = snapshot.tracks if snapshot is not None else ()
         # raw_mode 下没有轨迹，直接按本帧检测计数，卡片仍有信息量。
         counts = (snapshot.stats.get("label_counts") if snapshot else None) or {}
@@ -583,32 +627,15 @@ class MonitorPage(QWidget):
         screw_count = sum(
             1 for t in tracks if t.label == cfg.screw_label and t.observed
         ) or int(counts.get(cfg.screw_label, 0))
-        if tray is not None and tray.visible:
-            motion = {"MOVING": "移动中", "STILL": "静止"}.get(tray.motion, "未知")
-            self._region_cards["tray"].set_state(
-                "可见" if tray.reliable else "预测",
-                "#15803d" if tray.reliable else "#b45309",
-                f"{motion} · 置信度 {tray.confidence or 0:.2f}",
-            )
-        else:
-            self._region_cards["tray"].set_state(
-                "配置 ROI" if snapshot is not None else "等待",
-                "#374151",
-                "使用固定涂油盘 ROI" if snapshot is not None else "-",
-            )
-        self._region_cards["hand"].set_state(
-            f"{hand_count} 只手", "#15803d" if hand_count else "#374151",
+        self._region_cards["work"].set_state(
             f"丝杆 {screw_count} 个",
+            "#15803d" if screw_count else "#374151",
+            f"手 {hand_count} 只 · 刷具 {brush_count} 个（区内跟踪）",
         )
-        self._region_cards["brush"].set_state(
-            f"{brush_count} 个刷具",
-            "#15803d" if brush_count else "#374151",
-            "刷具接触与相对运动",
-        )
-        self._region_cards["exclude"].set_state(
-            f"{len(station.exclude_rois)} 个区域",
-            "#b45309" if station.exclude_rois else "#374151",
-            "物料盒区域不参与推理",
+        self._region_cards["oiling"].set_state(
+            "已标定" if station.oiling_roi is not None else "未标定",
+            "#2563eb",
+            "预留涂油范围约束（本轮仅显示）",
         )
 
     def _update_task_cards(self, snapshot: StationSnapshot | None) -> None:
@@ -765,6 +792,53 @@ class MonitorPage(QWidget):
             combo.addItem(video.name, userData=video.name)
         combo.blockSignals(False)
 
+    def _select_speed(self, speed: float) -> None:
+        """把速率下拉同步到给定倍数（找不到就选最接近的一项）。"""
+
+        combo = getattr(self, "_speed_combo", None)
+        if combo is None:
+            return
+        index = 0
+        best = float("inf")
+        for pos in range(combo.count()):
+            value = float(combo.itemData(pos))
+            delta = abs(value - float(speed))
+            if delta < best:
+                best = delta
+                index = pos
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _current_speed(self) -> float:
+        return float(self._speed_combo.currentData() or 1.0)
+
+    def _sync_speed_visibility(self, camera_state: str, station_id: str) -> None:
+        """速率只对示例回放有意义，实时相机隐藏；显示时同步到实际速率。
+
+        同步到实际速率而不是只看下拉：配置重载后视频源会按 ``demo.speed``
+        重建，下拉需要跟着反映真实状态。
+        """
+
+        if getattr(self, "_speed_combo", None) is None:
+            return
+        show = camera_state == "video"
+        self._speed_label.setVisible(show)
+        self._speed_combo.setVisible(show)
+        if not show:
+            return
+        info = self._service.video_status(station_id)
+        speed = info.get("speed")
+        if speed:
+            self._select_speed(float(speed))
+
+    def _on_speed_changed(self, _index: int) -> None:
+        station = self._current_station()
+        if station is None:
+            return
+        speed = self._current_speed()
+        self._service.set_station_video_speed(station.station_id, speed)
+
     def _sync_source_combo(self) -> None:
         """把下拉框同步到该工位当前实际使用的画面源。"""
 
@@ -802,8 +876,15 @@ class MonitorPage(QWidget):
             return
 
         self._last_frame_ts = 0.0
+        self._frame_pos_text = ""
         self._last_events_version = -1
         self._video.clear("示例回放启动中…" if name else "等待相机画面")
+        # 新视频源按配置的默认速率启动，这里把下拉当前选择应用过去，
+        # 免得切一次视频速率就被重置。
+        if name:
+            self._service.set_station_video_speed(
+                station.station_id, self._current_speed()
+            )
         InfoBar.info(
             "画面源",
             f"已切换到：{name}" if name else "已切回实时相机",
@@ -906,6 +987,16 @@ class MonitorPage(QWidget):
         self._apply_station(index)
 
 
+def _frame_position(info: dict) -> str:
+    """把帧序号格式化成「第 123/456 帧」（1 基，与 ROI 标定窗口一致）。"""
+
+    index = int(info.get("frame_index") or 0)
+    total = int(info.get("frame_count") or 0)
+    if total > 0:
+        return f"第 {index + 1}/{total} 帧"
+    return f"第 {index + 1} 帧"
+
+
 def _label_colors(detector) -> dict[str, str]:
     """按配置里的类别名分配固定配色。
 
@@ -924,3 +1015,4 @@ def _label_colors(detector) -> dict[str, str]:
         if name and name not in colors:
             colors[name] = PALETTE[index % len(PALETTE)]
     return colors
+

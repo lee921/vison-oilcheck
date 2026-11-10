@@ -8,12 +8,19 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Frame:
-    """解码后的 BGR 帧。"""
+    """解码后的 BGR 帧。
+
+    ``ts`` 是取到该帧的墙钟时间，用于预览刷新、录制分段时间和在线判定。
+    ``media_ts`` 是该帧在**视频时间轴**上的时间：示例回放变速（如 0.5×）
+    时它仍按视频自身帧周期前进，检测管线用它计时，判定结果与播放速度无关。
+    实时相机没有这个概念，保持 ``None``，管线回退到 ``ts``。
+    """
 
     bgr: Any
     width: int
     height: int
     ts: float
+    media_ts: float | None = None
 
 
 class FrameBuffer:

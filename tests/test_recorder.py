@@ -20,7 +20,10 @@ def test_training_recorder_writes_video_and_metadata(tmp_path):
         station_meta={
             "station_id": "ST01",
             "station_name": "测试工位",
-            "rois": {"tray_roi": {"kind": "rect", "points": [[0, 0], [1, 1]]}},
+            "rois": {
+                "tray_roi": {"kind": "rect", "points": [[0, 0], [1, 1]]},
+                "work_roi": {"kind": "rect", "points": [[0, 0], [1, 1]]},
+            },
         },
     )
     assert recorder.start()

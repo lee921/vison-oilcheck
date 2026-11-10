@@ -6,9 +6,8 @@
 模型对应《涂油工位视觉检测项目实现文档》：
 
 - 视觉 Track ID 与业务任务 ID 分离；
-- 单根丝杆任务（:class:`TaskSnapshot`）是唯一业务对象；
-- 取料、手持、刷涂分别有独立状态字段，最终结果为 OK / NG /
-  PENDING_CONFIRMATION / PROCESSING。
+- 单个作业周期（:class:`TaskSnapshot`）是唯一业务对象；
+- 只有两条判定：取料完成、人工二次涂油完成。
 """
 
 from __future__ import annotations
@@ -21,111 +20,63 @@ from enum import Enum
 from typing import Any
 
 
-class PickStatus(str, Enum):
-    """取料状态（文档 5.1 / 10）。"""
-
-    CANDIDATE = "CANDIDATE"
-    CONFIRMED = "CONFIRMED"
-    UNKNOWN = "UNKNOWN"
-
-
-PICK_STATUS_LABELS: dict[PickStatus, str] = {
-    PickStatus.CANDIDATE: "取料候选",
-    PickStatus.CONFIRMED: "取料已确认",
-    PickStatus.UNKNOWN: "取料未知",
-}
-
-
-class HoldingStatus(str, Enum):
-    """手持丝杆关联状态（文档 6 / 10）。"""
-
-    HOLDING = "HOLDING"
-    LOST = "LOST"
-    RELEASED = "RELEASED"
-
-
-HOLDING_STATUS_LABELS: dict[HoldingStatus, str] = {
-    HoldingStatus.HOLDING: "手持中",
-    HoldingStatus.LOST: "已丢失",
-    HoldingStatus.RELEASED: "已结束",
-}
-
-
-class OilingStatus(str, Enum):
-    """二次涂油进程状态（文档 7 / 10）。"""
-
-    WAITING = "WAITING"
-    CONTACT = "CONTACT"
-    BRUSHING = "BRUSHING"
-    COMPLETED = "COMPLETED"
-
-
-OILING_STATUS_LABELS: dict[OilingStatus, str] = {
-    OilingStatus.WAITING: "等待刷涂",
-    OilingStatus.CONTACT: "刷头接触",
-    OilingStatus.BRUSHING: "有效刷涂",
-    OilingStatus.COMPLETED: "刷涂完成",
-}
-
-
 class TaskStage(str, Enum):
-    """业务状态机阶段（文档 8）。"""
+    """作业周期阶段。
+
+    只有三个状态：等待取料 → 已取料（等待涂油）→ 本周期的涂油已完成。
+    完成一个周期后立即复位回 ``WAITING_PICK``，等待下一次取料。
+    """
 
     WAITING_PICK = "WAITING_PICK"
-    PICK_CANDIDATE = "PICK_CANDIDATE"
-    LEAVING_TRAY = "LEAVING_TRAY"
-    PICK_CONFIRMED = "PICK_CONFIRMED"
-    HOLDING = "HOLDING"
-    BRUSH_CONTACT = "BRUSH_CONTACT"
-    BRUSHING = "BRUSHING"
-    OILING_COMPLETED = "OILING_COMPLETED"
-    PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
-    NG = "NG"
+    PICKED = "PICKED"
+    OILED = "OILED"
 
 
 TASK_STAGE_LABELS: dict[TaskStage, str] = {
     TaskStage.WAITING_PICK: "等待取料",
-    TaskStage.PICK_CANDIDATE: "取料候选",
-    TaskStage.LEAVING_TRAY: "离开涂油盘",
-    TaskStage.PICK_CONFIRMED: "取料确认",
-    TaskStage.HOLDING: "手持跟踪",
-    TaskStage.BRUSH_CONTACT: "刷头接触",
-    TaskStage.BRUSHING: "二次涂油中",
-    TaskStage.OILING_COMPLETED: "二次涂油完成",
-    TaskStage.PENDING_CONFIRMATION: "待确认",
-    TaskStage.NG: "不合格",
+    TaskStage.PICKED: "已取料",
+    TaskStage.OILED: "涂油完成",
 }
 
 
 class TaskResult(str, Enum):
-    """任务最终结果（文档 8 / 10）。"""
+    """作业周期结果。
+
+    ``NG`` 表示周期已取料，但人工二次涂油还没完成就等来了下一次取料；
+    判定依据见 :mod:`app.oilcheck.pipeline` 的 ``_supersede_unfinished``。
+    """
 
     PROCESSING = "PROCESSING"
-    OK = "OK"
+    COMPLETED = "COMPLETED"
     NG = "NG"
-    PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
 
 
 TASK_RESULT_LABELS: dict[TaskResult, str] = {
     TaskResult.PROCESSING: "进行中",
-    TaskResult.OK: "合格",
-    TaskResult.NG: "不合格",
-    TaskResult.PENDING_CONFIRMATION: "待确认",
+    TaskResult.COMPLETED: "已完成",
+    TaskResult.NG: "NG（漏涂）",
 }
 
 
 class EventType(str, Enum):
     PICK = "PICK"
-    BRUSH_CONTACT = "BRUSH_CONTACT"
     MANUAL_OILING = "MANUAL_OILING"
-    TASK_RESULT = "TASK_RESULT"
+    # 上一周期只取料、二次涂油未完成就被新的取料打断 ⇒ 该周期判 NG。
+    OILING_MISSING = "OILING_MISSING"
 
 
 EVENT_TYPE_LABELS: dict[EventType, str] = {
     EventType.PICK: "取料",
-    EventType.BRUSH_CONTACT: "刷头接触",
     EventType.MANUAL_OILING: "人工二次涂油",
-    EventType.TASK_RESULT: "任务结果",
+    EventType.OILING_MISSING: "人工二次涂油未完成",
+}
+
+# 旧事件文件里可能还有 PUT / BRUSH_CONTACT / TASK_RESULT，读回来时保留原字符串，
+# 不能默认当成 PICK（否则历史记录会被误标）。
+LEGACY_EVENT_TYPE_LABELS: dict[str, str] = {
+    "PUT": "放料（历史）",
+    "BRUSH_CONTACT": "刷头接触（历史）",
+    "TASK_RESULT": "任务结果（历史）",
 }
 
 
@@ -274,29 +225,25 @@ class TrackSnapshot:
 
 @dataclass(frozen=True)
 class TaskSnapshot:
-    """单根丝杆任务（文档 10 的 ScrewTask），供 UI 展示。"""
+    """一个作业周期，供 UI 展示。"""
 
     task_id: str
     created_at: float
     stage: TaskStage
     stage_since: float
-    pick_status: PickStatus
-    holding_status: HoldingStatus
-    oiling_status: OilingStatus
     final_result: TaskResult
-    screw_track_id: int | None = None
     hand_track_id: int | None = None
+    screw_track_id: int | None = None
     brush_track_id: int | None = None
-    contact_intervals: tuple[tuple[float, float], ...] = ()
-    axis_segments: tuple[bool, ...] = ()
-    coverage: float = 0.0
-    effective_brush_duration_s: float = 0.0
-    brush_motion: float = 0.0
+    screw_observed: bool = False
+    # 刷头工作点处于丝杆接触邻域内的累计时长（秒）。
+    brush_hold_s: float = 0.0
+    # 判定完成所需的累计接触时长（秒），用于 UI 进度条。
+    brush_hold_target_s: float = 1.0
     confidence: float | None = None
     reason_code: str | None = None
     evidence: tuple[str, ...] = ()
     picked_at: float | None = None
-    confirmed_at: float | None = None
     completed_at: float | None = None
     last_seen_ts: float | None = None
     timeline: tuple[tuple[str, float], ...] = ()
@@ -310,24 +257,10 @@ class TaskSnapshot:
         return TASK_RESULT_LABELS.get(self.final_result, self.final_result.value)
 
     @property
-    def pick_label(self) -> str:
-        return PICK_STATUS_LABELS.get(self.pick_status, self.pick_status.value)
-
-    @property
-    def holding_label(self) -> str:
-        return HOLDING_STATUS_LABELS.get(
-            self.holding_status, self.holding_status.value
-        )
-
-    @property
-    def oiling_label(self) -> str:
-        return OILING_STATUS_LABELS.get(
-            self.oiling_status, self.oiling_status.value
-        )
-
-    @property
-    def coverage_percent(self) -> int:
-        return int(round(max(0.0, min(1.0, self.coverage)) * 100))
+    def brush_hold_percent(self) -> int:
+        target = max(1e-6, float(self.brush_hold_target_s))
+        ratio = max(0.0, min(1.0, self.brush_hold_s / target))
+        return int(round(ratio * 100))
 
 
 @dataclass(frozen=True)
@@ -380,7 +313,9 @@ class EventRecord:
     timestamp_end: float
     station_id: str
     camera_id: str
-    event_type: EventType
+    # 旧事件文件里可能有已删除的类型（PUT / BRUSH_CONTACT / TASK_RESULT），
+    # 读回来时保留原字符串，不能默认当成 PICK 而误标历史记录。
+    event_type: EventType | str
     result: EventResult
     task_id: str
     cycle_id: str | None = None
@@ -421,7 +356,10 @@ class EventRecord:
 
     @property
     def event_label(self) -> str:
-        return EVENT_TYPE_LABELS.get(self.event_type, self.event_type.value)
+        if isinstance(self.event_type, EventType):
+            return EVENT_TYPE_LABELS.get(self.event_type, self.event_type.value)
+        raw = str(self.event_type)
+        return LEGACY_EVENT_TYPE_LABELS.get(raw, raw)
 
     @property
     def result_label(self) -> str:
@@ -471,7 +409,11 @@ class EventRecord:
             "camera_id": self.camera_id,
             "cycle_id": self.cycle_id,
             "task_id": self.task_id,
-            "event_type": self.event_type.value,
+            "event_type": (
+                self.event_type.value
+                if isinstance(self.event_type, EventType)
+                else str(self.event_type)
+            ),
             "result": self.result.value,
             "evidence": self.evidence,
             "clip_reference": self.clip_reference,
@@ -503,7 +445,7 @@ class EventRecord:
             timestamp_end=_parse_ts(data.get("timestamp_end")),
             station_id=str(data.get("station_id", "")),
             camera_id=str(data.get("camera_id", "")),
-            event_type=_enum_or(EventType, data.get("event_type"), EventType.PICK),
+            event_type=_event_type_or(data.get("event_type")),
             result=_enum_or(EventResult, data.get("result"), EventResult.NEEDS_REVIEW),
             task_id=task_id,
             cycle_id=(
@@ -546,6 +488,18 @@ def _parse_ts(value: Any) -> float:
         except ValueError:
             return 0.0
     return 0.0
+
+
+def _event_type_or(value: Any) -> EventType | str:
+    """已知类型转枚举；已删除的历史类型保留原字符串。"""
+
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return EventType.PICK
+    try:
+        return EventType(raw)
+    except ValueError:
+        return raw
 
 
 def _enum_or(enum_cls: type[Enum], value: Any, default: Any) -> Any:

@@ -1,13 +1,13 @@
 """短时目标跟踪。
 
 视觉 Track ID 只表示相邻帧的短时视觉身份，遮挡后可能发生 ID Switch；
-业务层的任务 ID 在 :mod:`app.oilcheck.pipeline` 中独立维护。
+作业周期（``TASK-xxxxxx``）在 :mod:`app.oilcheck.pipeline` 中独立维护。
 
 跟踪策略：
 
 - 用“预测位置 + 中心距离”做贪心匹配，速度根据相邻帧位移平滑更新；
 - 短时漏检保留 ``max_missing_s``，超过则判定丢失；
-- 丝杆、手、刷头共用 :class:`ObjectTracker`，由调用方负责 ROI 过滤；
+- 手/刷头走 :mod:`app.oilcheck.bytetrack_adapter`，这里保留通用实现与回退；
 - 检测器提供 OBB 角度/关键点时，随轨迹一起保存。
 """
 
@@ -72,10 +72,10 @@ class TrackerOutput:
 
 
 class ObjectTracker:
-    """通用多目标跟踪（丝杆/手部/刷头）。
+    """通用多目标跟踪（手部/刷头，ByteTrack 不可用时的回退）。
 
-    不限定 ROI：丝杆需要从涂油盘跨到手持操作区，手和刷头也会移动；
-    ROI 屏蔽由 :class:`StationPipeline` 在送入跟踪器前完成。
+    不限定 ROI：手和刷头会从涂油盘跨到工作追踪区；
+    区域过滤由 :class:`StationPipeline` 在送入跟踪器前完成。
     """
 
     def __init__(
@@ -86,12 +86,15 @@ class ObjectTracker:
         min_hits: int = 1,
         max_active: int = 16,
         velocity_smoothing: float = 0.5,
+        id_base: int = 0,
     ) -> None:
         self._max_distance = max(0.005, float(max_distance))
         self._max_missing_s = max(0.0, float(max_missing_s))
         self._min_hits = max(1, int(min_hits))
         self._max_active = max(1, int(max_active))
         self._smoothing = max(0.0, min(0.95, float(velocity_smoothing)))
+        # id_base 用于给不同跟踪器分配互不重叠的 id 段（手 / 刷头）。
+        self._id_base = max(0, int(id_base))
         self._tracks: dict[int, Track] = {}
         self._next_id = 1
 
@@ -117,11 +120,13 @@ class ObjectTracker:
         ts: float,
         detections: tuple[Detection, ...],
         frame_size: tuple[int, int],
+        distance_scale: float = 1.0,
     ) -> TrackerOutput:
         width, height = frame_size
         if width <= 0 or height <= 0:
             return TrackerOutput(active=(), lost=())
         diag = max(1.0, math.hypot(width, height))
+        max_distance = self._max_distance * max(1e-3, float(distance_scale))
 
         matched_dets: set[int] = set()
         matched_tracks: set[int] = set()
@@ -133,7 +138,7 @@ class ObjectTracker:
                 cx, cy = det.box.center
                 distance = math.hypot(cx - pcx, cy - pcy) / diag
                 iou = predicted.iou(det.box)
-                if distance <= self._max_distance or iou >= 0.15:
+                if distance <= max_distance or iou >= 0.15:
                     pairs.append(
                         (distance - min(iou, 0.5) * 0.01, track.track_id, index)
                     )
@@ -166,7 +171,7 @@ class ObjectTracker:
             if len(self._tracks) >= self._max_active:
                 break
             track = Track(
-                track_id=self._next_id,
+                track_id=self._id_base + self._next_id,
                 box=det.box,
                 last_ts=float(ts),
                 last_seen_ts=float(ts),
@@ -260,11 +265,13 @@ class TrayTracker:
         ts: float,
         detections: tuple[Detection, ...],
         frame_size: tuple[int, int],
+        distance_scale: float = 1.0,
     ) -> TrayTrack:
         width, height = frame_size
         if width <= 0 or height <= 0:
             return self._track
         diag = max(1.0, math.hypot(width, height))
+        max_distance = self._max_distance * max(1e-3, float(distance_scale))
         predicted = self._track.predicted_box(ts)
 
         best: Detection | None = None
@@ -277,7 +284,7 @@ class TrayTracker:
                 cx, cy = det.box.center
                 distance = math.hypot(cx - pcx, cy - pcy) / diag
                 iou = predicted.iou(det.box)
-                if distance > self._max_distance and iou < 0.1:
+                if distance > max_distance and iou < 0.1:
                     continue
                 cost = distance - min(iou, 0.5) * 0.01
             else:

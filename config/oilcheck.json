@@ -1,43 +1,43 @@
 {
-  "version": "2.1",
+  "version": "2.4",
   "pipeline": {
     "max_fps": 15,
     "pick_hand_distance": 0.05,
-    "pick_motion_min": 0.01,
-    "pick_relative_max": 0.03,
-    "pick_comotion_min_s": 0.25,
     "pick_confirm_s": 0.3,
-    "pick_abort_s": 0.5,
-    "pick_occlusion_timeout_s": 2.0,
-    "pick_ambiguity_margin": 0.02,
-    "pick_window_s": 2.0,
-    "screw_track_max_distance": 0.08,
-    "screw_track_max_missing_s": 0.7,
-    "screw_track_min_hits": 2,
-    "screw_track_max_active": 16,
     "hand_track_max_distance": 0.15,
     "hand_track_max_missing_s": 0.8,
     "hand_track_min_hits": 1,
+    "hand_track_max_active": 8,
     "brush_track_max_distance": 0.15,
     "brush_track_max_missing_s": 0.8,
     "brush_track_min_hits": 1,
+    "brush_track_max_active": 4,
     "brush_contact_distance": 0.06,
-    "brush_min_duration_s": 1.0,
-    "brush_max_gap_s": 0.6,
-    "brush_min_motion": 0.15,
-    "brush_require_hand": false,
-    "coverage_segments": 5,
-    "coverage_required": 0.6,
-    "identity_timeout_s": 2.0,
-    "identity_ambiguity_margin": 0.02,
+    "brush_hold_s": 1.0,
     "holding_lost_timeout_s": 2.0,
-    "oiling_wait_timeout_s": 0.0,
     "single_active_task": true,
     "task_max_active": 4,
     "completed_retain_s": 10.0,
     "tray_max_distance": 0.2,
     "tray_max_missing_s": 1.0,
-    "tray_min_confidence": 0.3
+    "tray_min_confidence": 0.3,
+    "hand_screw_max_distance": 0.1,
+    "hand_interaction_margin": 0.02,
+    "held_infer_distance": 0.1,
+    "held_predict_hold_s": 0.5,
+    "screw_anchor_max_step": 0.12,
+    "screw_anchor_hold_s": 0.5,
+    "brush_hold_max_gap_s": 0.5,
+    "frame_scale_max": 4.0,
+    "roi_track_margin": 0.2,
+    "hand_tracker_backend": "auto",
+    "brush_tracker_backend": "auto",
+    "bytetrack_high_thresh": 0.3,
+    "bytetrack_low_thresh": 0.1,
+    "bytetrack_new_thresh": 0.3,
+    "bytetrack_match_thresh": 0.8,
+    "bytetrack_buffer_s": 2.0,
+    "bytetrack_cost_alpha": 0.4
   },
   "recording": {
     "training_dir": "recordings/training",
@@ -50,6 +50,7 @@
   "demo": {
     "loop": true,
     "fps_limit": 15,
+    "speed": 1.0,
     "videos": [
       {
         "name": "示例① 105708",
@@ -71,42 +72,41 @@
         "kind": "rect",
         "points": [
           [
-            0.28,
-            0.08
+            0.5,
+            0.1
           ],
           [
             0.72,
-            0.42
+            0.44
           ]
         ]
       },
-      "hand_roi": {
+      "work_roi": {
         "kind": "rect",
         "points": [
           [
-            0.1,
-            0.4
+            0.3543,
+            0.0
           ],
           [
-            0.48,
-            0.96
+            0.9979,
+            0.9488
           ]
         ]
       },
-      "brush_roi": {
+      "oiling_roi": {
         "kind": "rect",
         "points": [
           [
-            0.349,
-            0.412
+            0.3543,
+            0.0
           ],
           [
-            0.876,
-            1.0
+            0.9979,
+            0.9488
           ]
         ]
       },
-      "exclude_rois": [],
       "detector": {
         "kind": "yolo",
         "model_path": "model/detect/exp/weights/best.pt",
@@ -116,7 +116,7 @@
         "imgsz": 0,
         "device": "auto",
         "half": false,
-        "raw_mode": true,
+        "raw_mode": false,
         "screw_label": "screw",
         "hand_label": "hand",
         "brush_label": "brush",
