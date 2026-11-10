@@ -812,7 +812,7 @@ class StationPipeline:
             task.last_screw_ts = ts
             return best
 
-        # 3) 都没有：hold 窗口内按锚点位置继续，窗口外放弃。
+        # 3) hold 窗口内：按锚点位置继续（跨过一两帧漏检，不中断累计）。
         if (
             anchor is not None
             and task.screw_anchor_ts is not None
@@ -823,8 +823,68 @@ class StationPipeline:
             cx, cy = anchor
             return BBox(cx - 8.0, cy - 8.0, cx + 8.0, cy + 8.0)
 
+        # 4) 锚点已失效：尝试**重新捕获**。
+        #
+        # 现场会这样：取完料拿着杆走出画面（去别处、被遮挡、或杆暂时检测
+        # 不到），过一会儿再回来涂油。原实现在 hold 窗口过期后每帧直接返回
+        # None，周期永久停在 PICKED，直到下一次取料把它判成 NG——中间回来
+        # 涂了也不算。这里只要还在重新捕获时限内、且本帧又出现了「被手握着」
+        # 的丝杆，就把它接成新锚点，继续累计涂油。
+        reacquired = self._reacquire_anchor(task, ts)
+        if reacquired is not None:
+            gap = 0.0 if task.last_screw_ts is None else ts - task.last_screw_ts
+            task.screw_anchor = reacquired.center
+            task.screw_anchor_ts = ts
+            task.last_screw_ts = ts
+            task.screw_observed = True
+            if "SCREW_REACQUIRED" not in task.evidence:
+                task.evidence.append("SCREW_REACQUIRED")
+                self._logger.info(
+                    "周期 %s 重新捕获手持丝杆（距上次观测 %.1fs）",
+                    task.task_id,
+                    gap,
+                )
+            return reacquired
+
         task.screw_observed = False
         return None
+
+    def _reacquire_anchor(self, task: _Cycle, ts: float) -> BBox | None:
+        """锚点失效后重新捕获手持丝杆。
+
+        条件是「本帧有丝杆检测与某个手框交叠」——握着的时候丝杆必然被手框
+        遮住，这条约束足以把候选从满盘丝杆缩到手上那一根，不需要位置先验。
+        多只手各握一根时取最大的那根（握得越实交叠越大）。
+
+        ``screw_reacquire_timeout_s=0`` 表示不限时：只要周期还活着就一直等，
+        因为「多久算这一件不回来了」是工艺问题，交给下一次取料去判 NG 更准。
+        """
+
+        timeout = self.cfg.screw_reacquire_timeout_s
+        if timeout > 0 and task.last_screw_ts is not None:
+            if ts - task.last_screw_ts > timeout:
+                return None
+
+        label = self.station.detector.screw_label
+        best: tuple[float, BBox] | None = None
+        for det in self._last_detections:
+            if det.label != label:
+                continue
+            overlap = 0.0
+            for hand in self._hand_tracks:
+                if not hand.matched:
+                    continue
+                if not _overlaps(det.box, hand.box):
+                    continue
+                # 取交叠面积占比作为「握得有多实」的度量。
+                inter = det.box.intersection_area(hand.box)
+                area = max(1.0, det.box.width * det.box.height)
+                overlap = max(overlap, inter / area)
+            if overlap <= 0.0:
+                continue
+            if best is None or overlap > best[0]:
+                best = (overlap, det.box)
+        return None if best is None else best[1]
 
     def _hand_center(self, hand_track_id: int | None) -> tuple[float, float] | None:
         if hand_track_id is None:

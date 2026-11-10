@@ -304,6 +304,12 @@ class PipelineConfig:
     # 用空档桥接把这段补回来（按实际帧率缩放）。
     brush_hold_max_gap_s: float = 0.50
 
+    # 手持丝杆离开画面后，允许重新捕获的时长。工人取完料可能拿着杆走出
+    # 画面、过一会儿再回来涂油，这段时间内周期保持 PICKED 并继续等；
+    # 超过该时长仍未重新出现，才认为这一件不再回来。
+    # 0 表示不限制（只要周期没结束就一直等）。
+    screw_reacquire_timeout_s: float = 0.0
+
     # 帧率自适应：以配置 max_fps 为基准，按实测帧间隔放大上面所有
     # 距离门限与容差窗口。倍率上限避免低帧率时门限大到失去区分度。
     frame_scale_max: float = 4.0
@@ -453,6 +459,9 @@ class PipelineConfig:
             brush_hold_max_gap_s=_f(
                 "brush_hold_max_gap_s", d.brush_hold_max_gap_s, 0.0
             ),
+            screw_reacquire_timeout_s=_f(
+                "screw_reacquire_timeout_s", d.screw_reacquire_timeout_s, 0.0
+            ),
             frame_scale_max=_f("frame_scale_max", d.frame_scale_max, 1.0),
             roi_track_margin=_f(
                 "roi_track_margin", d.roi_track_margin, 0.0
@@ -514,6 +523,7 @@ class PipelineConfig:
             "screw_anchor_max_step": self.screw_anchor_max_step,
             "screw_anchor_hold_s": self.screw_anchor_hold_s,
             "brush_hold_max_gap_s": self.brush_hold_max_gap_s,
+            "screw_reacquire_timeout_s": self.screw_reacquire_timeout_s,
             "frame_scale_max": self.frame_scale_max,
             "roi_track_margin": self.roi_track_margin,
             "hand_tracker_backend": self.hand_tracker_backend,
@@ -1122,7 +1132,11 @@ CONFIG_COMMENTS: dict[str, str] = {
         "既跟得住快速移动，又不会跳到相邻丝杆（盘里间距很小）"
     ),
     "pipeline.screw_anchor_hold_s": (
-        "锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则停止累计涂油"
+        "锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则尝试重新捕获"
+    ),
+    "pipeline.screw_reacquire_timeout_s": (
+        "手持丝杆离开画面后允许重新捕获的时长。工人拿着杆走出画面、过一会儿"
+        "再回来涂油仍算完成；0=不限时，只要周期没结束就一直等"
     ),
     "pipeline.frame_scale_max": (
         "帧率自适应倍率上限。门限按「实际帧间隔 / (1/max_fps)」放大，"

@@ -948,3 +948,72 @@ def test_outside_area_does_not_create_new_tracks():
         feed(pipeline, next(ts_iter), hand_at(50.0, 50.0))
 
     assert pipeline._hand_tracks == ()
+
+
+# ----------------------------------------------------------------------
+# 手持丝杆离开后再回来 / 任意阶段取料即开新周期
+# ----------------------------------------------------------------------
+def test_screw_reacquired_after_long_absence():
+    """取料后拿着杆走出画面，过一会儿在别处回来涂油，仍算完成。"""
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, max_fps=1)
+    ts_iter = timestamps()
+    do_pick(pipeline, ts_iter)
+    task = pipeline._cycles[pipeline.tasks[0].task_id]
+    assert task.screw_anchor is not None
+
+    # 手和杆都消失 6 秒（只剩盘体）。
+    for _ in range(30):
+        feed(pipeline, next(ts_iter))
+
+    # 在远离原锚点的位置回来涂油。
+    spot = (180.0, 800.0)
+    for _ in range(10):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*spot),
+            held_screw_at(*spot),
+            brush_at(spot[0] + 10, spot[1]),
+        )
+
+    kinds = [e.event_type for e in events]
+    assert EventType.MANUAL_OILING in kinds
+    assert "SCREW_REACQUIRED" in task.evidence
+    assert task.stage == TaskStage.OILED
+
+
+def test_no_completion_when_hand_never_returns():
+    """杆离开后一直不回来：不能凭空判完成，周期保持 PICKED。"""
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, max_fps=1)
+    ts_iter = timestamps()
+    do_pick(pipeline, ts_iter)
+
+    # 刷子在画面里到处跑，但手里一直没有杆。
+    for i in range(40):
+        feed(pipeline, next(ts_iter), brush_at(200.0 + (i % 5) * 60, 850.0))
+
+    task = pipeline._cycles[pipeline.tasks[0].task_id]
+    assert task.stage == TaskStage.PICKED
+    assert task.brush_hold_s == pytest.approx(0.0)
+    assert [e for e in events if e.event_type == EventType.MANUAL_OILING] == []
+
+
+def test_pick_at_any_stage_starts_new_cycle():
+    """任何阶段判出取料，都立即进入下一周期（上一件未涂则判 NG）。"""
+
+    pipeline, events = make_pipeline(brush_hold_s=5.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    first = pipeline.tasks[0].task_id
+    # 还没涂完就直接再取一次。
+    do_pick(pipeline, ts_iter)
+
+    tasks = pipeline.tasks
+    assert len(tasks) == 2
+    assert tasks[0].task_id == first
+    assert tasks[0].final_result == TaskResult.NG
+    assert tasks[1].final_result == TaskResult.PROCESSING
+    assert [e for e in events if e.event_type == EventType.OILING_MISSING]
