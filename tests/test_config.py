@@ -675,3 +675,43 @@ def test_runtime_config_and_template_differ_only_in_values(tmp_path):
 
     actual = (config_dir / "oilcheck.json").read_text(encoding="utf-8").splitlines()
     assert actual == expected
+
+
+# ----------------------------------------------------------------------
+# 生效配置文件的位置与外部修改
+# ----------------------------------------------------------------------
+def test_source_info_points_at_the_data_directory_file(tmp_path):
+    """``source_info`` 必须报出数据目录里的那份，而不是仓库模板。
+
+    现场最常见的误判是「改了仓库 config/oilcheck.json 却不生效」——程序
+    只读数据目录那份，仓库里的仅在首次运行时复制一次。
+    """
+
+    from app.oilcheck.config import OilCheckConfigService
+    from app.paths import runtime_root
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "oilcheck.json").write_text(
+        json.dumps({"version": "2.5", "stations": []}), encoding="utf-8"
+    )
+
+    service = OilCheckConfigService(tmp_path)
+    service.load()
+    info = service.source_info()
+
+    assert info["path"] == str(config_dir / "oilcheck.json")
+    assert info["data_root"] == str(tmp_path.resolve())
+    assert info["exists"] is True
+    assert info["mtime"] is not None
+    assert info["template"] == str(runtime_root() / "config" / "oilcheck.json")
+    # 数据目录不在仓库里时，两者绝不是同一个文件。
+    assert info["same_as_template"] is False
+
+
+def test_source_info_reports_missing_file(tmp_path):
+    from app.oilcheck.config import OilCheckConfigService
+
+    info = OilCheckConfigService(tmp_path).source_info()
+    assert info["exists"] is False
+    assert info["mtime"] is None

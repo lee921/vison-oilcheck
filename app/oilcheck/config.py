@@ -1267,6 +1267,40 @@ class OilCheckConfigService:
                 backup.name,
             )
 
+    def source_info(self) -> dict[str, Any]:
+        """当前生效配置文件的位置与状态，供 UI/日志核对。
+
+        配置只在首次运行时从模板复制，之后一直读数据目录里的那份。现场最
+        常见的误判是「改了仓库模板却不生效」——把实际路径亮出来，比解释
+        规则更有用。
+        """
+
+        template = runtime_root() / "config" / "oilcheck.json"
+        info: dict[str, Any] = {
+            "path": str(self.config_path),
+            "exists": self.config_path.exists(),
+            "template": str(template),
+            "data_root": str(self._data_root),
+            "mtime": None,
+            "size": None,
+            "same_as_template": False,
+        }
+        try:
+            stat = self.config_path.stat()
+            info["mtime"] = stat.st_mtime
+            info["size"] = stat.st_size
+        except OSError:
+            pass
+        try:
+            info["same_as_template"] = (
+                template.exists()
+                and self.config_path.exists()
+                and template.resolve() == self.config_path.resolve()
+            )
+        except OSError:
+            pass
+        return info
+
     def load(self, *, create_if_missing: bool = True) -> OilCheckConfig:
         if create_if_missing:
             self.ensure_defaults()

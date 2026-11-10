@@ -23,7 +23,13 @@ from typing import Any
 
 from app.paths import resolve_runtime_file, runtime_root
 
-from .config import DemoVideo, OilCheckConfig, OilCheckConfigService, StationConfig
+from .config import (
+    DemoVideo,
+    OilCheckConfig,
+    OilCheckConfigService,
+    StationConfig,
+    load_json_with_comments,
+)
 from .detector import Detector, create_detector
 from .events import EventStore
 from .pipeline import StationPipeline
@@ -91,6 +97,9 @@ class OilCheckService:
         self._detector_overrides: dict[str, str] = {}
         self._active_video: dict[str, DemoVideo] = {}
         self._cycle_id = f"RUN-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # 配置文件的 mtime 快照：文件被外部改过（手工编辑 / 另一个进程保存）
+        # 时自动重载，避免「改了文件但程序还在用旧 ROI」。
+        self._config_mtime = self._stat_config_mtime()
 
         self._rebuild_runtimes_locked()
 
@@ -163,6 +172,7 @@ class OilCheckService:
 
     def reload(self, config: OilCheckConfig) -> None:
         """应用新的配置并重建工位运行时（录制保持不变）。"""
+        self._config_mtime = self._stat_config_mtime()
         old = list(self._runtimes.values())
         with self._lock:
             self._config = config
@@ -179,6 +189,11 @@ class OilCheckService:
 
     def station(self, station_id: str) -> StationConfig | None:
         return self._config.station(station_id)
+
+    def config_source(self) -> dict[str, Any]:
+        """当前生效配置文件的位置与状态（UI 用来显示「程序在读哪个文件」）。"""
+
+        return self._config_service.source_info()
 
     def station_snapshot(self, station_id: str) -> StationSnapshot | None:
         with self._lock:
@@ -513,6 +528,7 @@ class OilCheckService:
             interval = self._poll_interval()
             if self._stop_event.wait(interval):
                 break
+            self._reload_if_file_changed()
             with self._lock:
                 runtimes = list(self._runtimes.values())
             if not runtimes:
@@ -521,6 +537,50 @@ class OilCheckService:
                 if runtime.closed:
                     continue
                 self._poll_station(runtime)
+
+    def _stat_config_mtime(self) -> float | None:
+        try:
+            return self._config_service.config_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _reload_if_file_changed(self) -> None:
+        """配置文件被外部改动时重新加载并重建运行时。
+
+        手工编辑 ``oilcheck.json``（或另一个进程保存了它）之后，程序原本
+        会一直用启动时读到的那份，改 ROI 不生效、也很难看出原因。这里按
+        mtime 检测：变了就重新读一遍，解析失败则保持旧配置继续跑。
+        """
+
+        mtime = self._stat_config_mtime()
+        if mtime is None or mtime == self._config_mtime:
+            return
+        self._config_mtime = mtime
+        path = self._config_service.config_path
+        # 先确认文件还能解析：``load`` 解析失败时会退回空配置，照单全收
+        # 会让所有工位一起消失、检测直接停摆。编辑器保存到一半、手工改出
+        # 语法错误都属于这种情况，此时保持旧配置继续跑。
+        try:
+            raw = load_json_with_comments(path)
+        except (OSError, ValueError) as exc:
+            self._logger.error(
+                "检测配置文件解析失败，继续使用上次的配置 (%s): %s", path, exc
+            )
+            return
+        if not isinstance(raw, dict):
+            self._logger.error(
+                "检测配置文件内容不是对象，继续使用上次的配置: %s", path
+            )
+            return
+        # 只改时间戳、内容没变（touch/备份工具）时不必重建运行时。
+        loaded = self._config_service.load(create_if_missing=False)
+        if loaded.to_dict() == self._config.to_dict():
+            return
+        self._logger.warning(
+            "检测配置文件已变化，自动重新加载: %s",
+            self._config_service.config_path,
+        )
+        self.reload(loaded)
 
     def _poll_interval(self) -> float:
         pipeline_fps = self._config.pipeline.max_fps

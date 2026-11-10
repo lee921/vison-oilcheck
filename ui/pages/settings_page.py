@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -138,9 +140,20 @@ class SettingsPage(QWidget):
         app_form.addRow("截图目录", self._snapshot_dir)
         app_form.addRow("日志目录", self._log_dir)
 
+        # 把「程序实际在读哪个文件」直接亮出来：配置只在首次运行时从仓库
+        # 模板复制，之后一直读数据目录那份。改仓库里的模板不会生效，这一点
+        # 光靠文档很容易漏看。
+        self._config_source = QLabel("")
+        self._config_source.setWordWrap(True)
+        self._config_source.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._config_source.setStyleSheet("color:#9ca3af;font-size:11px;")
+
         roi_form = QFormLayout()
         roi_form.addRow("涂油盘区 / 工作追踪区 / 涂油区", self._btn_roi)
         roi_form.addRow("", self._roi_summary)
+        roi_form.addRow("", self._config_source)
 
         pipeline_form = QFormLayout()
         pipeline_form.addRow("检测最大帧率", self._max_fps)
@@ -290,6 +303,22 @@ class SettingsPage(QWidget):
             )
         self._roi_summary.setText(
             "\n".join(lines) or "未配置工位，请先在 oilcheck.json 中添加"
+        )
+        self._update_config_source()
+
+    def _update_config_source(self) -> None:
+        """显示实际生效的配置文件路径与修改时间。"""
+
+        info = self._oil_cfg_service.source_info()
+        stamp = "未找到"
+        if info.get("mtime"):
+            stamp = datetime.fromtimestamp(float(info["mtime"])).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        self._config_source.setText(
+            f"生效配置：{info['path']}（修改于 {stamp}）\n"
+            f"数据目录：{info['data_root']}，可用环境变量 "
+            f"OILCHECK_DATA_ROOT 覆盖；仓库 config/ 只在首次运行时复制为模板"
         )
 
     def _open_roi_calibration(self) -> None:
