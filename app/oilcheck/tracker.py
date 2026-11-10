@@ -18,6 +18,9 @@ from dataclasses import dataclass
 
 from .types import BBox, Detection
 
+# 涂油盘框外推位移上限（按画面对角线归一化）。
+MAX_PREDICT_FRACTION = 0.10
+
 
 @dataclass
 class Track:
@@ -33,6 +36,15 @@ class Track:
     confidence: float = 0.0
     angle: float | None = None
     point: tuple[float, float] | None = None
+    # 本帧的**原始检测框**（未经过卡尔曼平滑）。``box`` 是滤波后的状态，
+    # 快速移动时会滞后（实测 200px 跳变只走到 155px）；业务判定（进盘/离盘、
+    # 握持、锚点交叠）应该用原始检测，显示仍用平滑框。
+    raw_box: BBox | None = None
+
+    def observation_box(self) -> BBox:
+        """本帧用于判定的框：优先原始检测，没有观测时退回滤波框。"""
+
+        return self.box if self.raw_box is None else self.raw_box
 
     def predicted_box(self, ts: float) -> BBox:
         dt = max(0.0, float(ts) - self.last_ts)
@@ -168,7 +180,7 @@ class ObjectTracker:
         for det_index, det in enumerate(detections):
             if det_index in matched_dets:
                 continue
-            if len(self._tracks) >= self._max_active:
+            if not self._make_room_for_new_track():
                 break
             track = Track(
                 track_id=self._id_base + self._next_id,
@@ -178,11 +190,31 @@ class ObjectTracker:
                 confidence=det.confidence,
                 angle=det.angle,
                 point=det.point,
+                raw_box=det.box,
             )
             self._tracks[track.track_id] = track
             self._next_id += 1
 
         return TrackerOutput(active=tuple(self._tracks.values()), lost=tuple(lost))
+
+    def _make_room_for_new_track(self) -> bool:
+        """为新轨迹腾名额：满了先淘汰最久未匹配的轨迹。
+
+        漏检轨迹在 ``max_missing_s`` 内仍占名额，直接拒绝新目标会让新手框
+        整段建不了轨迹（画面里常有手臂、盘边被误检成 hand）。淘汰顺序：
+        先丢未匹配的，再丢匹配过的，同类按漏检时长从长到短。
+        """
+
+        if len(self._tracks) < self._max_active:
+            return True
+        if not self._tracks:
+            return False
+        victim = max(
+            self._tracks.values(),
+            key=lambda item: (not item.matched, item.missing_s),
+        )
+        self._tracks.pop(victim.track_id, None)
+        return True
 
     def _update_track(self, track: Track, det: Detection, ts: float) -> None:
         old_cx, old_cy = track.box.center
@@ -199,6 +231,7 @@ class ObjectTracker:
         track.confidence = det.confidence
         track.angle = det.angle
         track.point = det.point
+        track.raw_box = det.box
         track.last_ts = float(ts)
         track.last_seen_ts = float(ts)
         track.hits += 1
@@ -220,13 +253,27 @@ class TrayTrack:
     missing_s: float = 0.0
     hits: int = 0
     reliable: bool = False
+    # 画面对角线（像素），用于限制外推位移。由 TrayTracker.update 维护。
+    diag: float = 0.0
 
     def predicted_box(self, ts: float) -> BBox | None:
+        """按速度外推的盘体框。
+
+        外推位移有硬上限（``MAX_PREDICT_FRACTION`` × 画面对角线）：盘体漏检
+        一段时间后纯速度外推会把框送到画面外，``_tray_region_box`` 取并集后
+        「在盘内」恒真，取料判定随之失效。
+        """
+
         if self.box is None:
             return None
         dt = max(0.0, float(ts) - self.last_ts)
         dx = self.velocity[0] * dt
         dy = self.velocity[1] * dt
+        limit = MAX_PREDICT_FRACTION * max(1.0, self.diag)
+        span = math.hypot(dx, dy)
+        if span > limit > 0:
+            dx *= limit / span
+            dy *= limit / span
         if abs(dx) < 0.5 and abs(dy) < 0.5:
             return self.box
         return BBox(
@@ -271,6 +318,7 @@ class TrayTracker:
         if width <= 0 or height <= 0:
             return self._track
         diag = max(1.0, math.hypot(width, height))
+        self._track.diag = diag
         max_distance = self._max_distance * max(1e-3, float(distance_scale))
         predicted = self._track.predicted_box(ts)
 

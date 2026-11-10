@@ -160,11 +160,18 @@ def timestamps(start: float = 1.0, step: float = 0.2):
 
 
 def enter_tray_empty(
-    pipeline: StationPipeline, ts_iter, *, screw: Detection, cycles: int = 3
+    pipeline: StationPipeline, ts_iter, *, screw: Detection, cycles: int = 5
 ) -> float:
-    """手空手进入涂油盘并在盘内停留到满足确认时长。"""
+    """手空手进入涂油盘并在盘内停留到满足确认时长。
+
+    先在盘外喂两帧「空手」：取料判定按**盘外观测历史**（连续多帧）判断
+    进盘时手里有没有杆，现场工人在盘外确实是空手的。
+    """
 
     ts = 0.0
+    for _ in range(2):
+        ts = next(ts_iter)
+        feed(pipeline, ts, hand_at(350.0, 650.0), screw_at(*TRAY_SCREW))
     for step in range(cycles):
         ts = next(ts_iter)
         cx = ENTRY_HAND[0] - step * 20
@@ -183,9 +190,16 @@ def leave_tray_holding(
     *,
     tray_screw: Detection,
     target: tuple[float, float] = HAND_TARGET,
-    steps: int = 3,
+    steps: int = 5,
+    settle_frames: int = 4,
 ) -> float:
-    """手带着丝杆从盘内走到目标位置。"""
+    """手带着丝杆从盘内走到目标位置，并在目标位置继续持有几帧。
+
+    离盘之后取料判定还要攒 ``pick_sample_every_frames × pick_history_samples``
+    个盘外采样才定论（默认 k=2、n=3 ⇒ 至少 2 个采样点），所以走到目标后
+    必须再喂几帧：夹具在离盘当帧就结束的话，采样窗口攒不满，取料事件根本
+    发不出来（这正是现场“取料没跑完就停了”的同一种症状）。
+    """
 
     start = (ENTRY_HAND[0] - 40, ENTRY_HAND[1] - 20)
     ts = 0.0
@@ -195,13 +209,33 @@ def leave_tray_holding(
         cx = start[0] + (target[0] - start[0]) * t
         cy = start[1] + (target[1] - start[1]) * t
         feed(pipeline, ts, hand_at(cx, cy), held_screw_at(cx, cy), tray_screw)
+    for _ in range(settle_frames):
+        ts = next(ts_iter)
+        feed(
+            pipeline,
+            ts,
+            hand_at(*target),
+            held_screw_at(*target),
+            tray_screw,
+        )
     return ts
 
 
 def do_pick(pipeline: StationPipeline, ts_iter) -> float:
-    """完整一次「空手进盘 → 带料离盘」。"""
+    """完整一次「空手进盘 → 带料离盘」。
+
+    进盘前先空手在盘外走几帧：现场工人取下一件之前一定是空手的，而取料
+    判定按盘外观测历史投票决定「进盘时手里有没有杆」。
+    """
 
     tray_screw = screw_at(*TRAY_SCREW)
+    steps = 5
+    for step in range(steps):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(HAND_TARGET[0] - step * 10, HAND_TARGET[1] + step * 10),
+        )
     enter_tray_empty(pipeline, ts_iter, screw=tray_screw)
     return leave_tray_holding(pipeline, ts_iter, tray_screw=tray_screw)
 
@@ -1017,3 +1051,28 @@ def test_pick_at_any_stage_starts_new_cycle():
     assert tasks[0].final_result == TaskResult.NG
     assert tasks[1].final_result == TaskResult.PROCESSING
     assert [e for e in events if e.event_type == EventType.OILING_MISSING]
+
+
+def test_pick_not_rejected_when_only_one_outside_frame_is_sparse():
+    """低帧率下盘外只采到一帧、且该帧已与盘内丝杆交叠：仍应判取料。
+
+    现场日志出现过「手带着丝杆进盘又离开，不判取料」——那一帧手已经伸到
+    盘边，与盘内静置丝杆交叠，被误判成带料进盘，整件漏判。判据改为
+    「进盘前不久见过这只手空手」。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    # 盘外空手一帧（远离盘区）
+    feed(pipeline, next(ts_iter), hand_at(*HAND_TARGET), screw_at(*TRAY_SCREW))
+    # 进盘，此时手与盘内丝杆交叠（真实场景：手已经伸到盘边）
+    for _ in range(3):
+        feed(pipeline, next(ts_iter), hand_at(*ENTRY_HAND), screw_at(*TRAY_SCREW))
+    # 带料离盘
+    leave_tray_holding(
+        pipeline, ts_iter, tray_screw=screw_at(*TRAY_SCREW)
+    )
+
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert len(picks) == 1, "盘外见过空手，就不该判成带料进盘"

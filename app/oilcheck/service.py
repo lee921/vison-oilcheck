@@ -54,6 +54,11 @@ class _StationRuntime:
     busy: bool = False
     last_frame_ts: float = 0.0
     dropped_frames: int = 0
+    # 示例回放当前帧序号；用于识别「循环回绕」，回绕时重置判定状态。
+    last_video_frame_index: int = -1
+    # 待执行的判定状态重置；由执行器线程在处理下一帧前执行，
+    # 避免与正在跑 ``pipeline.process`` 的执行器线程并发调用。
+    pending_pipeline_reset: bool = False
     # 最近 1 秒内完成处理的帧时间戳，用于计算实际检测帧率。
     processed_ts: deque[float] = field(default_factory=deque)
     last_snapshot: StationSnapshot | None = None
@@ -356,6 +361,8 @@ class OilCheckService:
 
         runtime.video_source = None
         runtime.last_frame_ts = 0.0
+        runtime.last_video_frame_index = -1
+        runtime.pending_pipeline_reset = False
         if old_source is not None:
             try:
                 old_source.stop()
@@ -539,6 +546,8 @@ class OilCheckService:
         if frame.ts <= runtime.last_frame_ts:
             return
         runtime.last_frame_ts = frame.ts
+        if video is not None:
+            self._reset_on_video_rewind(runtime, video)
 
         with self._lock:
             recorder = self._recorders.get(camera_id)
@@ -561,9 +570,37 @@ class OilCheckService:
         except RuntimeError:
             runtime.busy = False
 
+    def _reset_on_video_rewind(
+        self, runtime: _StationRuntime, video: VideoFileSource
+    ) -> None:
+        """示例回放循环回绕/跳转时重置判定状态。
+
+        画面回到开头而管线还带着上一轮的最后几秒状态时，同一个取料动作会被
+        算成两次（下一轮的同一时刻直接判出 PICK），事件数比真实件数多。
+        回绕不是连续过程，与「切换视频」一样按新会话处理。
+        """
+
+        index = video.frame_index
+        previous = runtime.last_video_frame_index
+        runtime.last_video_frame_index = index
+        if previous < 0 or index >= previous:
+            return
+        # 只置标记：``pipeline`` 归执行器线程独占，重置必须排到那一侧执行。
+        runtime.pending_pipeline_reset = True
+        self._logger.info(
+            "示例回放回绕（帧 %s → %s），将重置判定状态 (工位=%s)",
+            previous,
+            index,
+            runtime.station.station_id,
+        )
+
     def _process_frame(self, runtime: _StationRuntime, bgr: Any, ts: float) -> None:
         started = time.perf_counter()
         try:
+            if runtime.pending_pipeline_reset:
+                runtime.pending_pipeline_reset = False
+                runtime.pipeline.reset()
+                runtime.last_snapshot = None
             detections: FrameDetections = runtime.detector.detect(bgr, ts)
             snapshot = runtime.pipeline.process(detections=detections)
             elapsed = (time.perf_counter() - started) * 1000.0

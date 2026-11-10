@@ -19,8 +19,8 @@ def test_repo_oilcheck_template_is_valid():
     data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
-    assert cfg.version == "2.4"
-    assert data["version"] == "2.4"
+    assert cfg.version == "2.5"
+    assert data["version"] == "2.5"
     assert cfg.stations
     station = cfg.stations[0]
     assert station.station_id == "ST01"
@@ -34,6 +34,12 @@ def test_repo_oilcheck_template_is_valid():
     assert station.detector.tray_label
     assert cfg.pipeline.max_fps >= 1
     assert cfg.pipeline.brush_hold_s > 0
+    # 2.5 跟踪稳定性参数：锚点绝对步长上限、关联代价阈值语义。
+    # 上限不得低于基准步长，否则取料瞬间锚点跨不过去会永久卡住。
+    assert cfg.pipeline.screw_anchor_max_step_abs >= cfg.pipeline.screw_anchor_max_step
+    assert cfg.pipeline.bytetrack_match_thresh >= 1.0
+    # 检测置信度必须低于 ByteTrack 高置信度阈值，否则第二阶段收不到输入。
+    assert station.detector.confidence <= cfg.pipeline.bytetrack_high_thresh
     assert cfg.recording.segment_seconds >= 10
     # 模板里不应再残留槽位/遮挡区或已废弃的判定参数。
     raw_station = data["stations"][0]
@@ -191,7 +197,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.4"
+    assert cfg.version == "2.5"
     assert station.detector.kind == "yolo"
     assert station.detector.model_path.endswith("best.pt")
     assert station.detector.brush_label == "brush"
@@ -260,7 +266,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.4"
+    assert cfg.version == "2.5"
     # 用户调过的 ROI 与判定参数保留
     assert station.tray_roi.points == ((0.5, 0.1), (0.72, 0.44))
     assert station.work_roi.points == ((0.35, 0.0), (0.99, 0.95))
@@ -299,7 +305,7 @@ def test_migration_is_idempotent(tmp_path):
     config_dir = tmp_path / "config"
     config_dir.mkdir(parents=True)
     (config_dir / "oilcheck.json").write_text(
-        json.dumps({"version": "2.4", "stations": []}), encoding="utf-8"
+        json.dumps({"version": "2.5", "stations": []}), encoding="utf-8"
     )
     from app.oilcheck.config import OilCheckConfigService
 
@@ -413,7 +419,7 @@ def test_repo_template_is_commented():
     text = path.read_text(encoding="utf-8")
     assert "//" in text, "模板应带注释"
     # 注释不破坏可解析性
-    assert json.loads(strip_json_comments(text))["version"] == "2.4"
+    assert json.loads(strip_json_comments(text))["version"] == "2.5"
 
 
 def test_save_preserves_comments(tmp_path):

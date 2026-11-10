@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Any
 
 from .association import brush_work_point
@@ -52,23 +54,137 @@ EventCallback = Any  # Callable[[EventRecord], None]，避免循环导入
 _HAND_ID_BASE = 100_000
 _BRUSH_ID_BASE = 200_000
 
+# 帧间隔鲁棒估计的样本数。单帧长间隔（视频跳帧、推理卡顿）不应该改变
+# 距离门限，所以用中位数而不是「上一帧的间隔」。
+_FRAME_GAP_WINDOW = 15
+
+# 区外延续跟踪的硬上限（归一化），不随 frame_scale 放大。
+_ROI_TRACK_LIMIT_ABS = 0.10
+
+# 盘体漏检超过该时长，涂油盘区退回手工标定区（不再用外推框）。
+_TRAY_PREDICT_TRUST_S = 0.30
+
+# 「纯位置连续性」跟进手持丝杆的单帧位移上限（不随帧率放大）。
+#
+# 与「杆与本周期那只手交叠」的证据强度不同：握持是强证据，取料瞬间手带杆
+# 快速划出，单帧位移可达 0.11；纯位置连续性只是「上一帧在这、这一帧还在
+# 附近」，允许的跨度必须小得多，否则锚点会一步跳到旁边另一根杆上（实测
+# 在 0.15 的跨度下会被另一只手的杆抢走）。
+_CONTINUITY_STEP_ABS = 0.08
+
 
 @dataclass
 class _HandVisit:
-    """一只手的「进盘 — 离盘」过程。"""
+    """一只手的「进盘 — 离盘」过程。
+
+    「在不在盘内」「手里有没有杆」都不看单帧：每隔
+    ``pick_sample_every_frames`` 帧采一个样，保留最近
+    ``pick_history_samples`` 个采样点，按多数投票决定。
+
+    两路采样的口径不同：
+
+    - **在不在盘内**：每帧都参与采样，确认进盘与离盘；
+    - **手里有没有杆**：只用**盘外**的采样。手伸在盘上方时必然蹭到盘里的
+      静置杆，盘内的握持读数与实际有没有握着无关（实测盘内读数交替闪烁，
+      而盘外携带阶段检出率 96~99%）。盘内噪声帧一旦混进窗口，多数票就
+      永远投不出正确结论。
+    """
 
     hand_track_id: int
     entered_tray_ts: float
-    # 进盘**那一刻上一帧**手里是否已经拿着丝杆。取料只认“空手进、带料出”。
+    # 进盘时手里是否已经拿着丝杆。取料只认“空手进、带料出”。
     #
-    # 不能在进盘当帧判：手一伸进盘，手框就与盘内静置的丝杆交叠，
-    # 当帧判定永远是“持有”，取料会被全部吞掉（现场视频 140911 即如此）。
-    # 进盘前手在盘外，能自由拿着的只可能是从盘外带来的丝杆。
+    # 不能在进盘当帧判：手一伸进盘，手框就与盘内静置的丝杆交叠，当帧判定
+    # 永远是“持有”，取料会被全部吞掉（现场视频 140911 即如此）。因此按
+    # **盘外观测历史**投票判定。
     holding_on_entry: bool
+    # 已确认「在盘内」。
     inside_tray: bool = True
     last_seen_ts: float = 0.0
-    # 进盘前一帧（手在盘外）的持有状态；初始沿用进盘帧之前观察到的手部状态。
-    holding_before_entry: bool = False
+    frames_since_sample: int = 0
+    inside_samples: deque[bool] = field(default_factory=deque)
+    # **盘外**握持采样（进盘前后与离盘后的「手里有没有杆」）。
+    holding_samples: deque[bool] = field(default_factory=deque)
+    # 离盘后任意一帧见过「手握杆」。采样点按 k 帧一个，离盘后手很快就
+    # 出画面时窗口里一个点都没有；这个标记把那些没落在采样点上的正面
+    # 证据留下来，免得点数不足被默认按空手处理。
+    holding_seen: bool = False
+    # 最近一帧在盘外时手里有没有杆；最近一帧在盘内时为 None。
+    # 手在原地消失、离盘还没按采样窗口确认时，这是唯一的依据。
+    last_outside_holding: bool | None = None
+    # 最近一帧的手框。手消失时跟踪器会先把轨迹删掉（``_hand_tracker.get``
+    # 返回 None），那时只能靠这份快照做出占位证据。
+    last_hand_box: BBox | None = None
+    # 离盘的时刻；此后继续攒盘外握持采样，攒够 n 个再定论。
+    exited_at_ts: float | None = None
+    # 是否已确认「进过盘」。一旦置真，这一段进盘过程就成立，直到离盘判定。
+    entered_confirmed: bool = False
+
+    def tick(self, *, every_frames: int) -> bool:
+        """推进一步并返回本帧是否到采样点（每 k 帧一个）。"""
+
+        self.frames_since_sample += 1
+        if self.frames_since_sample < max(1, every_frames):
+            return False
+        self.frames_since_sample = 0
+        return True
+
+    def push_inside(self, inside: bool, keep: int) -> None:
+        _push(self.inside_samples, bool(inside), keep)
+
+    def push_holding(self, holding: bool, keep: int) -> None:
+        """记录盘外握持采样；离盘后重新开始累积（离盘前的属于取料前）。"""
+
+        _push(self.holding_samples, bool(holding), keep)
+
+    def restart_holding(self) -> None:
+        """离盘后重置握持窗口：从此刻起重新累积。"""
+
+        self.holding_samples.clear()
+        self.frames_since_sample = 0
+
+    @property
+    def inside_majority(self) -> bool:
+        return _majority(self.inside_samples)
+
+    @property
+    def left_majority(self) -> bool:
+        return bool(self.inside_samples) and not _majority(self.inside_samples)
+
+    def holding_verdict(self, keep: int) -> bool:
+        """盘外握持窗口的结论。
+
+        窗口攒满 ``keep`` 个采样点后按多数投票：单帧闪断（手把杆完全遮住）
+        不会把一次取料判丢。
+
+        窗口没攒满就得定论（手离开画面、视频结束、等到超时）时，只要见过
+        一帧「手框里/与手框交叠的杆」就认作握持：盘外手持杆的检出率实测
+        96~99%，见过一次基本就是真的拿着；反过来，单帧「没杆」多半只是
+        杆被手遮住，不足以否定。一帧都没见过时没有正面证据，按空手处理。
+
+        「点数不足 ⇒ 按空手处理」是之前的行为，代价是整件任务停在这里：
+        没有取料就没有周期，后面的涂油判定也就无从谈起。
+        """
+
+        if len(self.holding_samples) >= max(1, keep):
+            return _majority(self.holding_samples)
+        return any(self.holding_samples) or self.holding_seen
+
+
+def _push(samples: deque[bool], value: bool, keep: int) -> None:
+    """往采样窗口尾append，超过 keep 个就丢最旧的。"""
+
+    while len(samples) >= max(1, keep):
+        samples.popleft()
+    samples.append(value)
+
+
+def _majority(samples: deque[bool] | list[bool]) -> bool:
+    """过半即真；没有样本时按假处理。"""
+
+    if not samples:
+        return False
+    return sum(1 for value in samples if value) * 2 > len(samples)
 
 
 @dataclass
@@ -96,6 +212,12 @@ class _Cycle:
     # 丝杆锚点：取料时锁定那根杆，之后按最近邻连续性跟它，不再依赖手 ID。
     screw_anchor: tuple[float, float] | None = None
     screw_anchor_ts: float | None = None
+    # 最近一次「锚点来自手里确实握着的杆」的时刻，以及那一刻的位置。
+    # 纯位置连续性只在离这个位置 ``hand_screw_max_distance`` 以内有效：
+    # 不设这道约束时，锚点会在密集的静置丝杆之间逐帧漂移（实测漂进零件盒
+    # 里的整排静置杆，手里那根反而累计不上）。
+    screw_gripped_ts: float | None = None
+    screw_gripped_at: tuple[float, float] | None = None
     # 最近一次「刷子靠近」的时刻，用于跨过一两帧漏检把空档补回来。
     last_brush_ts: float | None = None
     timeline: list[tuple[str, float]] = field(default_factory=list)
@@ -171,8 +293,11 @@ class StationPipeline:
 
         # 每只手的进盘过程；一只手下同一时间只会有一段。
         self._visits: dict[int, _HandVisit] = {}
-        # 手在盘外时手里是否拿着丝杆（进盘判定的参照）。
-        self._outside_holding: dict[int, bool] = {}
+        # 手在盘外时的持握**历史**，进盘判定用：值为 (是否空手, 时刻) 的
+        # 队列，只保留时间窗口内（``_entry_grace_s``）的观测。进盘时看空手
+        # 帧占比，而不是「最近一帧」——单帧既可能是手刚伸到盘边与静置杆
+        # 交叠，也可能是手正把杆递进来，都不能定性。
+        self._outside_holding: dict[int, deque[tuple[bool, float]]] = {}
         self._cycles: dict[str, _Cycle] = {}
         self._task_seq = 0
 
@@ -187,7 +312,12 @@ class StationPipeline:
         self._last_frame_gap_s = 0.0
         # 帧率自适应：实测帧间隔 / 配置基准帧间隔。低帧率下按这个倍率放大
         # 距离门限与容差窗口，否则同一动作跨的位移一大就断开。
+        # 用最近若干帧间隔的中位数估计，避免单帧跳变把门限瞬间撑大。
+        self._gap_samples: deque[float] = deque(maxlen=_FRAME_GAP_WINDOW)
         self._frame_scale = 1.0
+        # 本帧的时间是否可信。长间隔/时间倒退时不可信：不桥接空档、
+        # 不把掉帧的时间算进停留/涂油时长。
+        self._timing_reliable = True
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -226,7 +356,9 @@ class StationPipeline:
         self._brush_tracks = ()
         self._frame_gap_events = 0
         self._last_frame_gap_s = 0.0
+        self._gap_samples.clear()
         self._frame_scale = 1.0
+        self._timing_reliable = True
 
     def process(self, *, detections: FrameDetections) -> StationSnapshot:
         ts = float(detections.ts)
@@ -236,24 +368,42 @@ class StationPipeline:
         if self.station.detector.raw_mode:
             return self._process_raw(detections)
 
+        if self._last_frame_ts is not None and ts <= self._last_frame_ts:
+            # 同一时间戳重复帧 / 时间倒退：不推进任何状态。重复处理会把
+            # 停留时长、轨迹命中次数都算重，而画面其实是同一帧。
+            if ts < self._last_frame_ts:
+                self._frame_gap_events += 1
+                self._logger.warning(
+                    "视频时间戳倒退：%.3fs（工位=%s），本帧跳过",
+                    ts - self._last_frame_ts,
+                    self.station.station_id,
+                )
+            return self.snapshot()
+
         dt = 0.0
+        base_dt = 1.0 / max(1, self.cfg.max_fps)
         if self._last_frame_ts is not None:
             raw_gap = ts - self._last_frame_ts
             self._last_frame_gap_s = raw_gap
-            # 视频时间戳跳变/长间隔会破坏时序证据，单独记录，不静默吞掉。
-            if raw_gap < 0 or raw_gap > 1.0:
+            # 先看上一帧的节拍，再判断本帧间隔是否可信：真正的低帧率流
+            # （每帧都慢）与偶发掉帧（夹一两个长间隔）必须分开处理，否则
+            # 2fps 现场会被永久判成「时间不可靠」，判定彻底停摆。
+            plausible = self._max_plausible_dt(raw_gap)
+            self._timing_reliable = raw_gap <= plausible
+            if not self._timing_reliable:
                 self._frame_gap_events += 1
                 self._logger.warning(
-                    "视频时间戳异常：%.3fs（工位=%s），暂停依赖连续时间的判断",
+                    "视频时间戳异常：%.3fs（工位=%s），本帧不按连续时间计时",
                     raw_gap,
                     self.station.station_id,
                 )
-            dt = max(0.0, min(1.0, raw_gap))
-            # 实际帧间隔 / 配置基准帧间隔。dt 已经被夹到 [0,1]，
-            # 倍率再夹一次上限，避免门限放大到失去区分度。
-            base_dt = 1.0 / max(1, self.cfg.max_fps)
+            dt = max(0.0, min(plausible, raw_gap))
+            self._gap_samples.append(raw_gap)
+            # 节拍用最近帧间隔的中位数：偶发的长间隔不改变它，持续的低帧率
+            # 会在几帧内把估计拉到真实值。
+            typical = median(self._gap_samples)
             self._frame_scale = max(
-                1.0, min(self.cfg.frame_scale_max, dt / base_dt)
+                1.0, min(self.cfg.frame_scale_max, typical / base_dt)
             )
         self._last_frame_ts = ts
         self._frame_size = (int(width), int(height))
@@ -359,6 +509,7 @@ class StationPipeline:
                 "tray_reliable": self._tray_region_reliable(),
                 "frame_gap_events": self._frame_gap_events,
                 "last_frame_gap_s": round(self._last_frame_gap_s, 3),
+                "timing_reliable": self._timing_reliable,
                 "raw_mode": self.station.detector.raw_mode,
                 "label_counts": _label_counts(self._last_detections),
                 "hand_visits": len(self._visits),
@@ -466,7 +617,11 @@ class StationPipeline:
             return in_roi
 
         # 延续门限：与跟踪器同一套距离门限，再乘 roi_track_margin 留一点余量。
-        limit = self.cfg.roi_track_margin * self._frame_scale
+        # 加绝对上限：帧率倍率放开后这个门限会大到整幅画面，区外检测全被
+        # 喂进跟踪器，轨迹碎片随之变多。
+        limit = min(
+            self.cfg.roi_track_margin * self._frame_scale, _ROI_TRACK_LIMIT_ABS
+        )
         in_roi_ids = {id(det) for det in in_roi}
         extra: list[Detection] = []
         for det in self._last_detections:
@@ -480,7 +635,7 @@ class StationPipeline:
             for track in tracks:
                 px, py = track.predicted_box(ts).center
                 if math.hypot(cx - px, cy - py) / diag <= limit:
-                    extra.append(det)
+                    extra.append(_demote_for_continuation(det, self.cfg))
                     break
         if not extra:
             return in_roi
@@ -506,6 +661,8 @@ class StationPipeline:
         if width <= 0 or height <= 0:
             return None
         fixed = self.station.tray_roi.pixel_bbox(width, height)
+        if not self._tray_prediction_trustworthy(ts):
+            return fixed
         predicted = self._tray.predicted_box(ts)
         if predicted is None:
             return fixed
@@ -516,8 +673,48 @@ class StationPipeline:
             max(fixed.y2, predicted.y2),
         )
 
+    def _tray_prediction_trustworthy(self, ts: float) -> bool:
+        """盘体预测框还能不能参与盘区判定。
+
+        漏检时间一长，纯速度外推会把框送到画面外；取并集后整个画面都成了
+        「盘内」，取料/离盘判定随即失效（实测 0.9s 漏检即出画面）。外部
+        条件：本帧有观测，或漏检在 ``_TRAY_PREDICT_TRUST_S`` 内且预测框没
+        明显越界/膨胀。
+        """
+
+        if self._tray.box is None:
+            return False
+        if self._tray.matched:
+            return True
+        if self._tray.missing_s > _TRAY_PREDICT_TRUST_S:
+            return False
+        predicted = self._tray.predicted_box(ts)
+        if predicted is None:
+            return False
+        width, height = self._frame_size
+        if width <= 0 or height <= 0:
+            return False
+        if (
+            predicted.x1 < -width
+            or predicted.y1 < -height
+            or predicted.x2 > 2 * width
+            or predicted.y2 > 2 * height
+        ):
+            return False
+        area = predicted.width * predicted.height
+        base = self._tray.box.width * self._tray.box.height
+        return not (base > 0 and area > 2.0 * base)
+
     def _tray_region_reliable(self) -> bool:
-        return True
+        """盘体定位是否可用（供 UI 状态条）。
+
+        只报告真实情况：漏检超过可信窗口即 ``False``，不再恒为 ``True``。
+        """
+
+        return self._tray.box is not None and (
+            self._tray.matched
+            or self._tray.missing_s <= _TRAY_PREDICT_TRUST_S
+        )
 
     # ------------------------------------------------------------------
     # 取料判定
@@ -525,91 +722,321 @@ class StationPipeline:
     def _update_pick(self, *, ts: float, tray_box: BBox | None) -> None:
         """空手进盘 → 带料离盘 ⇒ 取料完成。
 
-        逐只手跟踪「进盘—离盘」过程：
+        所有子判定都用最近 n 个采样点投票（``pick_sample_every_frames`` /
+        ``pick_history_samples``），不拿单帧当结论：
 
-        - 进盘那一帧记录手里是否已有丝杆（``holding_on_entry``）；
-        - 离盘那一帧，如果进盘时是空手、离开时手里有丝杆，就判取料完成。
+        - **是否在盘内**：窗口内出现过盘内采样即可确认「进过盘」（事件性，
+          用 any——短时取料不会被后来的盘外采样淹没）；窗口多数在盘外才
+          确认离盘（用多数——避免盘边抖动劈段）；
+        - **离盘后手里有没有杆**：只采**盘外**的读数。攒满 n 个采样点就
+          按多数投票；点数不足就得定论（手出画面、视频结束、等到超时）
+          时，见过一帧手握杆就算握持。离盘那一帧的杆检测往往还没稳（杆心
+          刚离开盘区、置信度 0.5 上下），盘内读数又被静置杆污染，两者都
+          不能混进窗口；
+        - **进盘时手里有没有杆**：同样按盘外观测历史投票。
 
-        带料进盘又带料离开（例如工人把丝杆放回去再拿走）不算取料；空手进、
-        空手出也不算。
+        带料进盘又带料离开（例如工人把丝杆放回去再拿走）不算取料，空手进、
+        空手出也不算。点数不足时**不能**一律按空手处理：那样一次真实取料
+        会连周期都建不出来，后面的涂油判定无从谈起（现场「取料没跑完就
+        停了」）。只有一帧正面证据都没有时才按空手处理。
         """
 
+        every = max(1, int(self.cfg.pick_sample_every_frames))
+        keep = max(1, int(self.cfg.pick_history_samples))
+        # 离盘后攒够 n 个采样的时限 + 一点余量；超时仍不足则按空手处理。
+        settle_s = (
+            (every * keep + 1)
+            * (1.0 / max(1, self.cfg.max_fps))
+            * self._frame_scale
+        )
         live_hands: set[int] = set()
         for hand in self._hand_tracks:
-            if not hand.matched:
+            if not hand.matched or hand.hits < max(
+                1, self._hand_tracker.min_hits
+            ):
+                # 单帧误检不参与进盘判定（min_hits 之前对手部无效）。
                 continue
             live_hands.add(hand.track_id)
-            cx, cy = hand.box.center
-            inside = (
+            # 判定用本帧原始检测框：滤波框在快速移动时滞后（200px 跳变只
+            # 走到 155px），边界判定会晚一帧。
+            hand_box = hand.observation_box()
+            cx, cy = hand_box.center
+            inside_raw = (
                 tray_box.x1 <= cx <= tray_box.x2
                 and tray_box.y1 <= cy <= tray_box.y2
             )
-            holding = self._holding_screw(hand.box)
+            holding = self._holding_screw(hand_box)
+            holding_now = holding is not None
             visit = self._visits.get(hand.track_id)
 
             if visit is None:
-                if inside:
-                    # 手第一次出现就在盘内：没有进盘前的观察，只能按当帧状态取
-                    # 保守值——手里有丝杆就不判取料，避免“把丝杆放回去又拿走”
-                    # 被算成取料；真正从盘外走进来的手会走下面的分支。
-                    self._visits[hand.track_id] = _HandVisit(
-                        hand_track_id=hand.track_id,
-                        entered_tray_ts=ts,
-                        holding_on_entry=holding is not None,
-                        inside_tray=True,
-                        last_seen_ts=ts,
-                    )
-                else:
-                    self._outside_holding[hand.track_id] = holding is not None
-                continue
+                if not inside_raw:
+                    self._record_outside_holding(hand.track_id, holding, ts)
+                empty_outside = self._mostly_empty_outside(
+                    hand.track_id, ts, default_empty=True
+                )
+                visit = _HandVisit(
+                    hand_track_id=hand.track_id,
+                    entered_tray_ts=ts,
+                    holding_on_entry=holding_now and not empty_outside,
+                    inside_tray=inside_raw,
+                    last_seen_ts=ts,
+                    frames_since_sample=every,
+                )
+                self._visits[hand.track_id] = visit
 
             visit.last_seen_ts = ts
-            was_inside = visit.inside_tray
-            visit.inside_tray = inside
-            if not inside:
-                self._outside_holding[hand.track_id] = holding is not None
+            visit.last_hand_box = hand_box
+            visit.last_outside_holding = None if inside_raw else holding_now
+            due = visit.tick(every_frames=every)
+            if due:
+                visit.push_inside(inside_raw, keep)
+                # 盘内读数不可用（会蹭到静置杆），只在盘外采握持。
+                if not inside_raw and visit.exited_at_ts is None:
+                    self._record_outside_holding(hand.track_id, holding, ts)
 
-            if not was_inside and inside:
-                # 从盘外走进盘内：用进盘前一帧（盘外）的持有状态。
-                visit.holding_on_entry = self._outside_holding.get(
-                    hand.track_id, False
+            # ---- 离盘后：攒盘外握持采样，攒够再定论 ----
+            if visit.exited_at_ts is not None:
+                if inside_raw:
+                    # 又回到盘内：视为同一段取料的中途抖动，取消离盘待定。
+                    visit.exited_at_ts = None
+                    visit.restart_holding()
+                    visit.holding_seen = False
+                    continue
+                # 正面证据不挑采样点：采样按 k 帧一个，手离盘后很快就
+                # 出画面时窗口可能一个点都攒不到。
+                if holding_now:
+                    visit.holding_seen = True
+                if due:
+                    visit.push_holding(holding_now, keep)
+                # 攒满窗口才定论（和之前一致）。提前定论会改变后面几段的
+                # 「进盘时手上有没有杆」：实测 105708 在 7.5fps 下从 4 取
+                # 掉到 3 取。点数不足的情形由 holding_verdict 和「手消失」
+                # 分支兜底，不需要抢跑。
+                ready = len(visit.holding_samples) >= keep
+                timed_out = ts - visit.exited_at_ts > settle_s
+                if not (ready or timed_out):
+                    continue
+                self._settle_pick(
+                    visit=visit,
+                    hand_track_id=hand.track_id,
+                    hand_box=hand_box,
+                    ts=ts,
+                    holding=holding,
+                    keep=keep,
                 )
-                continue
-            if not was_inside or inside:
-                # 仍在盘内，或本来就不在盘内：只更新状态。
+                self._visits.pop(hand.track_id, None)
                 continue
 
-            # 刚离开涂油盘。
-            self._visits.pop(hand.track_id, None)
-            if visit.holding_on_entry:
-                self._logger.debug(
-                    "手 %s 带着丝杆进盘又离开，不判取料", hand.track_id
-                )
+            # ---- 尚未离盘：判断进盘 / 仍在盘内 ----
+            if not visit.entered_confirmed:
+                if any(visit.inside_samples):
+                    visit.entered_confirmed = True
+                    # 进盘定性：看进盘前的盘外历史。
+                    visit.holding_on_entry = not self._mostly_empty_outside(
+                        hand.track_id, ts, default_empty=True
+                    )
+                    visit.inside_tray = True
+                    visit.restart_holding()
+                elif not inside_raw:
+                    self._record_outside_holding(hand.track_id, holding, ts)
                 continue
-            if holding is None:
-                self._logger.debug("手 %s 空手离开涂油盘，不判取料", hand.track_id)
-                continue
-            dwell = ts - visit.entered_tray_ts
-            if dwell < self.cfg.pick_confirm_s:
-                # 进盘到离盘太快，多半是手从盘边划过。
-                self._logger.debug(
-                    "手 %s 在盘内停留过短（%.2fs），不判取料",
-                    hand.track_id,
-                    dwell,
-                )
-                continue
-            self._confirm_pick(ts=ts, hand=hand, screw=holding, dwell_s=dwell)
 
-        # 手消失：结束它的进盘过程。
+            if not visit.left_majority:
+                visit.inside_tray = True
+                continue
+
+            # 确认离盘：从这里开始攒盘外握持采样。
+            visit.inside_tray = False
+            visit.exited_at_ts = ts
+            visit.restart_holding()
+            if not inside_raw:
+                # 手此刻确实在盘外：这个读数就是离盘后的第一个证据。
+                visit.last_outside_holding = holding_now
+                if holding_now:
+                    visit.holding_seen = True
+            if due:
+                visit.push_holding(holding_now, keep)
+
+        # 手消失：先用已经攒到的采样定论，再结束进盘过程。
+        trackers = {track.track_id: track for track in self._hand_tracks}
         for hand_id in list(self._visits):
             if hand_id in live_hands:
                 continue
             visit = self._visits[hand_id]
-            if ts - visit.last_seen_ts >= self.cfg.holding_lost_timeout_s:
-                self._visits.pop(hand_id, None)
+            if ts - visit.last_seen_ts < self.cfg.holding_lost_timeout_s:
+                continue
+            if visit.exited_at_ts is None and self._vanished_outside(visit):
+                # 手在盘外直接消失，离盘还没来得及按采样窗口确认（窗口
+                # 按 k 帧一个点，走得太快就采不到）。最后观测确实在盘外，
+                # 就按那一刻离盘结算，别把这段整段丢掉。
+                visit.exited_at_ts = visit.last_seen_ts
+                if visit.last_outside_holding:
+                    visit.push_holding(True, keep)
+                    visit.holding_seen = True
+            if visit.exited_at_ts is not None:
+                # 手已经确认离盘：用已攒到的采样定论，哪怕不足 n 个。
+                # 之前要求「窗口里至少有一个采样」才结算，低帧率/很快就
+                # 出画面时窗口是空的，这段进盘过程被直接丢掉，取料事件
+                # 永远发不出来。
+                #
+                # 手框优先用当前轨迹，轨迹已被跟踪器删除（手出画面超过
+                # 保留期）时用快照：手一消失就删轨迹的话，这里会拿到
+                # None 而静默跳过，取料同样发不出来。
+                hand = trackers.get(hand_id)
+                hand_box = (
+                    hand.observation_box()
+                    if hand is not None
+                    else visit.last_hand_box
+                )
+                if hand_box is not None:
+                    self._settle_pick(
+                        visit=visit,
+                        hand_track_id=hand_id,
+                        hand_box=hand_box,
+                        ts=visit.exited_at_ts,
+                        holding=None,
+                        keep=keep,
+                    )
+            self._visits.pop(hand_id, None)
         for hand_id in list(self._outside_holding):
             if hand_id not in live_hands and hand_id not in self._visits:
                 self._outside_holding.pop(hand_id, None)
+
+    @staticmethod
+    def _vanished_outside(visit: _HandVisit) -> bool:
+        """手消失时最后观测在盘外，且已经确认进过盘。"""
+
+        return visit.entered_confirmed and visit.last_outside_holding is not None
+
+    def _settle_pick(
+        self,
+        *,
+        visit: _HandVisit,
+        hand_track_id: int,
+        hand_box: BBox,
+        ts: float,
+        holding: Detection | None,
+        keep: int,
+    ) -> None:
+        """攒够采样（或不得不定论）时给这一件下定论。"""
+
+        dwell = ts - visit.entered_tray_ts
+        if visit.holding_on_entry:
+            self._logger.debug(
+                "手 %s 带着丝杆进盘又离开，不判取料", hand_track_id
+            )
+            return
+        if dwell < self.cfg.pick_confirm_s:
+            # 进盘到离盘太快，多半是手从盘边划过。
+            self._logger.debug(
+                "手 %s 在盘内停留过短（%.2fs），不判取料",
+                hand_track_id,
+                dwell,
+            )
+            return
+        if not visit.holding_verdict(keep):
+            self._logger.debug(
+                "手 %s 离盘后 %d 个采样点里没有见到手里的杆，不判取料",
+                hand_track_id,
+                len(visit.holding_samples),
+            )
+            return
+        screw = holding
+        if screw is None:
+            # 定论这一帧恰好没检出杆：用占位证据，置信度记 0 便于追溯。
+            screw = _holding_placeholder(hand_box)
+        self._confirm_pick(
+            ts=ts,
+            hand_track_id=hand_track_id,
+            screw=screw,
+            dwell_s=dwell,
+        )
+
+    def _record_outside_holding(
+        self, hand_id: int, holding: Detection | None, ts: float
+    ) -> None:
+        """记录一次「手在盘外、手里有没有杆」的观测。"""
+
+        window = max(0.0, self._entry_grace_s())
+        history = self._outside_holding.setdefault(hand_id, deque())
+        history.append((holding is None, ts))
+        while history and ts - history[0][1] > window:
+            history.popleft()
+
+    def _mostly_empty_outside(
+        self, hand_id: int, ts: float, *, default_empty: bool = False
+    ) -> bool:
+        """进盘前**最近几次**盘外观测里，「空手」是否占多数。
+
+        只看最近 ``pick_confirm_frames + 1`` 次观测，不用时间窗：时间窗在
+        低帧率下会被放大到几秒，把上一件涂油时「手持杆」的观测也卷进来，
+        于是每次进盘都被当成「带料进盘」。
+
+        观测不足 2 次时直接采用那一次的结果——低帧率下盘外可能只采到一帧，
+        此时没有更好的依据，退回单帧判断总好过一律拒绝取料。
+        """
+
+        history = self._outside_holding.get(hand_id)
+        window = max(0.0, self._entry_grace_s())
+        recent = (
+            [(empty, t) for empty, t in history if ts - t <= window]
+            if history
+            else []
+        )
+        if not recent:
+            # 这只手从未在盘外被观测到（例如第一次建轨迹就在盘内，或者
+            # 太久没见已滚出时间窗）：没有依据，按调用方的保守值处理。
+            # 之前这里直接返回 False（=“不是空手”），会让“空手进盘”一律
+            # 被当成“带料进盘”，取料整件丢掉。
+            return default_empty
+        limit = max(2, int(self.cfg.pick_history_samples))
+        recent = recent[-limit:]
+        if len(recent) < 2:
+            # 观测不足（低帧率下盘外只采到一帧）：按调用方给的保守值处理。
+            # 进盘判定宁可放过（``default_empty=True``），因为漏判一件的
+            # 代价高于多判一次——多出来的那次取料会因涂油未完成而进复核。
+            return default_empty
+        empty_count = sum(1 for empty, _ in recent if empty)
+        # 平局按「空手」处理：进盘判定宁可放过一件（后续涂油判定会拦），
+        # 也不要因为一两帧的杆交叠把整件取料吞掉。
+        return empty_count * 2 >= len(recent)
+
+    def _max_plausible_dt(self, current_gap: float | None = None) -> float:
+        """单帧可信的最大间隔：按**已建立的节拍**的两倍计。
+
+        掉帧时 ``dt`` 越大，累计时长越容易被凭空放大：一帧 0.95s 的间隔
+        能让刷头只看过 3 帧就判完成（实测）。上限取「最近帧间隔中位数」的
+        两倍，而不是配置里的 ``max_fps``——现场可能本来就只有 2~5fps，
+        用配置值会把正常帧全判成不可信。还没建立节拍时，用本帧间隔自身
+        作为节拍（第一帧无法区分「低帧率」和「掉帧」，按前者处理）。
+        """
+
+        base_dt = 1.0 / max(1, self.cfg.max_fps)
+        if self._gap_samples:
+            typical = median(self._gap_samples)
+        elif current_gap is not None and current_gap > 0:
+            typical = float(current_gap)
+        else:
+            typical = base_dt
+        return 2.0 * max(typical, base_dt)
+
+    def _entry_grace_s(self) -> float:
+        """进盘前多久之内的「盘外空手」观测仍算数。
+
+        窗口取 ``holding_lost_timeout_s``，但设 2s 的绝对上限：低帧率下
+        乘上帧率倍率会长到 8s，那时「八秒前见过这只手空手」已经不足以
+        说明本次是空手进盘。
+
+        也不能取得太窄：工人从盘外走到盘内要 1~2s，窗口只有两三帧时，
+        进盘那一刻永远查不到「最近空手」，真空手取料会被判成带料进盘
+        而整件漏掉（示例视频第一件的取料即如此）。
+        """
+
+        return min(
+            self.cfg.holding_lost_timeout_s * self._frame_scale,
+            2.0,
+        )
 
     def _holding_screw(self, hand_box: BBox) -> Detection | None:
         """手里拿着的那根丝杆：与手框**真实交叠或落在手框内**的丝杆检测。
@@ -648,15 +1075,15 @@ class StationPipeline:
         self,
         *,
         ts: float,
-        hand: Track,
+        hand_track_id: int,
         screw: Detection,
         dwell_s: float,
     ) -> None:
-        task = self._ensure_cycle(ts, hand_track_id=hand.track_id)
+        task = self._ensure_cycle(ts, hand_track_id=hand_track_id)
         task.stage = TaskStage.PICKED
         task.stage_since = ts
         task.picked_at = ts
-        task.hand_track_id = hand.track_id
+        task.hand_track_id = hand_track_id
         task.screw_observed = True
         # 锚点留空：离盘那一刻手里可能还压着盘边的杆，直接拿来初始化会锁错
         # 目标（锁成留在盘里的那根）。交给 _current_screw_box 用「跟手框交叠」
@@ -673,7 +1100,7 @@ class StationPipeline:
             event_type=EventType.PICK,
             reason="pick_confirmed",
             extra={
-                "hand_track_id": hand.track_id,
+                "hand_track_id": hand_track_id,
                 "dwell_in_tray_s": round(dwell_s, 3),
                 "screw_confidence": round(float(screw.confidence), 3),
             },
@@ -683,7 +1110,7 @@ class StationPipeline:
         self._logger.info(
             "取料完成 %s（手部轨迹=%s，盘内停留 %.2fs）",
             task.task_id,
-            hand.track_id,
+            hand_track_id,
             dwell_s,
         )
 
@@ -728,11 +1155,20 @@ class StationPipeline:
         # 低帧率下刷子常有一两帧漏检，那几帧的 dt 若直接丢弃，累计会明显
         # 偏短（3~5fps 时每漏一帧就少 0.2~0.3s）。这里把「上一次靠近」到
         # 本帧的空档一并计入，上限按实际帧率放大后的 brush_hold_max_gap_s。
+        # 桥接空档与 dt 用同一个可信上限：原先 dt 夹到 1.0s、桥接却按
+        # brush_hold_max_gap_s×scale 给到 2.0s，一次掉帧就能把 0.2s 的
+        # 真实靠近凑成 1.0s 以上并直接判完成（实测）。时间不可信的帧
+        # 不桥接，只累计可信的 dt。
         add = dt
-        if task.last_brush_ts is not None:
+        if task.last_brush_ts is not None and self._timing_reliable:
             gap = ts - task.last_brush_ts
-            max_gap = self.cfg.brush_hold_max_gap_s * self._frame_scale
-            if 0 < gap <= max_gap:
+            max_gap = min(
+                self.cfg.brush_hold_max_gap_s * self._frame_scale,
+                self._max_plausible_dt(),
+            )
+            # 加一点容差：max_gap 由乘法算出（如 0.2×2），实际 gap 恰等
+            # 于它时会被浮点误差挡在门外（0.4 > 0.3999999999999999）。
+            if 0 < gap <= max_gap + 1e-9:
                 add = gap
         task.last_brush_ts = ts
         task.brush_hold_s += add
@@ -746,10 +1182,16 @@ class StationPipeline:
 
         取料那一刻把手里那根杆记成锚点，之后每帧更新：
 
-        1. 优先取「与本帧某个手框交叠」的杆——握着的时候丝杆一定被手框遮住，
-           这条约束把候选从满盘丝杆缩到手上那一根；
-        2. 交叠候选里取离锚点最近的（``screw_anchor_max_step``，按实际帧率缩放）；
-        3. 手上没有交叠杆（手被身体挡住/框偏了）才退化为纯位置连续性；
+        1. 优先取「与**本周期那只手**的交叠框交叠」的杆——握着的时候丝杆一定
+           被手框遮住，这条约束把候选从满盘丝杆缩到手上那一根；只看本周期
+           这只手，别的工人/另一只手握的杆不能把锚点抢走（实测会直接导致
+           刷别处的杆也判完成）；
+        2. 交叠候选里取离锚点最近的（``screw_anchor_max_step`` 按实际帧率
+           缩放，但不超过 ``screw_anchor_max_step_abs``，防跳杆）；
+        3. 手上没有交叠杆（手框偏了、杆被遮，或杆其实在另一只手里）时退化
+           为按位置连续性取离锚点最近的杆，但**仅在锚点仍贴近最后一次确认
+           握持的位置时**（``hand_screw_max_distance``）——否则锚点会在密集
+           的静置丝杆之间逐帧漂走；
         4. 全都找不到时，在 ``screw_anchor_hold_s`` 内按锚点位置继续，
            让刷子靠近的累计不因一两帧漏检中断。
 
@@ -762,16 +1204,32 @@ class StationPipeline:
         width, height = self._frame_size
         diag = max(1.0, math.hypot(width, height))
         label = self.station.detector.screw_label
-        step = self.cfg.screw_anchor_max_step * self._frame_scale
+        # 绝对上限（不随帧率放大）：盘里丝杆间距只有 0.02~0.03，
+        # frame_scale 顶到 4 时单帧步长会到 0.48，一跳就是相邻那根杆。
+        #
+        # 上限只允许**收紧**帧率放大的结果、不允许低于配置值本身：取料
+        # 瞬间手带着杆快速划出，单帧位移实测 0.09~0.11，上限比这还小时
+        # 锚点一步跨不过去就永久卡在盘内那根杆上，整件涂油累计为 0
+        # （示例视频第一件即如此）。
+        step = min(
+            self.cfg.screw_anchor_max_step * self._frame_scale,
+            max(
+                self.cfg.screw_anchor_max_step_abs,
+                self.cfg.screw_anchor_max_step,
+            ),
+        )
         anchor = task.screw_anchor
         hand_center = self._hand_center(task.hand_track_id)
 
-        # 1) 握在手里的杆：与手框交叠的那些。
+        # 1) 握在手里的杆：与**本周期那只手**的框交叠的那些。
+        cycle_hand = self._live_hand(task.hand_track_id)
         gripped: list[tuple[float, BBox]] = []
         for det in self._last_detections:
             if det.label != label:
                 continue
-            if not any(_overlaps(det.box, hand.box) for hand in self._hand_tracks):
+            if cycle_hand is None or not _overlaps(
+                det.box, cycle_hand.observation_box()
+            ):
                 continue
             cx, cy = det.box.center
             distance = (
@@ -783,6 +1241,7 @@ class StationPipeline:
                 continue
             gripped.append((distance, det.box))
 
+        grabbed = bool(gripped)
         if gripped and anchor is None:
             # 初始化：取交叠杆中离手中心最近的那根（握着的一定贴着这只手）。
             best = min(
@@ -791,15 +1250,41 @@ class StationPipeline:
         else:
             best = min(gripped, key=lambda item: item[0])[1] if gripped else None
 
-        # 2) 手上没有可见的杆：按位置连续性找。
-        if best is None and anchor is not None:
+        # 位置连续性只在「离最后一次确认握持的位置不远」时成立。锚点每帧
+        # 都会被刷新，不加这道约束它会在密集的静置丝杆之间逐帧漂走
+        # （实测漂进零件盒里的整排静置杆，手里那根反而累计不上）。
+        continuity_ok = (
+            task.screw_gripped_at is not None
+            and anchor is not None
+            and math.hypot(
+                anchor[0] - task.screw_gripped_at[0],
+                anchor[1] - task.screw_gripped_at[1],
+            )
+            / diag
+            <= self.cfg.hand_screw_max_distance * self._frame_scale
+        )
+
+        # 2) 手上没有可见的杆（手框偏了/杆被遮/刷的是另一只手拿的杆）：
+        #    按位置连续性找离锚点最近的杆。
+        #
+        # 安全性由两道约束共同保证：
+        # - ``continuity_ok``：锚点仍贴「最后一次确认握持」的位置，不会在
+        #   密集的静置丝杆之间逐帧漂走；
+        # - ``_CONTINUITY_STEP_ABS``：单帧跨度比「握持证据」时小得多。没有
+        #   握持证据却允许跨 0.15，会一步跳到另一只手握的杆上。
+        #
+        # 不能要求「本周期那只手不可见」才走这条分支：现场常常一只手拿杆、
+        # 另一只手拿刷子，被跟踪的那只（拿刷子的那只）一直在画面里，此时
+        # 杆本身才是唯一的定位依据（实测会让整件涂油累计为 0）。
+        continuity_step = min(step, _CONTINUITY_STEP_ABS)
+        if best is None and anchor is not None and continuity_ok:
             nearest: tuple[float, BBox] | None = None
             for det in self._last_detections:
                 if det.label != label:
                     continue
                 cx, cy = det.box.center
                 distance = math.hypot(cx - anchor[0], cy - anchor[1]) / diag
-                if distance > step:
+                if distance > continuity_step:
                     continue
                 if nearest is None or distance < nearest[0]:
                     nearest = (distance, det.box)
@@ -810,11 +1295,22 @@ class StationPipeline:
             task.screw_anchor_ts = ts
             task.screw_observed = True
             task.last_screw_ts = ts
+            if grabbed:
+                task.screw_gripped_ts = ts
+                task.screw_gripped_at = best.center
             return best
 
         # 3) hold 窗口内：按锚点位置继续（跨过一两帧漏检，不中断累计）。
+        #
+        # 窗口从「最后一次锚点更新」算起。加位置约束（``continuity_ok``）：
+        # 锚点一旦漂离最后确认握持的位置就不再往下接，避免它在密集的静置
+        # 丝杆之间逐帧漂走（实测漂进零件盒里的整排静置杆）。
+        #
+        # 注：杆被手完全遮住、超过窗口时按既定规则暂停累计、周期保持
+        # PICKED（见 docs/05 已知限制）——现场确实会这样，属于已知取舍。
         if (
             anchor is not None
+            and continuity_ok
             and task.screw_anchor_ts is not None
             and ts - task.screw_anchor_ts
             <= self.cfg.screw_anchor_hold_s * self._frame_scale
@@ -830,9 +1326,19 @@ class StationPipeline:
         # None，周期永久停在 PICKED，直到下一次取料把它判成 NG——中间回来
         # 涂了也不算。这里只要还在重新捕获时限内、且本帧又出现了「被手握着」
         # 的丝杆，就把它接成新锚点，继续累计涂油。
-        reacquired = self._reacquire_anchor(task, ts)
-        if reacquired is not None:
+        reacquire = self._reacquire_anchor(task, ts)
+        if reacquire is not None:
+            reacquired, hand = reacquire
             gap = 0.0 if task.last_screw_ts is None else ts - task.last_screw_ts
+            if hand.track_id != task.hand_track_id:
+                # 换绑：本周期那只手的视觉 ID 已重建，跟着新 ID 继续判。
+                self._logger.info(
+                    "周期 %s 手部轨迹 %s → %s（视觉 ID 重建）",
+                    task.task_id,
+                    task.hand_track_id,
+                    hand.track_id,
+                )
+                task.hand_track_id = hand.track_id
             task.screw_anchor = reacquired.center
             task.screw_anchor_ts = ts
             task.last_screw_ts = ts
@@ -849,12 +1355,16 @@ class StationPipeline:
         task.screw_observed = False
         return None
 
-    def _reacquire_anchor(self, task: _Cycle, ts: float) -> BBox | None:
+    def _reacquire_anchor(
+        self, task: _Cycle, ts: float
+    ) -> tuple[BBox, Track] | None:
         """锚点失效后重新捕获手持丝杆。
 
-        条件是「本帧有丝杆检测与某个手框交叠」——握着的时候丝杆必然被手框
-        遮住，这条约束足以把候选从满盘丝杆缩到手上那一根，不需要位置先验。
-        多只手各握一根时取最大的那根（握得越实交叠越大）。
+        条件是「本帧有丝杆检测与本周期那只手的框交叠」——握着的时候丝杆
+        必然被手框遮住，这条约束足以把候选从满盘丝杆缩到手上那一根，不需要
+        位置先验。手部轨迹已被回收时改为接最近的那只有效手。
+
+        返回 ``(框, 手)``，调用方在换手时更新周期的 ``hand_track_id``。
 
         ``screw_reacquire_timeout_s=0`` 表示不限时：只要周期还活着就一直等，
         因为「多久算这一件不回来了」是工艺问题，交给下一次取料去判 NG 更准。
@@ -865,34 +1375,117 @@ class StationPipeline:
             if ts - task.last_screw_ts > timeout:
                 return None
 
+        # 只认**本周期那只手**握着的杆：别的工人/另一只手握着的是另一件料，
+        # 接成新锚点会让刷别处的杆也算作这一件涂完了（已复现误判）。
+        #
+        # 例外是「本周期那只手的轨迹已经被跟踪器彻底回收」：手部视觉 ID 在
+        # 遮挡/快速移动后必然重建，这时回来涂油的是同一个人，必须允许换绑。
+        # 判据是「轨迹还在不在跟踪器里」而不是「本帧匹不匹配」——后者分不开
+        # 「同一只手暂时漏检」和「别的工人伸手进来」。
+        if self._hand_tracked(task.hand_track_id):
+            hand = self._live_hand(task.hand_track_id)
+            if hand is not None and task.screw_anchor is not None:
+                hx, hy = hand.observation_box().center
+                width, height = self._frame_size
+                diag = max(1.0, math.hypot(width, height))
+                if (
+                    math.hypot(hx - task.screw_anchor[0], hy - task.screw_anchor[1])
+                    / diag
+                    > self.cfg.hand_screw_max_distance * self._frame_scale
+                ):
+                    # 本周期那只手还在、却已经跑到别处：这是另一只手/另一件料，
+                    # 不能接成本周期的锚点（实测会直接导致刷别处的杆也判完成）。
+                    return None
+        else:
+            # 换绑：本周期那只手的轨迹已经不在跟踪器里。这一件被拿走了很久
+            # （手和杆都出过画面），回来时在哪都合理，不限制位置；但杆仍要
+            # 被这只手握着（下面按「杆心落在手框内」筛）。
+            hand = self._nearest_live_hand_to(task.screw_anchor)
+        if hand is None:
+            return None
         label = self.station.detector.screw_label
+        hand_box = hand.observation_box()
         best: tuple[float, BBox] | None = None
         for det in self._last_detections:
             if det.label != label:
                 continue
-            overlap = 0.0
-            for hand in self._hand_tracks:
-                if not hand.matched:
-                    continue
-                if not _overlaps(det.box, hand.box):
-                    continue
-                # 取交叠面积占比作为「握得有多实」的度量。
-                inter = det.box.intersection_area(hand.box)
-                area = max(1.0, det.box.width * det.box.height)
-                overlap = max(overlap, inter / area)
-            if overlap <= 0.0:
+            # 与「持有判定」同一口径：杆心落在手框内，或两者明显交叠。
+            # 只要求「有一点交叠」不够——手臂从零件盒上方经过时会蹭到盒里
+            # 整排静置杆，锚点会被接过去，之后刷手里那根永远累计不上。
+            gripped = (
+                _box_center_in(det.box, hand_box)
+                or hand_box.iou(det.box) >= 0.15
+            )
+            if not gripped:
                 continue
-            if best is None or overlap > best[0]:
-                best = (overlap, det.box)
-        return None if best is None else best[1]
+            # 多根都满足时取离旧锚点最近的（离得远说明是别人手里的）。
+            cx, cy = det.box.center
+            score = (
+                0.0
+                if task.screw_anchor is None
+                else math.hypot(cx - task.screw_anchor[0], cy - task.screw_anchor[1])
+            )
+            if best is None or score < best[0]:
+                best = (score, det.box)
+        if best is None:
+            return None
+        return best[1], hand
 
-    def _hand_center(self, hand_track_id: int | None) -> tuple[float, float] | None:
+    def _hand_tracked(self, hand_track_id: int | None) -> bool:
+        """该 id 的轨迹是否仍在跟踪器里（无论本帧是否匹配）。"""
+
+        return (
+            hand_track_id is not None
+            and self._hand_tracker.get(hand_track_id) is not None
+        )
+
+    def _nearest_live_hand_to(
+        self,
+        anchor: tuple[float, float] | None,
+        *,
+        limit: float | None = None,
+    ) -> Track | None:
+        """离给定位置最近的本帧有效手；给了 ``limit`` 就只接受够近的。"""
+
+        live = [
+            hand
+            for hand in self._hand_tracks
+            if hand.matched and hand.hits >= max(1, self._hand_tracker.min_hits)
+        ]
+        if not live:
+            return None
+        if anchor is None:
+            return live[0]
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+
+        def distance(hand: Track) -> float:
+            cx, cy = hand.observation_box().center
+            return math.hypot(cx - anchor[0], cy - anchor[1]) / diag
+
+        best = min(live, key=distance)
+        if limit is not None and distance(best) > limit:
+            return None
+        return best
+
+    def _live_hand(self, hand_track_id: int | None) -> Track | None:
+        """本帧真正观测到、且达到 ``min_hits`` 的那只手（否则 None）。
+
+        ``min_hits`` 之前对手部完全不生效：单帧误检就能建轨迹并写进盘状态。
+        """
+
         if hand_track_id is None:
             return None
         hand = self._hand_tracker.get(hand_track_id)
         if hand is None or not hand.matched:
             return None
-        return hand.box.center
+        if hand.hits < max(1, self._hand_tracker.min_hits):
+            return None
+        return hand
+
+    def _hand_center(self, hand_track_id: int | None) -> tuple[float, float] | None:
+        hand = self._live_hand(hand_track_id)
+        return None if hand is None else hand.box.center
 
     def _has_live_brush(self) -> bool:
         """本帧是否有任一已匹配的刷头轨迹（用于区分漏检和远离）。"""
@@ -1168,6 +1761,47 @@ class StationPipeline:
 # ----------------------------------------------------------------------
 # 几何与辅助
 # ----------------------------------------------------------------------
+def _holding_placeholder(hand_box: BBox) -> Detection:
+    """离盘帧没有杆检测时，用握手位置附近的一个占位「握持证据」。
+
+    只在「离盘前不久已确认过握持」时才用到；占位框贴着手框下缘（手握杆
+    时杆就在那个方向），置信度记 0 便于在事件里区分「实检」与「沿用」。
+    """
+
+    cx = hand_box.center[0]
+    cy = hand_box.center[1] + hand_box.height * 0.5
+    return Detection(
+        label="",
+        confidence=0.0,
+        box=BBox(cx - 1.0, cy - 1.0, cx + 1.0, cy + 1.0),
+    )
+
+
+def _demote_for_continuation(det: Detection, cfg: PipelineConfig) -> Detection:
+    """把「区外延续」用的检测压到低置信度带。
+
+    ByteTrack 只让高置信度检测新建轨迹；把延续检测压到 ``new_thresh`` 以下
+    就变成「只能接回已有轨迹，不能凭空新建」——否则区外同一片区域里的
+    误检会不断长出新轨迹，而它们本来就不该被跟踪。
+    """
+
+    ceiling = cfg.bytetrack_new_thresh - 1e-3
+    floor = cfg.bytetrack_low_thresh + 1e-3
+    if ceiling <= floor:
+        return det
+    score = min(float(det.confidence), ceiling)
+    if score == det.confidence:
+        return det
+    return Detection(
+        label=det.label,
+        confidence=score,
+        box=det.box,
+        track_id=det.track_id,
+        angle=det.angle,
+        point=det.point,
+    )
+
+
 def _overlaps(a: BBox, b: BBox) -> bool:
     """两个框是否有实际交叠（不含仅贴边）。"""
 

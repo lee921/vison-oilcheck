@@ -37,7 +37,7 @@ from .roi import Roi
 logger = logging.getLogger("oilcheck.config")
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.4"
+_CONFIG_VERSION = "2.5"
 
 # 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
 _TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
@@ -59,7 +59,7 @@ _PIPELINE_DEFAULTS_2_3: dict[str, Any] = {
     "bytetrack_high_thresh": 0.30,
     "bytetrack_low_thresh": 0.10,
     "bytetrack_new_thresh": 0.30,
-    "bytetrack_match_thresh": 0.80,
+    "bytetrack_match_thresh": 1.00,
     "bytetrack_buffer_s": 2.00,
     "bytetrack_cost_alpha": 0.40,
 }
@@ -256,6 +256,29 @@ class PipelineConfig:
     pick_hand_distance: float = 0.05
     # 手必须在盘内停留这么久才算一次取料（滤掉从盘边划过的手）。
     pick_confirm_s: float = 0.30
+    # 取料判定用「间隔采样 + 多帧投票」，不拿单帧当结论：
+    # - ``pick_sample_every_frames``（k）：每隔 k 帧采样一次状态；
+    # - ``pick_history_samples``（n）：保留最近 n 个采样点。
+    #
+    # 涉及两个状态——「手是否在盘内」「离盘时手里有没有杆」。
+    #
+    # 现场实测：盘区边线附近手框中心会来回抖动一帧；离盘那一帧的丝杆
+    # 置信度也常掉到 0.5 左右（杆心还没进手框），只看当帧会判成
+    # 「空手离盘」而丢掉整件。
+    #
+    # 取 k=2、n=3：每 2 帧采一个样、看最近 3 个采样点。
+    #
+    # 两段示例视频按「取料数 / 涂油数 / 误判 NG」在 15fps 与 7.5fps 下横扫
+    # k∈{1,2,3} × n∈{1,2,3,5}：k=1,n=5（早先默认）在两组场景合计 4 次取料
+    # 只判出 3 次；n=5 的观察窗太长，低帧率下盘边抖动会把一件拆成两段。
+    # k=2,n=3 与 k=3,n=2 在四组场景下全部 4 取、0 MISS、0 假阳性。
+    #
+    # k×n 决定「离盘后要攒多少个盘外采样才按多数定论」：k=2、n=3 在
+    # 15fps 下是 0.4s、7.5fps 下 0.8s。手出画面、视频结束、或等到超时仍
+    # 不足这么多点时不再等，见过一帧手握杆就按握持结算——点数不足一律按
+    # 空手处理会让真实取料连周期都建不出来。
+    pick_sample_every_frames: int = 2
+    pick_history_samples: int = 3
 
     # 目标跟踪（手/刷头使用 ByteTrack）
     hand_track_max_distance: float = 0.15
@@ -297,6 +320,14 @@ class PipelineConfig:
     # 覆盖约 p95：既跟得住快速移动，又不会跳到相邻的静置杆上
     # （盘里丝杆间距只有 0.02~0.03）。
     screw_anchor_max_step: float = 0.12
+    # 锚点单帧位移的**绝对**上限（不随帧率缩放）。盘里丝杆间距只有
+    # 0.02~0.03，低帧率时 frame_scale 会把上面那个门限放大到 0.5，一跳就是
+    # 相邻那根杆。
+    #
+    # 必须 ≥ ``screw_anchor_max_step``：取料瞬间手带着杆快速划出，实测单帧
+    # 位移到 0.09~0.11。上限比这个大，锚点会一步跨不过去而永久卡在盘内那根
+    # 杆上（之后每帧都找不到杆，整件涂油累计为 0）。
+    screw_anchor_max_step_abs: float = 0.15
     # 锚点丢失后靠预测位置继续跟的时长（按实际帧率缩放）。
     screw_anchor_hold_s: float = 0.50
 
@@ -326,7 +357,9 @@ class PipelineConfig:
     bytetrack_high_thresh: float = 0.30
     bytetrack_low_thresh: float = 0.10
     bytetrack_new_thresh: float = 0.30
-    bytetrack_match_thresh: float = 0.80
+    # 关联代价阈值。门控未命中的代价固定为 1.5（高于任何阈值），因此 1.0 表示
+    # 「只看距离/IoU 门限」，与 *_track_max_distance 的语义一致；调小可加严。
+    bytetrack_match_thresh: float = 1.00
     bytetrack_buffer_s: float = 2.00
     bytetrack_cost_alpha: float = 0.40
 
@@ -453,6 +486,9 @@ class PipelineConfig:
             screw_anchor_max_step=_f(
                 "screw_anchor_max_step", d.screw_anchor_max_step, 0.005
             ),
+            screw_anchor_max_step_abs=_f(
+                "screw_anchor_max_step_abs", d.screw_anchor_max_step_abs, 0.005
+            ),
             screw_anchor_hold_s=_f(
                 "screw_anchor_hold_s", d.screw_anchor_hold_s, 0.0
             ),
@@ -499,6 +535,8 @@ class PipelineConfig:
             "max_fps": self.max_fps,
             "pick_hand_distance": self.pick_hand_distance,
             "pick_confirm_s": self.pick_confirm_s,
+            "pick_sample_every_frames": self.pick_sample_every_frames,
+            "pick_history_samples": self.pick_history_samples,
             "hand_track_max_distance": self.hand_track_max_distance,
             "hand_track_max_missing_s": self.hand_track_max_missing_s,
             "hand_track_max_active": self.hand_track_max_active,
@@ -521,6 +559,7 @@ class PipelineConfig:
             "held_infer_distance": self.held_infer_distance,
             "held_predict_hold_s": self.held_predict_hold_s,
             "screw_anchor_max_step": self.screw_anchor_max_step,
+            "screw_anchor_max_step_abs": self.screw_anchor_max_step_abs,
             "screw_anchor_hold_s": self.screw_anchor_hold_s,
             "brush_hold_max_gap_s": self.brush_hold_max_gap_s,
             "screw_reacquire_timeout_s": self.screw_reacquire_timeout_s,
@@ -884,6 +923,9 @@ class OilCheckConfigService:
         rois_outdated = old_parts < (2, 2)
         # 2.3 引入槽位身份、手-丝杆关联、刷-手关联与 ByteTrack 后端。
         slots_outdated = old_parts < (2, 3)
+        # 2.5 跟踪稳定性：锚点加绝对步长上限；关联代价门控语义对齐
+        # （未进门限的代价改为 1.5，阈值 0.80 会把有效距离截到 0.667×）。
+        stability_outdated = old_parts < (2, 5)
 
         changed: list[str] = []
 
@@ -976,6 +1018,56 @@ class OilCheckConfigService:
                     if key in station:
                         station.pop(key)
                         changed.append(f"-stations.{key}")
+
+        # 4.4) 2.5 跟踪稳定性：补锚点绝对步长上限；把仍是旧默认值的
+        #      关联代价阈值提到 1.0（现场已手工调过的值保留，不覆盖）。
+        #
+        # 本节**不看版本号**：2.5 早期版本把 screw_anchor_max_step_abs 写成
+        # 0.08（小于基准步长 0.12），会让锚点在取料瞬间跨不过去而永久卡住；
+        # 那份配置的 version 已经是 2.5，按版本号判断会漏掉。这里每次都做
+        # 幂等纠正——只在值确实不合法时才改，不会反复改写文件。
+        pipeline = data.get("pipeline")
+        if not isinstance(pipeline, dict):
+            pipeline = {}
+            if stability_outdated:
+                data["pipeline"] = pipeline
+                changed.append("pipeline")
+        abs_step = pipeline.get("screw_anchor_max_step_abs")
+        base_step = pipeline.get("screw_anchor_max_step")
+        if isinstance(abs_step, (int, float)) and (
+            isinstance(base_step, (int, float))
+            and float(abs_step) < float(base_step)
+        ):
+            # 必须不小于基准步长：取料瞬间单帧位移实测可达 0.11。
+            pipeline["screw_anchor_max_step_abs"] = float(base_step)
+            changed.append("pipeline.screw_anchor_max_step_abs")
+        elif stability_outdated and not isinstance(abs_step, (int, float)):
+            pipeline["screw_anchor_max_step_abs"] = 0.15
+            changed.append("pipeline.screw_anchor_max_step_abs")
+        if stability_outdated:
+            match_thresh = pipeline.get("bytetrack_match_thresh")
+            if isinstance(match_thresh, (int, float)) and float(match_thresh) <= 0.80:
+                # 旧语义下 0.80 等价于「距离门限打 0.667 折」；新语义下
+                # 1.0 才是「只用距离门限」，等价于把配置写的行为还回来。
+                pipeline["bytetrack_match_thresh"] = 1.0
+                changed.append("pipeline.bytetrack_match_thresh")
+
+        # 4.45) 检测置信度必须低于 ByteTrack 高置信度阈值，否则低分框在
+        #       检测层就被丢掉，第二阶段补救关联永远收不到输入。旧配置里
+        #       常见的 0.5 > 0.3 就属于这种情况，等价于关掉了第二阶段。
+        high_thresh = pipeline.get("bytetrack_high_thresh")
+        for station in data.get("stations", ()) or ():
+            if not isinstance(station, dict):
+                continue
+            detector = station.get("detector")
+            if not isinstance(detector, dict):
+                continue
+            conf = detector.get("confidence")
+            if not isinstance(conf, (int, float)):
+                continue
+            if isinstance(high_thresh, (int, float)) and float(conf) > float(high_thresh):
+                detector["confidence"] = float(high_thresh)
+                changed.append("detector.confidence")
 
         # 4.5) demo：旧配置没有示例回放速率时补默认值，不改现场已设的值。
         demo = data.get("demo")
@@ -1070,6 +1162,14 @@ CONFIG_COMMENTS: dict[str, str] = {
     "pipeline.pick_hand_distance": (
         "手-丝杆关联时视为「够得着」的最大归一化中心距离"
     ),
+    "pipeline.pick_sample_every_frames": (
+        "取料判定的采样间隔（帧）：每隔这么多帧记一次「是否在盘内 / "
+        "手里是否有杆」的状态"
+    ),
+    "pipeline.pick_history_samples": (
+        "取料判定保留的采样点数：用最近这么多个采样点投票决定状态，"
+        "避免单帧抖动导致漏判或误判"
+    ),
     "pipeline.pick_confirm_s": (
         "手在涂油盘内的最短停留时长。低于该值视为从盘边划过，不判取料。"
         "纯时间阈值，不随帧率缩放"
@@ -1131,6 +1231,10 @@ CONFIG_COMMENTS: dict[str, str] = {
         "丝杆锚点单帧最大位移。取料后按最近邻连续性跟这根杆，"
         "既跟得住快速移动，又不会跳到相邻丝杆（盘里间距很小）"
     ),
+    "pipeline.screw_anchor_max_step_abs": (
+        "锚点单帧位移的绝对上限，不随帧率放大。盘里丝杆间距只有 0.02~0.03，"
+        "低帧率下必须靠它防止锚点跳到相邻丝杆"
+    ),
     "pipeline.screw_anchor_hold_s": (
         "锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则尝试重新捕获"
     ),
@@ -1151,7 +1255,10 @@ CONFIG_COMMENTS: dict[str, str] = {
     "pipeline.bytetrack_high_thresh": "ByteTrack 高置信度检测阈值（第一阶段关联）",
     "pipeline.bytetrack_low_thresh": "ByteTrack 低置信度检测阈值（第二阶段补救关联）",
     "pipeline.bytetrack_new_thresh": "达到该置信度才允许新建轨迹",
-    "pipeline.bytetrack_match_thresh": "关联代价阈值，超过即判为不匹配",
+    "pipeline.bytetrack_match_thresh": (
+        "关联代价阈值。未进门限的代价固定 1.5，故 1.0 表示只看距离/IoU 门限；"
+        "调小可加严"
+    ),
     "pipeline.bytetrack_buffer_s": (
         "轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）"
     ),

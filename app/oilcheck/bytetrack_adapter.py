@@ -10,11 +10,16 @@ ultralytics 自带的 ``BYTETracker`` 只按 IoU 关联，实测 20×20 的小�
 
 不用 ``min(iou, distance)``——那会让一个指标的优秀表现完全抵消另一个指标的异常。
 
-两点已核实：
+已核实与改写：
 - ``get_dists`` 在卡尔曼 ``multi_predict`` 之后调用，``tlwh`` 已是预测状态，
   中心距离天然基于预测位置；
-- 第二阶段的低置信度关联在 ultralytics 源码里是硬编码的纯 IoU，不经过
-  ``get_dists``，所以改写它不会破坏 ByteTrack 原始的两阶段策略。
+- **第二阶段**（低置信度补救）在 ultralytics 源码里是硬编码的纯 IoU，
+  小目标快速移动时必然失配——这正是上面记录的原始故障。这里覆写
+  ``_second_association``，让它复用同一套加权代价；
+- 卡尔曼改用 ``KalmanFilterXYWH``：手/刷框近似方形且尺寸抖动大，XYAH 的
+  长宽比状态会把框宽拉回（实测量测 5.0 被滤到 1.04）；
+- 门控未命中的代价固定为 ``GATE_COST=1.5``，使 ``match_thresh=1.0`` 表示
+  「只看距离/IoU 门限」，避免 α 把有效距离暗中截到 0.667 倍。
 
 对外保持与 :class:`app.oilcheck.tracker.ObjectTracker` 相同的调用契约，
 pipeline 与测试可以原样使用。
@@ -32,6 +37,10 @@ from .tracker import ObjectTracker, Track, TrackerOutput
 from .types import BBox, Detection
 
 logger = logging.getLogger("oilcheck.bytetrack")
+
+# 门控未命中的代价。必须高于任何可配置的 match_thresh（默认 1.0），
+# 否则「距离门限」会被代价阈值悄悄截断。
+GATE_COST = 1.5
 
 
 def _ensure_lap_available() -> None:
@@ -168,8 +177,29 @@ def _build_impl(
         logger.warning("ByteTrack 不可用，回退 ObjectTracker：%s", exc)
         return None
 
+    from ultralytics.trackers.byte_tracker import STrack
+    from ultralytics.trackers.utils.kalman_filter import KalmanFilterXYWH
+
+    class _XYWHSTrack(STrack):  # type: ignore[misc, valid-type]
+        """状态用 (cx, cy, w, h)：手/刷框近似方形，长宽比不必单独建模。"""
+
+        def convert_coords(self, tlwh: np.ndarray) -> np.ndarray:
+            ret = np.asarray(tlwh).copy()
+            ret[:2] += ret[2:] / 2
+            return ret
+
+        @property
+        def tlwh(self) -> np.ndarray:
+            if self.mean is None:
+                return self._tlwh.copy()
+            ret = self.mean[:4].copy()
+            ret[:2] -= ret[2:] / 2
+            return ret
+
     class _CostByteTracker(BYTETracker):  # type: ignore[misc, valid-type]
         """带类别/距离门控与加权代价的 ByteTrack。"""
+
+        track_class = _XYWHSTrack
 
         def __init__(self, tracker_args: Any) -> None:
             super().__init__(tracker_args)
@@ -178,6 +208,9 @@ def _build_impl(
             self._alpha = min(0.99, max(0.01, float(alpha)))
             self.last_debug: CostDebug | None = None
 
+        def get_kalmanfilter(self) -> Any:
+            return KalmanFilterXYWH()
+
         @staticmethod
         def _center(strack: Any) -> tuple[float, float]:
             # STrack.tlwh 已经是卡尔曼预测后的状态。
@@ -185,10 +218,16 @@ def _build_impl(
             return (float(x) + float(w) * 0.5, float(y) + float(h) * 0.5)
 
         def get_dists(self, tracks: list[Any], detections: list[Any]) -> np.ndarray:
-            iou_cost = matching.iou_distance(tracks, detections)
             if not tracks or not detections:
-                return iou_cost
+                return matching.iou_distance(tracks, detections)
+            return self._cost_matrix(tracks, detections)
 
+        def _cost_matrix(
+            self, tracks: list[Any], detections: list[Any]
+        ) -> np.ndarray:
+            """类别/距离门控 + 加权代价；门控未命中给 ``GATE_COST``。"""
+
+            iou_cost = matching.iou_distance(tracks, detections)
             track_centers = np.array(
                 [self._center(t) for t in tracks], dtype=np.float32
             )
@@ -204,18 +243,61 @@ def _build_impl(
             center_cost = distance / self._max_center
             gated = distance > self._max_center
 
-            # 类别门控：同一实例内类别不一致时不匹配。
-            for ti, track in enumerate(tracks):
-                for di, det in enumerate(detections):
-                    if getattr(track, "cls", None) != getattr(det, "cls", None):
-                        gated[ti, di] = True
+            # 类别门控：同一实例内类别不一致时不匹配（向量化，避免 Python 双循环）。
+            track_cls = np.array(
+                [float(getattr(t, "cls", 0.0)) for t in tracks], dtype=np.float32
+            )
+            det_cls = np.array(
+                [float(getattr(d, "cls", 0.0)) for d in detections],
+                dtype=np.float32,
+            )
+            gated |= track_cls[:, None] != det_cls[None, :]
 
             cost = self._alpha * iou_cost + (1.0 - self._alpha) * center_cost
-            cost = np.where(gated, 1.0, cost)
+            cost = np.where(gated, GATE_COST, cost)
             if self.args.fuse_score:
                 # 默认关闭；若显式开启，按 ultralytics 语义再融合一次检测分数。
                 cost = matching.fuse_score(cost, detections)
             return cost
+
+        def _second_association(
+            self,
+            strack_pool: list[Any],
+            u_track: list[int],
+            detections_second: list[Any],
+            activated: list[Any],
+            refind: list[Any],
+            lost: list[Any],
+        ) -> None:
+            """第二阶段：用同一套加权代价接回低置信度检测。
+
+            ultralytics 原生这里是硬编码纯 IoU + 阈值 0.5，小目标每帧移动
+            上百像素时必然接不上，低分框就白喂进来了。这里沿用第一阶段的
+            距离门控与加权代价，代价阈值仍用 ``match_thresh``。
+            """
+
+            from ultralytics.trackers.basetrack import TrackState
+
+            r_tracked = [
+                strack_pool[i]
+                for i in u_track
+                if strack_pool[i].state == TrackState.Tracked
+            ]
+            if r_tracked and detections_second:
+                dists = self._cost_matrix(r_tracked, detections_second)
+                matches, u_track, _ = matching.linear_assignment(
+                    dists, thresh=self.args.match_thresh
+                )
+                self._apply_matches(
+                    matches, r_tracked, detections_second, activated, refind
+                )
+            else:
+                u_track = list(range(len(r_tracked)))
+
+            for it in u_track:
+                track = r_tracked[it]
+                track.mark_lost()
+                lost.append(track)
 
     from ultralytics.utils import IterableSimpleNamespace
 
@@ -262,6 +344,10 @@ class ByteTrackObjectTracker:
         self._max_distance = max(0.005, float(max_distance))
         self._tracks: dict[int, Track] = {}
         self._lost: list[Track] = []
+        # 已宣布丢失的轨迹 id：ByteTrack 内部的 lost_stracks 仍会保留一段时间
+        # （按帧数计），不加这道闸门的话同一个 id 会在几百帧后「复活」，
+        # 业务层会把「同名不同目标」当成同一只手/同一根杆。
+        self._retired: set[int] = set()
 
         self._fallback: ObjectTracker | None = None
         self._impl: Any = None
@@ -314,6 +400,8 @@ class ByteTrackObjectTracker:
     def reset(self) -> None:
         self._tracks.clear()
         self._lost.clear()
+        self._retired.clear()
+        self._local_seq = 0
         if self._impl is not None:
             self._impl.reset()
         if self._fallback is not None:
@@ -364,11 +452,15 @@ class ByteTrackObjectTracker:
             parsed = self._parse_row(row, detections)
             if parsed is None:
                 continue
-            track_id, det = parsed
+            track_id, det, raw_box = parsed
+            if track_id in self._retired:
+                # ByteTrack 让已退役的 id 重新出现了：换一个新 id，
+                # 保证「宣布丢失 = 永不复活」。
+                track_id = self._fresh_id()
             seen.add(track_id)
             existing = self._tracks.get(track_id)
             if existing is None:
-                if len(self._tracks) >= self._max_active:
+                if not self._make_room_for_new_track():
                     continue
                 self._tracks[track_id] = Track(
                     track_id=track_id,
@@ -378,9 +470,10 @@ class ByteTrackObjectTracker:
                     confidence=det.confidence,
                     angle=det.angle,
                     point=det.point,
+                    raw_box=raw_box if raw_box is not None else det.box,
                 )
             else:
-                self._merge(existing, det, ts)
+                self._merge(existing, det, ts, raw_box)
 
         lost: list[Track] = []
         for track_id, track in list(self._tracks.items()):
@@ -391,6 +484,7 @@ class ByteTrackObjectTracker:
             if track.missing_s > self._max_missing_s:
                 lost.append(track)
                 self._tracks.pop(track_id, None)
+                self._retire(track_id)
         self._lost = lost
 
         return TrackerOutput(
@@ -398,9 +492,52 @@ class ByteTrackObjectTracker:
         )
 
     # ------------------------------------------------------------------
+    def _fresh_id(self) -> int:
+        """分配一个适配器自己管理的 id（用于已退役 id 的复活情形）。"""
+
+        self._local_seq = getattr(self, "_local_seq", 0) + 1
+        return self._id_base + 10_000_000 + self._local_seq
+
+    def _retire(self, track_id: int) -> None:
+        """把 id 从 ByteTrack 内部池里永久移除，并记入退役集合。"""
+
+        self._retired.add(int(track_id))
+        local_id = int(track_id) - self._id_base
+        impl = self._impl
+        if impl is None:
+            return
+        for pool_name in ("tracked_stracks", "lost_stracks", "removed_stracks"):
+            pool = getattr(impl, pool_name, None)
+            if not pool:
+                continue
+            setattr(
+                impl,
+                pool_name,
+                [
+                    item
+                    for item in pool
+                    if int(getattr(item, "track_id", -1)) != local_id
+                ],
+            )
+
+    def _make_room_for_new_track(self) -> bool:
+        """名额满时先淘汰最久未匹配的轨迹，再考虑拒绝新目标。"""
+
+        if len(self._tracks) < self._max_active:
+            return True
+        if not self._tracks:
+            return False
+        victim = max(
+            self._tracks.values(),
+            key=lambda item: (not item.matched, item.missing_s),
+        )
+        self._tracks.pop(victim.track_id, None)
+        self._retire(victim.track_id)
+        return True
+
     def _parse_row(
         self, row: Any, detections: tuple[Detection, ...]
-    ) -> tuple[int, Detection] | None:
+    ) -> tuple[int, Detection, BBox | None] | None:
         global _LOGGED_FORMAT_WARNING
         width = int(np.asarray(row).shape[0])
         values = np.asarray(row, dtype=np.float64).ravel()
@@ -421,24 +558,28 @@ class ByteTrackObjectTracker:
 
         index_int = int(index)
         if 0 <= index_int < len(detections):
-            det = detections[index_int]
-            # 用映射回的原始检测，保留 angle/point/confidence。
+            raw = detections[index_int]
+            # ``box`` 是卡尔曼状态（显示用），``raw_box`` 是本帧真实检测
+            # （业务判定用，快速移动时不滞后）。
             det = Detection(
-                label=det.label,
-                confidence=det.confidence,
+                label=raw.label,
+                confidence=raw.confidence,
                 box=box,
                 track_id=int(track_id),
-                angle=det.angle,
-                point=det.point,
+                angle=raw.angle,
+                point=raw.point,
             )
+            return int(track_id) + self._id_base, det, raw.box
         else:
             det = Detection(
                 label="", confidence=float(_score_of(values, width)), box=box
             )
-        return int(track_id) + self._id_base, det
+            return int(track_id) + self._id_base, det, None
 
     @staticmethod
-    def _merge(track: Track, det: Detection, ts: float) -> None:
+    def _merge(
+        track: Track, det: Detection, ts: float, raw_box: BBox | None = None
+    ) -> None:
         old_cx, old_cy = track.box.center
         new_cx, new_cy = det.box.center
         dt = max(1e-3, float(ts) - track.last_ts)
@@ -452,6 +593,7 @@ class ByteTrackObjectTracker:
         track.confidence = det.confidence
         track.angle = det.angle
         track.point = det.point
+        track.raw_box = raw_box if raw_box is not None else det.box
         track.last_ts = float(ts)
         track.last_seen_ts = float(ts)
         track.hits += 1

@@ -1,6 +1,6 @@
 {
   // 配置结构版本，供自动迁移判断，不要手工改
-  "version": "2.4",
+  "version": "2.5",
   // 时序判定参数。单位：时间=秒，距离=按画面对角线归一化
   "pipeline": {
     // 检测最大帧率。也是帧率自适应的基准：实际帧间隔超过 1/max_fps 时，距离门限按倍率放大（见 frame_scale_max）
@@ -9,6 +9,10 @@
     "pick_hand_distance": 0.05,
     // 手在涂油盘内的最短停留时长。低于该值视为从盘边划过，不判取料。纯时间阈值，不随帧率缩放
     "pick_confirm_s": 0.3,
+    // 取料判定的采样间隔（帧）：每隔这么多帧记一次「是否在盘内 / 手里是否有杆」的状态
+    "pick_sample_every_frames": 2,
+    // 取料判定保留的采样点数：用最近这么多个采样点投票，避免单帧抖动导致漏判或误判。与上一项相乘决定离盘后攒够多少个盘外采样才定论（= 发取料事件的延迟）
+    "pick_history_samples": 3,
     // 手部轨迹匹配的最大归一化中心距离。低帧率时按帧间隔自动放大
     "hand_track_max_distance": 0.15,
     // 手部轨迹漏检后保留时长，超过即删除轨迹
@@ -20,11 +24,11 @@
     // 刷头轨迹匹配的最大归一化中心距离
     "brush_track_max_distance": 0.15,
     // 刷头轨迹漏检后保留时长
-    "brush_track_max_missing_s": 0.8,
+    "brush_track_max_missing_s": 1.5,
     // 刷头轨迹需命中多少帧才参与靠近判定
     "brush_track_min_hits": 1,
     // 同时保留的刷头轨迹上限
-    "brush_track_max_active": 4,
+    "brush_track_max_active": 3,
     // 刷头工作点到手持丝杆中心的归一化距离小于该值，本帧计为「靠近」
     "brush_contact_distance": 0.06,
     // 刷头靠近累计到该时长即判「人工二次涂油完成」。纯时间阈值，不随帧率缩放
@@ -53,6 +57,9 @@
     "held_predict_hold_s": 0.5,
     // 丝杆锚点单帧最大位移。取料后按最近邻连续性跟这根杆，既跟得住快速移动，又不会跳到相邻丝杆（盘里间距很小）
     "screw_anchor_max_step": 0.12,
+    // 锚点单帧位移的绝对上限，不随帧率放大。用于低帧率下防止锚点跳到相邻丝杆；
+    // 必须不小于 screw_anchor_max_step（取料瞬间手带杆打出画面，单帧位移可达 0.11）
+    "screw_anchor_max_step_abs": 0.15,
     // 锚点当帧找不到时，按锚点位置继续跟踪的时长；超出则在下面时限内尝试重新捕获
     "screw_anchor_hold_s": 0.5,
     // 手持丝杆离开画面后允许重新捕获的时长。工人取完料可能拿着杆走出画面、
@@ -65,19 +72,20 @@
     // 已跟踪目标移出工作追踪区后继续跟踪的距离余量。区外目标不会新建轨迹
     "roi_track_margin": 0.2,
     // auto=优先 ByteTrack，失败回退自研；可选 bytetrack / object
-    "hand_tracker_backend": "auto",
+    "hand_tracker_backend": "bytetrack",
     // 同上，刷头专用
-    "brush_tracker_backend": "auto",
+    "brush_tracker_backend": "bytetrack",
     // ByteTrack 高置信度检测阈值（第一阶段关联）
     "bytetrack_high_thresh": 0.3,
     // ByteTrack 低置信度检测阈值（第二阶段补救关联）
     "bytetrack_low_thresh": 0.1,
     // 达到该置信度才允许新建轨迹
     "bytetrack_new_thresh": 0.3,
-    // 关联代价阈值，超过即判为不匹配
-    "bytetrack_match_thresh": 0.8,
+    // 关联代价阈值。未进门限的代价固定为 1.5，所以 1.0 表示「只看距离/IoU 门限」；
+    // 调小可加严（现场标定用）
+    "bytetrack_match_thresh": 1.0,
     // 轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）
-    "bytetrack_buffer_s": 2.0,
+    "bytetrack_buffer_s": 3.0,
     // 关联代价权重：α·(1-IoU) + (1-α)·(中心距离/上限)。调大更看重框重叠，调小更看重中心距离
     "bytetrack_cost_alpha": 0.4
   },
@@ -167,8 +175,9 @@
         "kind": "yolo",
         // 权重路径，相对仓库根或绝对路径
         "model_path": "model/detect/exp/weights/best.pt",
-        // 检测置信度阈值
-        "confidence": 0.5,
+        // 检测置信度阈值。要低于 bytetrack_high_thresh（0.3），否则低于该值的框
+        // 在检测层就被丢掉，ByteTrack 的低分补救关联（第二阶段）永远收不到输入
+        "confidence": 0.25,
         // NMS 的 IoU 阈值
         "iou": 0.7,
         // 单帧最多输出多少个检测框
