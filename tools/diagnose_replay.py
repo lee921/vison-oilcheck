@@ -37,12 +37,24 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames", type=int, default=0, help="只跑前 N 帧，0=全部")
     parser.add_argument("--video", type=int, default=1, help="示例视频序号（1 基）")
+    parser.add_argument(
+        "--debug", type=int, default=0,
+        help="前 N 帧打印管线内部视角（原始检测 vs 显示检测、ROI、帧尺寸）",
+    )
     args = parser.parse_args()
 
     service = OilCheckConfigService(data_root())
     # 只读：不走 ensure_defaults()，避免诊断动作触发配置迁移/写回。
     cfg = service.load(create_if_missing=False)
     info = service.source_info()
+
+    _hr("0) 实际加载的模块")
+    import app.oilcheck.config as _cfg_mod
+    import app.oilcheck.pipeline as _pipe_mod
+    import app.oilcheck.roi as _roi_mod
+
+    for mod in (_cfg_mod, _pipe_mod, _roi_mod):
+        print(f"  {mod.__name__}: {getattr(mod, '__file__', '?')}")
 
     _hr("1) 生效配置")
     print("配置文件:", info["path"])
@@ -111,6 +123,22 @@ def main() -> int:
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     limit = args.frames if args.frames > 0 else total
     print(f"视频 {video_path.name}: {fps:.1f} fps, {total} 帧, 本次跑 {limit} 帧")
+    # 指纹：两端对比时先确认跑的是同一份权重和同一段录像。GPU/CPU 的推理
+    # 结果可能有细微差异，但同一份输入 + 同一套 ROI 不该出现「丝杆全在区外」。
+    import hashlib
+
+    def _digest(path: Path) -> str:
+        h = hashlib.md5()
+        with path.open("rb") as fp:
+            for chunk in iter(lambda: fp.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:12]
+
+    model_file = Path(
+        resolve_runtime_file(station.detector.model_path, repo_root=runtime_root())
+    )
+    print("权重 md5:", _digest(model_file))
+    print("视频 md5:", _digest(video_path))
 
     frame_no = 0
     last_task = None
@@ -127,13 +155,13 @@ def main() -> int:
         frame_dets = detector.detect(bgr, ts)
         snapshot = pipeline.process(detections=frame_dets)
         counts = snapshot.stats.get("label_counts") or {}
+        raw = frame_dets.detections
+        fw, fh = snapshot.frame_size
         screw_in = sum(
             1
-            for d in snapshot.detections
+            for d in raw
             if d.label == station.detector.screw_label
-            and station.work_roi.contains_box_center(
-                d.box, snapshot.frame_size[0], snapshot.frame_size[1]
-            )
+            and station.work_roi.contains_box_center(d.box, fw, fh)
         )
         in_work_counts.append(screw_in)
 
@@ -147,13 +175,10 @@ def main() -> int:
                 (d.box.x1 / snapshot.frame_size[0], d.box.y1 / snapshot.frame_size[1]),
                 (d.box.x2 / snapshot.frame_size[0], d.box.y2 / snapshot.frame_size[1]),
             ))
-            for d in snapshot.detections if d.label == tray_label
+            for d in raw if d.label == tray_label
         )
-        hands = [
-            d for d in snapshot.detections
-            if d.label == station.detector.hand_label
-        ]
-        if any(d.label == station.detector.screw_label for d in snapshot.detections):
+        hands = [d for d in raw if d.label == station.detector.hand_label]
+        if any(d.label == station.detector.screw_label for d in raw):
             frames_with_screw_detected += 1
         inside = 0
         for hand in hands:
@@ -163,6 +188,22 @@ def main() -> int:
         if inside:
             frames_with_hand_in_tray += 1
             hand_in_tray_total += inside
+
+        if frame_no <= args.debug:
+            shown = snapshot.detections
+            shown_screw = [d for d in shown if d.label == station.detector.screw_label]
+            raw_screw = [d for d in raw if d.label == station.detector.screw_label]
+            print(f"  [debug] 帧{frame_no} pipeline.station is station={pipeline.station is station}"
+                  f" work_roi={pipeline.station.work_roi.points}"
+                  f" frame_size={snapshot.frame_size}"
+                  f" 原始丝杆={len(raw_screw)} 显示丝杆={len(shown_screw)}"
+                  f" 显示检测总数={len(shown)}")
+            for d in raw_screw:
+                cx, cy = d.box.center
+                inside = station.work_roi.contains_box_center(d.box, *snapshot.frame_size)
+                print(f"      screw 中心=({cx:.0f},{cy:.0f}) "
+                      f"归一化=({cx / max(1, snapshot.frame_size[0]):.3f},"
+                      f"{cy / max(1, snapshot.frame_size[1]):.3f}) 区内={inside}")
 
         task = snapshot.stats.get("active_task_id")
         if task != last_task:
@@ -190,7 +231,7 @@ def main() -> int:
         inside = sum(1 for n in in_work_counts if n > 0)
         print(f"工作追踪区内出现过丝杆的帧: {inside}/{len(in_work_counts)}"
               f"（中位数 {sorted(in_work_counts)[len(in_work_counts) // 2]} 个）")
-    print(f"检出过丝杆的帧: {frames_with_screw_detected}/{frame_no}")
+    print(f"全画面检出过丝杆的帧: {frames_with_screw_detected}/{frame_no}")
     print(f"有手落在涂油盘区内的帧: {frames_with_hand_in_tray}/{frame_no}"
           f"（累计 {hand_in_tray_total} 次手-盘内命中）")
     if not events and frames_with_hand_in_tray == 0:
