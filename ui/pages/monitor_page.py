@@ -296,6 +296,7 @@ class MonitorPage(QWidget):
         self._record_chip = self._make_chip("录制：关闭", "#374151")
 
         self._source_combo = ComboBox()
+        self._source_signature: tuple[tuple[str, str], ...] | None = None
         self._reload_sources()
 
         # 回放速率：只在示例视频下显示。默认取 demo.speed，切换视频后沿用
@@ -588,6 +589,8 @@ class MonitorPage(QWidget):
         if station is None:
             return
         snapshot = self._service.station_snapshot(station.station_id)
+        # 画面源清单可能随配置重载变化，先重建再同步选中项。
+        self._sync_sources()
         # 画面源可能被服务层直接切换（配置重载、外部调用），下拉保持同步。
         self._sync_source_combo()
         self._update_region_cards(station, snapshot)
@@ -778,12 +781,29 @@ class MonitorPage(QWidget):
         combo = getattr(self, "_source_combo", None)
         if combo is None:
             return
+        videos = self._service.demo_videos()
         combo.blockSignals(True)
         combo.clear()
         combo.addItem("实时相机", userData=LIVE_SOURCE)
-        for video in self._service.demo_videos():
+        for video in videos:
             combo.addItem(video.name, userData=video.name)
         combo.blockSignals(False)
+        self._source_signature = tuple((v.name, v.path) for v in videos)
+
+    def _sync_sources(self) -> None:
+        """配置里的视频清单变了就重建下拉。
+
+        服务层会在配置文件被外部改动后自动重载（例如手工补上 ``demo.videos``），
+        但界面只在页面构建时读一次清单，不跟着重建的话下拉里永远是旧的几条，
+        现场会以为「配置改了没用」。清单很短，直接比较签名。
+        """
+
+        signature = tuple(
+            (v.name, v.path) for v in self._service.demo_videos()
+        )
+        if signature == getattr(self, "_source_signature", None):
+            return
+        self._reload_sources()
 
     def _select_speed(self, speed: float) -> None:
         """把速率下拉同步到给定倍数（找不到就选最接近的一项）。"""

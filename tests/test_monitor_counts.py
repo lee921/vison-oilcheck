@@ -1,8 +1,11 @@
-"""监控页「工作追踪区」卡片计数：只算区内的目标。"""
+"""监控页计数与画面源下拉。"""
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import replace
+from pathlib import Path
 
 from app.oilcheck.config import PipelineConfig, StationConfig
 from app.oilcheck.pipeline import StationPipeline
@@ -135,3 +138,95 @@ def test_raw_mode_counts_full_frame_and_says_so():
     counts, suffix = work_area_counts(station, snapshot)
     assert counts["screw"] == 1
     assert "raw_mode" in suffix
+
+
+# ----------------------------------------------------------------------
+# 画面源下拉：配置里的示例视频清单变了要跟着重建
+# ----------------------------------------------------------------------
+def test_source_combo_follows_demo_video_changes():
+    """服务层重载配置后，下拉要能出现新登记的示例视频。
+
+    清单只在页面构建时读一次的话，运行中补上 ``demo.videos`` 后界面还是旧的，
+    现场会以为「配置改了没用」。
+    """
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:  # pragma: no cover - 无 Qt 环境
+        return
+
+    from app.models import AppConfig
+    from app.oilcheck.config import DemoVideo, OilCheckConfig
+    from app.oilcheck.events import EventStore
+    from app.oilcheck.types import RecordingStatus
+    from ui.pages.monitor_page import MonitorPage
+
+    class _Service:
+        def __init__(self) -> None:
+            self.event_store = EventStore(Path(tempfile.mkdtemp()))
+            self.videos: tuple[DemoVideo, ...] = ()
+            self.config = OilCheckConfig(stations=(_station(),))
+
+        def demo_videos(self):
+            return self.videos
+
+        def stations(self):
+            return self.config.stations
+
+        def station_snapshot(self, station_id):  # noqa: ANN001, ARG002
+            return None
+
+        def camera_state(self, camera_id):  # noqa: ANN001, ARG002
+            return "missing"
+
+        def active_video(self, station_id):  # noqa: ANN001, ARG002
+            return None
+
+        def demo_speed(self):
+            return 1.0
+
+        def latest_frame(self, camera_id):  # noqa: ANN001, ARG002
+            return None
+
+        def events(self, *_args, **_kwargs):
+            return ()
+
+        def recent_events(self, *_args, **_kwargs):
+            return ()
+
+        def recording_status(self, camera_id):
+            return RecordingStatus(camera_id=camera_id, active=False)
+
+        def video_status(self, station_id):  # noqa: ANN001, ARG002
+            return {}
+
+    class _Manager:
+        def get_session(self, camera_id):  # noqa: ANN001, ARG002
+            return None
+
+    app = QApplication.instance() or QApplication([])
+    page = MonitorPage(
+        service=_Service(),
+        manager=_Manager(),
+        cfg_service=None,
+        app_cfg=AppConfig(),
+    )
+    try:
+        assert page._source_combo.count() == 1
+        # 模拟服务层重载出两条示例视频，下一次刷新就应看到它们。
+        page._service.videos = (
+            DemoVideo(name="示例①", path="data/sample_video/a.mp4"),
+            DemoVideo(name="示例②", path="data/sample_video/b.mp4"),
+        )
+        page._sync_sources()
+        assert page._source_combo.count() == 3
+        assert page._source_combo.itemText(1) == "示例①"
+
+        # 清单没变时不要反复清空重建（会打断用户当前选择）。
+        page._source_combo.setCurrentIndex(2)
+        page._sync_sources()
+        assert page._source_combo.currentIndex() == 2
+    finally:
+        page.deleteLater()
+        app.processEvents()

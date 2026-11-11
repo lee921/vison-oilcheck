@@ -39,7 +39,7 @@ from .roi import Roi
 logger = logging.getLogger("oilcheck.config")
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.5"
+_CONFIG_VERSION = "2.6"
 
 # 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
 _TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
@@ -931,6 +931,31 @@ def _unknown_keys(
     return found
 
 
+def _template_demo() -> dict[str, Any] | None:
+    """仓库模板里的 ``demo`` 段；模板缺失或不可解析时返回 None。"""
+
+    template = runtime_root() / "config" / "oilcheck.json"
+    try:
+        # 模板带注释（JSONC），不能用 json.loads 直接读。
+        tpl = load_json_with_comments(template)
+    except (OSError, ValueError):
+        return None
+    demo = tpl.get("demo") if isinstance(tpl, dict) else None
+    return demo if isinstance(demo, dict) and demo else None
+
+
+def _demo_videos_missing(demo: Any) -> bool:
+    """demo 段或其中的 videos 键是否「缺失」。
+
+    ``"videos": []`` 不算缺失：用户可以把清单清空，让下拉里只剩实时相机。
+    只有整段不在、或 videos 不是数组时才需要按模板补回来。
+    """
+
+    if not isinstance(demo, dict):
+        return True
+    return not isinstance(demo.get("videos"), list)
+
+
 @dataclass(frozen=True)
 class OilCheckConfig:
     version: str = _CONFIG_VERSION
@@ -1034,25 +1059,38 @@ class OilCheckConfigService:
         # 2.5 跟踪稳定性：锚点加绝对步长上限；关联代价门控语义对齐
         # （未进门限的代价改为 1.5，阈值 0.80 会把有效距离截到 0.667×）。
         stability_outdated = old_parts < (2, 5)
+        # 2.6 修复空示例视频清单：2.0 及更早的版本保存配置时，没有 demo 段
+        # 会被写成 "videos": []，之后按版本号补 demo 的分支不再触发，服务器
+        # 上从此一条示例视频都没有（文件里段在、视频也在，下拉里却是空的）。
+        demo_videos_outdated = old_parts < (2, 6)
 
         changed: list[str] = []
 
-        # 1) demo 段：仅对旧版本补上模板里的示例视频清单。
-        #    已是当前版本但缺 demo（例如用户主动删掉），尊重用户选择不再加回。
-        if outdated and not isinstance(data.get("demo"), dict):
-            template = runtime_root() / "config" / "oilcheck.json"
-            demo = None
-            if template.exists():
-                try:
-                    # 模板带注释（JSONC），不能用 json.loads 直接读。
-                    tpl = load_json_with_comments(template)
-                    demo = tpl.get("demo")
-                except (OSError, json.JSONDecodeError):
-                    demo = None
-            # 模板里也没有示例视频时不要凭空写一个空段，否则每次启动都会改文件。
-            if isinstance(demo, dict) and demo:
-                data["demo"] = demo
-                changed.append("demo")
+        # 1) demo 段：缺「整段」或「videos 键」时按模板补上示例视频清单。
+        #
+        #    显式写成 "videos": [] 的保持不动——那是用户主动清空，下拉里只剩
+        #    「实时相机」是预期行为。但整段/整键缺失不能补成空清单：下面第 6
+        #    步按「生效参数」补键，缺段会被补出 videos: []，现场看起来 demo
+        #    段在、视频文件也在，下拉里却一条示例都没有，日志也不报错。
+        #    这类文件多半来自早期版本的保存或手工删段，与版本号无关，所以
+        #    不再用 outdated 门控。
+        demo = data.get("demo")
+        videos = demo.get("videos") if isinstance(demo, dict) else None
+        # 升级到 2.6 时，把旧版本遗留的空清单也补回模板：那份空清单不是用户
+        # 主动清空的，是当时保存配置时凭空写出来的。
+        legacy_empty = demo_videos_outdated and videos == []
+        if _demo_videos_missing(demo) or legacy_empty:
+            template_demo = _template_demo()
+            template_videos = (
+                template_demo.get("videos") if template_demo is not None else None
+            )
+            if isinstance(template_videos, list) and template_videos:
+                if isinstance(demo, dict):
+                    demo["videos"] = template_videos
+                    changed.append("demo.videos")
+                else:
+                    data["demo"] = template_demo
+                    changed.append("demo")
 
         # 2) 工位 ROI：只保留涂油盘区，新增工作追踪区，删除旧的
         #    手持操作区/刷涂区/排除区。
@@ -1313,7 +1351,17 @@ class OilCheckConfigService:
             return OilCheckConfig()
         if not isinstance(data, dict):
             return OilCheckConfig()
-        return OilCheckConfig.from_dict(data)
+        cfg = OilCheckConfig.from_dict(data)
+        if not cfg.demo.videos:
+            # 空清单本身是合法配置（下拉只剩实时相机），但现场最常见的困惑
+            # 就在这里：文件里有 demo 段、data/sample_video 里也有视频，却
+            # 没有一条可选。启动日志里写明原因和文件路径，便于对照排查。
+            logger.warning(
+                "示例视频清单为空（demo.videos=[]）：监控页「画面源」只有实时相机。"
+                "配置文件：%s",
+                self.config_path,
+            )
+        return cfg
 
     def save(self, cfg: OilCheckConfig) -> None:
         _write_json_atomic(

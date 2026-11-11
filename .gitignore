@@ -7,8 +7,12 @@ logs/
 snapshots/
 recordings/
 data/*
-!data/sample_img/*
+# 取反要先生效在目录上：data/* 把整个 sample_video/ 排除了，只写
+# !data/sample_video/* 时目录进不来，里面的 json 元数据也加不成被跟踪文件。
+!data/sample_video/
 !data/sample_video/*
+!data/sample_img/
+!data/sample_img/*
 *.bmp
 *.mp4
 # 海康 SDK 运行时日志（含设备 IP 等现场信息）

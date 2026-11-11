@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from app.oilcheck.config import (
     OilCheckConfig,
@@ -19,8 +20,8 @@ def test_repo_oilcheck_template_is_valid():
     data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
-    assert cfg.version == "2.5"
-    assert data["version"] == "2.5"
+    assert cfg.version == "2.6"
+    assert data["version"] == "2.6"
     assert cfg.stations
     station = cfg.stations[0]
     assert station.station_id == "ST01"
@@ -197,7 +198,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.5"
+    assert cfg.version == "2.6"
     assert station.detector.kind == "yolo"
     assert station.detector.model_path.endswith("best.pt")
     assert station.detector.brush_label == "brush"
@@ -266,7 +267,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.5"
+    assert cfg.version == "2.6"
     # 用户调过的 ROI 与判定参数保留
     assert station.tray_roi.points == ((0.5, 0.1), (0.72, 0.44))
     assert station.work_roi.points == ((0.35, 0.0), (0.99, 0.95))
@@ -401,6 +402,88 @@ def test_legacy_config_gets_demo_speed(tmp_path):
     assert data["demo"]["speed"] == 0.5
 
 
+def _write_config(tmp_path: Path, mutate) -> Path:  # noqa: ANN001
+    """按仓库模板造一份运行配置，交给 ``mutate`` 改动后写进临时数据目录。"""
+
+    path = runtime_root() / "config" / "oilcheck.json"
+    data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
+    mutate(data)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    target = config_dir / "oilcheck.json"
+    target.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
+def test_missing_demo_section_is_filled_with_template_videos(tmp_path):
+    """demo 整段缺失时补回模板清单，不能补成空列表。
+
+    补成 ``videos: []`` 的文件看起来一切正常（demo 段在、视频文件也在），
+    监控页下拉里却一条示例都没有，且不报任何错——现场最难排查的一种。
+    """
+
+    from app.oilcheck.config import OilCheckConfigService
+
+    _write_config(tmp_path, lambda data: data.pop("demo"))
+    cfg = OilCheckConfigService(tmp_path).load()
+
+    assert [video.name for video in cfg.demo.videos] == [
+        "示例① 105708",
+        "示例② 140911",
+    ]
+
+
+def test_missing_videos_key_is_filled_with_template_videos(tmp_path):
+    """demo 段在、videos 键缺失（早期版本保存出来的形状）也要补回清单。"""
+
+    from app.oilcheck.config import OilCheckConfigService
+
+    _write_config(tmp_path, lambda data: data["demo"].pop("videos"))
+    cfg = OilCheckConfigService(tmp_path).load()
+
+    assert cfg.demo.videos, "缺 videos 键不应被补成空清单"
+
+
+def test_legacy_empty_videos_list_is_refilled_once(tmp_path):
+    """2.0 版本保存出来的空清单要修回来，且只改一次。
+
+    早期版本没有 demo 段时，UI 保存会把 ``videos: []`` 写进文件；之后按版本号
+    补 demo 的分支不再触发，服务器上从此一条示例视频都没有。升级到 2.6 时
+    补回模板清单——这份空清单不是用户主动清空的。
+    """
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+
+    def _make_legacy(data) -> None:  # noqa: ANN001
+        data["version"] = "2.5"
+        data["demo"]["videos"] = []
+
+    path = _write_config(tmp_path, _make_legacy)
+    cfg = OilCheckConfigService(tmp_path).load()
+    assert cfg.demo.videos, "旧版本遗留的空清单应补回模板示例视频"
+
+    # 用户之后主动清空（已是 2.6）必须保持为空，不能每次启动又加回来。
+    data = load_json_with_comments(path)
+    data["demo"]["videos"] = []
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    cfg = OilCheckConfigService(tmp_path).load()
+    assert cfg.demo.videos == ()
+    assert load_json_with_comments(path)["demo"]["videos"] == []
+
+
+def test_empty_videos_list_is_kept(tmp_path):
+    """显式写成 ``videos: []`` 是用户主动清空，迁移不能改回去。"""
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+
+    path = _write_config(tmp_path, lambda data: data["demo"].__setitem__("videos", []))
+    cfg = OilCheckConfigService(tmp_path).load()
+
+    assert cfg.demo.videos == ()
+    assert load_json_with_comments(path)["demo"]["videos"] == []
+
+
 # ----------------------------------------------------------------------
 # 配置注释（JSONC）
 # ----------------------------------------------------------------------
@@ -430,7 +513,7 @@ def test_repo_template_is_commented():
     text = path.read_text(encoding="utf-8")
     assert "//" in text, "模板应带注释"
     # 注释不破坏可解析性
-    assert json.loads(strip_json_comments(text))["version"] == "2.5"
+    assert json.loads(strip_json_comments(text))["version"] == "2.6"
 
 
 def test_save_preserves_comments(tmp_path):
