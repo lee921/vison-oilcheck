@@ -484,6 +484,65 @@ def test_empty_videos_list_is_kept(tmp_path):
     assert load_json_with_comments(path)["demo"]["videos"] == []
 
 
+def test_legacy_screw_label_is_migrated(tmp_path):
+    """旧类别名 rod 必须纠正成模型实际输出的 screw。
+
+    模型输出 hand / brush / oil_station / screw。配置里若还是 1.0 时代的
+    ``rod``，这类检测会被判定侧当作未配置类别整批丢掉——画面上的框照常
+    显示（用的模型输出标签），但取料/涂油一个事件都产生不了。迁移只纠正
+    ``tray_label`` / ``brush_label`` 时，服务器上就会是这个症状。
+    """
+
+    from app.oilcheck.config import OilCheckConfigService
+
+    def _legacy_rod(data) -> None:  # noqa: ANN001
+        data["stations"][0]["detector"]["screw_label"] = "rod"
+
+    _write_config(tmp_path, _legacy_rod)
+    cfg = OilCheckConfigService(tmp_path).load()
+    assert cfg.stations[0].detector.screw_label == "screw"
+
+    # 用户自己改过的、非旧默认值的类别名要保持不动。
+    tmp2 = tmp_path / "keep"
+    tmp2.mkdir()
+
+    def _custom(data) -> None:  # noqa: ANN001
+        data["stations"][0]["detector"]["screw_label"] = "my_screw"
+
+    _write_config(tmp2, _custom)
+    cfg = OilCheckConfigService(tmp2).load()
+    assert cfg.stations[0].detector.screw_label == "my_screw"
+
+
+def test_legacy_rod_label_field_is_migrated(tmp_path):
+    """1.0 配置只有 rod_label 字段，迁移后要变成 screw 而不是 rod。"""
+
+    from app.oilcheck.config import OilCheckConfigService
+
+    legacy = {
+        "version": "1.0",
+        "stations": [
+            {
+                "station_id": "ST01",
+                "name": "1号取料工位",
+                "camera_id": "cam_6ca47a",
+                "enabled": True,
+                "tray_roi": {"kind": "rect", "points": [[0.54, 0.01], [0.66, 0.39]]},
+                "hand_roi": {"kind": "rect", "points": [[0.36, 0.008], [0.879, 0.998]]},
+                "detector": {"kind": "yolo", "rod_label": "rod"},
+            }
+        ],
+    }
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "oilcheck.json").write_text(
+        json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+    )
+
+    cfg = OilCheckConfigService(tmp_path).load()
+    assert cfg.stations[0].detector.screw_label == "screw"
+
+
 # ----------------------------------------------------------------------
 # 配置注释（JSONC）
 # ----------------------------------------------------------------------

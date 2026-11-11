@@ -70,6 +70,8 @@ def main() -> int:
         det = station.detector
         print(f"    检测器 kind={det.kind} conf={det.confidence} raw_mode={det.raw_mode}")
         print(f"    model_path={det.model_path} device={det.device}")
+        print(f"    类别名: screw={det.screw_label!r} hand={det.hand_label!r} "
+              f"brush={det.brush_label!r} tray={det.tray_label!r}")
 
     _hr("2) 关键判定参数")
     pipe = cfg.pipeline
@@ -108,6 +110,21 @@ def main() -> int:
     station = cfg.enabled_stations()[0]
     events: list = []
     detector = create_detector(station)
+    class_names = getattr(detector, "class_names", None) or {}
+    if class_names:
+        print("模型输出的类别:", class_names)
+        configured = {
+            "screw": station.detector.screw_label,
+            "hand": station.detector.hand_label,
+            "brush": station.detector.brush_label,
+            "tray": station.detector.tray_label,
+        }
+        known = set(class_names.values())
+        missing = {k: v for k, v in configured.items() if v not in known}
+        if missing:
+            print("!! 配置的类别名与模型输出不一致 ->", missing)
+            print("!! 这些类别的检测会被全部过滤掉，判定不可能产生事件。")
+            print("!! 模型实际输出:", sorted(known))
     print("检测器:", getattr(detector, "name", "?"),
           "device=", getattr(detector, "device", "?"),
           "imgsz=", getattr(detector, "imgsz", "?"))

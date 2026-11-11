@@ -130,6 +130,8 @@ _DETECTOR_DEFAULTS_2_1: dict[str, Any] = {
     "raw_mode": False,
     "brush_label": "brush",
     "tray_label": "oil_station",
+    # 旧配置里的 rod_label / screw_rod 会迁移成这个值。
+    "screw_label": "screw",
 }
 
 
@@ -1242,16 +1244,24 @@ class OilCheckConfigService:
                     changed.append(f"detector.{key}")
 
             # 旧类别名与训练模型（0=hand 1=brush 2=oil_station 3=screw）
-            # 不一致，模型只输出 oil_station，配置成 oil_tray 会一个盘体都匹配不到。
-            if outdated:
-                legacy_labels = {
-                    "tray_label": "oil_tray",
-                    "brush_label": "brush_head",
-                }
-                for key, legacy in legacy_labels.items():
-                    if str(detector.get(key, "")).strip() == legacy:
-                        detector[key] = _DETECTOR_DEFAULTS_2_1[key]
-                        changed.append(f"detector.{key}")
+            # 不一致：模型只输出 oil_station / screw，配置成 oil_tray / rod
+            # 会整整一类目标都匹配不到。不看版本号——这类旧值可能已经跟着
+            # 配置一路升到了 2.6（老字段改过名，但值从没被纠正过），按版本号
+            # 判断会永远漏掉；只在值确实还是旧名时才改，不会反复改写文件。
+            #
+            # 症状很隐蔽：画面上的检测框照常显示（那用的是模型输出的标签），
+            # 但判定侧按配置里的类别名过滤，这类目标全部被当成"未配置类别"
+            # 丢掉，取料/涂油一个事件都产生不了。
+            legacy_labels = {
+                "tray_label": ("oil_tray", "tray"),
+                "brush_label": ("brush_head",),
+                "screw_label": ("rod", "screw_rod", "screw_rod_head"),
+            }
+            for key, legacy_values in legacy_labels.items():
+                current = str(detector.get(key, "")).strip()
+                if current in legacy_values:
+                    detector[key] = _DETECTOR_DEFAULTS_2_1[key]
+                    changed.append(f"detector.{key}")
 
         # 6) 键集合同步：代码里有默认值、文件里缺的键补写回去，让「配置文件
         #    里看到的键」和「实际生效的参数」一致。只补不删、不改已有值——
