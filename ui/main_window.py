@@ -69,7 +69,7 @@ class MainWindow(FluentWindow):
             on_saved=self._on_settings_saved,
             on_oilcheck_saved=self._on_oilcheck_saved,
         )
-        log_dir = (self._cfg_service.repo_root / self._app_cfg.log_dir).resolve()
+        log_dir = (self._cfg_service.data_root / self._app_cfg.log_dir).resolve()
         self._logs_page = LogsPage(store=log_store, log_dir=log_dir)
 
         self.addSubInterface(
@@ -131,7 +131,7 @@ class MainWindow(FluentWindow):
         self._monitor_page.set_app_config(app_cfg)
         self._settings_page.set_app_config(app_cfg)
         self._logs_page.set_log_dir(
-            (self._cfg_service.repo_root / app_cfg.log_dir).resolve()
+            (self._cfg_service.data_root / app_cfg.log_dir).resolve()
         )
 
     def _on_oilcheck_saved(self, cfg: OilCheckConfig) -> None:

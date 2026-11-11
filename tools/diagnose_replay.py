@@ -23,7 +23,7 @@ from app.oilcheck.config import OilCheckConfigService  # noqa: E402
 from app.oilcheck.detector import create_detector  # noqa: E402
 from app.oilcheck.pipeline import StationPipeline  # noqa: E402
 from app.oilcheck.roi import Roi  # noqa: E402
-from app.paths import data_root, resolve_runtime_file, runtime_root  # noqa: E402
+from app.paths import resolve_runtime_file, runtime_root  # noqa: E402
 
 
 def _hr(title: str) -> None:
@@ -43,7 +43,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    service = OilCheckConfigService(data_root())
+    service = OilCheckConfigService()
     # 只读：不走 ensure_defaults()，避免诊断动作触发配置迁移/写回。
     cfg = service.load(create_if_missing=False)
     info = service.source_info()
@@ -58,7 +58,7 @@ def main() -> int:
 
     _hr("1) 生效配置")
     print("配置文件:", info["path"])
-    print("数据目录:", info["data_root"])
+    print("配置目录:", info["config_dir"])
     print("仓库模板:", info["template"])
     print("配置版本:", cfg.version)
     print("工位数:", len(cfg.enabled_stations()))

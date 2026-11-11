@@ -10,22 +10,47 @@ from dataclasses import replace
 from pathlib import Path
 
 from .models import AppConfig, CameraConfig
-from .paths import data_root, runtime_root
+from .paths import config_root, data_root, runtime_root
 
 logger = logging.getLogger("oilcheck.config")
 
 
 class ConfigService:
-    def __init__(self, repo_root: Path | None = None) -> None:
-        self._repo_root = (repo_root or data_root()).resolve()
+    """读写仓库 ``config/`` 下的 app.json / cameras.json。
+
+    配置目录（``config_dir``）与运行数据目录（``data_root``）是两个概念：
+    前者固定在仓库里，UI 改的值、代码读的值、仓库里的文件永远是同一份；
+    后者只放日志、截图、事件、训练录制。
+    """
+
+    def __init__(
+        self,
+        repo_root: Path | None = None,
+        *,
+        storage_root: Path | None = None,
+    ) -> None:
+        if repo_root is None:
+            self._config_dir = config_root()
+            self._data_root = (storage_root or data_root()).resolve()
+        else:
+            # 显式传入 repo_root 时沿用旧语义：它同时是配置根与数据根。
+            # 测试与离线工具靠这个指向临时目录。
+            self._config_dir = (Path(repo_root) / "config").resolve()
+            self._data_root = Path(repo_root).resolve()
 
     @property
     def repo_root(self) -> Path:
-        return self._repo_root
+        """运行数据目录。保留旧名字，避免 UI 侧大改。"""
+
+        return self._data_root
+
+    @property
+    def data_root(self) -> Path:
+        return self._data_root
 
     @property
     def config_dir(self) -> Path:
-        return self._repo_root / "config"
+        return self._config_dir
 
     @property
     def app_config_path(self) -> Path:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from app.oilcheck.config import (
@@ -194,7 +196,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
 
     from app.oilcheck.config import OilCheckConfigService
 
-    service = OilCheckConfigService(tmp_path)
+    service = OilCheckConfigService(tmp_path / "config")
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
@@ -263,7 +265,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
 
     from app.oilcheck.config import OilCheckConfigService
 
-    service = OilCheckConfigService(tmp_path)
+    service = OilCheckConfigService(tmp_path / "config")
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
@@ -315,14 +317,14 @@ def test_migration_is_idempotent(tmp_path):
     )
     from app.oilcheck.config import OilCheckConfigService
 
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
     first = path.read_bytes()
     # 缺键已补齐
     assert (config_dir / "oilcheck.json.bak").exists()
 
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
     assert path.read_bytes() == first, "第二次加载不应再改写配置"
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
     assert path.read_bytes() == first, "第三次加载不应再改写配置"
 
 
@@ -352,7 +354,7 @@ def test_explicit_cpu_device_is_kept(tmp_path):
     )
     from app.oilcheck.config import OilCheckConfigService
 
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
     assert cfg.enabled_stations()[0].detector.device == "cpu"
 
 
@@ -386,7 +388,7 @@ def test_legacy_config_gets_demo_speed(tmp_path):
     )
     from app.oilcheck.config import OilCheckConfigService
 
-    service = OilCheckConfigService(tmp_path)
+    service = OilCheckConfigService(tmp_path / "config")
     service.load()
     data = json.loads(
         strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
@@ -425,7 +427,7 @@ def test_missing_demo_section_is_filled_with_template_videos(tmp_path):
     from app.oilcheck.config import OilCheckConfigService
 
     _write_config(tmp_path, lambda data: data.pop("demo"))
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
 
     assert [video.name for video in cfg.demo.videos] == [
         "示例① 105708",
@@ -439,7 +441,7 @@ def test_missing_videos_key_is_filled_with_template_videos(tmp_path):
     from app.oilcheck.config import OilCheckConfigService
 
     _write_config(tmp_path, lambda data: data["demo"].pop("videos"))
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
 
     assert cfg.demo.videos, "缺 videos 键不应被补成空清单"
 
@@ -459,7 +461,7 @@ def test_legacy_empty_videos_list_is_refilled_once(tmp_path):
         data["demo"]["videos"] = []
 
     path = _write_config(tmp_path, _make_legacy)
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
     assert cfg.demo.videos, "旧版本遗留的空清单应补回模板示例视频"
 
     # 用户之后主动清空（已是 2.6）必须保持为空，不能每次启动又加回来。
@@ -467,7 +469,7 @@ def test_legacy_empty_videos_list_is_refilled_once(tmp_path):
     data["demo"]["videos"] = []
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
     assert cfg.demo.videos == ()
     assert load_json_with_comments(path)["demo"]["videos"] == []
 
@@ -478,7 +480,7 @@ def test_empty_videos_list_is_kept(tmp_path):
     from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
 
     path = _write_config(tmp_path, lambda data: data["demo"].__setitem__("videos", []))
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
 
     assert cfg.demo.videos == ()
     assert load_json_with_comments(path)["demo"]["videos"] == []
@@ -499,7 +501,7 @@ def test_legacy_screw_label_is_migrated(tmp_path):
         data["stations"][0]["detector"]["screw_label"] = "rod"
 
     _write_config(tmp_path, _legacy_rod)
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
     assert cfg.stations[0].detector.screw_label == "screw"
 
     # 用户自己改过的、非旧默认值的类别名要保持不动。
@@ -510,7 +512,7 @@ def test_legacy_screw_label_is_migrated(tmp_path):
         data["stations"][0]["detector"]["screw_label"] = "my_screw"
 
     _write_config(tmp2, _custom)
-    cfg = OilCheckConfigService(tmp2).load()
+    cfg = OilCheckConfigService(tmp2 / "config").load()
     assert cfg.stations[0].detector.screw_label == "my_screw"
 
 
@@ -539,8 +541,70 @@ def test_legacy_rod_label_field_is_migrated(tmp_path):
         json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
     )
 
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
     assert cfg.stations[0].detector.screw_label == "screw"
+
+
+def test_config_dir_is_the_repo_config_by_default(monkeypatch, tmp_path):
+    """不传参时读写仓库的 config/，不是数据目录下的副本。
+
+    UI 保存的位置、判定读取的位置、仓库里的文件必须是同一份；否则现场会
+    遇到「改了配置不生效」「两份文件不一致」这类问题。
+    """
+
+    from app.oilcheck.config import OilCheckConfigService
+    from app.paths import config_root, runtime_root
+
+    monkeypatch.delenv("OILCHECK_CONFIG_ROOT", raising=False)
+    service = OilCheckConfigService()
+    assert service.config_dir == runtime_root() / "config"
+    assert service.config_path == config_root() / "oilcheck.json"
+
+    monkeypatch.setenv("OILCHECK_CONFIG_ROOT", str(tmp_path / "cfg"))
+    overridden = OilCheckConfigService()
+    assert overridden.config_dir == (tmp_path / "cfg").resolve()
+
+
+def test_ui_save_and_pipeline_read_the_same_file(monkeypatch, tmp_path):
+    """UI 保存的值 = 仓库 config 文件里的值 = 判定管线手里的值。"""
+
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
+    from app.oilcheck.pipeline import StationPipeline
+    from app.oilcheck.roi import Roi
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    template = runtime_root() / "config" / "oilcheck.json"
+    shutil.copy2(template, config_dir / "oilcheck.json")
+
+    service = OilCheckConfigService(config_dir)
+    cfg = service.load()
+    station = cfg.stations[0]
+
+    new_roi = Roi.from_dict({"kind": "rect", "points": [[0.11, 0.12], [0.31, 0.62]]})
+    assert new_roi is not None
+    updated = replace(station, tray_roi=new_roi)
+    service.save(
+        replace(
+            cfg,
+            stations=tuple(
+                updated if s.station_id == station.station_id else s
+                for s in cfg.stations
+            ),
+        )
+    )
+
+    # 文件里
+    on_disk = load_json_with_comments(service.config_path)["stations"][0]
+    assert on_disk["tray_roi"]["points"] == [[0.11, 0.12], [0.31, 0.62]]
+
+    # 管线里（reload 用的就是 service.load() 的结果）
+    pipeline = StationPipeline(
+        station=service.load().stations[0],
+        pipeline_cfg=cfg.pipeline,
+        detector_name="null",
+    )
+    assert pipeline.station.tray_roi.points == ((0.11, 0.12), (0.31, 0.62))
 
 
 # ----------------------------------------------------------------------
@@ -580,7 +644,7 @@ def test_save_preserves_comments(tmp_path):
 
     from app.oilcheck.config import CONFIG_COMMENTS, OilCheckConfigService
 
-    svc = OilCheckConfigService(tmp_path)
+    svc = OilCheckConfigService(tmp_path / "config")
     cfg = svc.load()
     svc.save(cfg)
 
@@ -656,7 +720,7 @@ def test_missing_keys_are_written_back_to_the_config_file(tmp_path):
         encoding="utf-8",
     )
 
-    cfg = OilCheckConfigService(tmp_path).load()
+    cfg = OilCheckConfigService(tmp_path / "config").load()
     data = load_json_with_comments(path)
 
     # 文件里的键集合 == 实际生效的参数集合（工位按 station_id 对齐）。
@@ -703,7 +767,7 @@ def test_key_sync_never_touches_field_values_or_rois(tmp_path):
     }
     path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
 
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
     data = load_json_with_comments(path)
 
     station = data["stations"][0]
@@ -734,7 +798,7 @@ def test_unknown_keys_are_kept(tmp_path):
         encoding="utf-8",
     )
 
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
     data = load_json_with_comments(path)
     assert data["pipeline"]["field_tuned_note"] == "现场手记"
 
@@ -767,7 +831,7 @@ def test_key_sync_pairs_stations_by_id_not_index(tmp_path):
         encoding="utf-8",
     )
 
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
     data = load_json_with_comments(path)
     broken, station = data["stations"]
 
@@ -813,7 +877,7 @@ def test_runtime_config_and_template_differ_only_in_values(tmp_path):
     (config_dir / "oilcheck.json").write_text(
         add_json_comments(template, CONFIG_COMMENTS) + "\n", encoding="utf-8"
     )
-    OilCheckConfigService(tmp_path).load()
+    OilCheckConfigService(tmp_path / "config").load()
 
     actual = (config_dir / "oilcheck.json").read_text(encoding="utf-8").splitlines()
     assert actual == expected
@@ -838,22 +902,22 @@ def test_source_info_points_at_the_data_directory_file(tmp_path):
         json.dumps({"version": "2.5", "stations": []}), encoding="utf-8"
     )
 
-    service = OilCheckConfigService(tmp_path)
+    service = OilCheckConfigService(tmp_path / "config")
     service.load()
     info = service.source_info()
 
     assert info["path"] == str(config_dir / "oilcheck.json")
-    assert info["data_root"] == str(tmp_path.resolve())
+    assert info["config_dir"] == str(config_dir.resolve())
     assert info["exists"] is True
     assert info["mtime"] is not None
     assert info["template"] == str(runtime_root() / "config" / "oilcheck.json")
-    # 数据目录不在仓库里时，两者绝不是同一个文件。
+    # 指向临时目录时，与仓库模板绝不是同一个文件。
     assert info["same_as_template"] is False
 
 
 def test_source_info_reports_missing_file(tmp_path):
     from app.oilcheck.config import OilCheckConfigService
 
-    info = OilCheckConfigService(tmp_path).source_info()
+    info = OilCheckConfigService(tmp_path / "config").source_info()
     assert info["exists"] is False
     assert info["mtime"] is None

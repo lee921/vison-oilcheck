@@ -59,7 +59,7 @@ def _make_service(tmp_path: Path) -> tuple[OilCheckService, Path]:
         ),
         encoding="utf-8",
     )
-    service = OilCheckConfigService(tmp_path)
+    service = OilCheckConfigService(tmp_path / "config")
     cfg = service.load()
     oil_service = OilCheckService(
         manager=_FakeManager(),

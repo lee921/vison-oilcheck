@@ -44,6 +44,26 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"))
 
 
+def config_root() -> Path:
+    """返回配置文件目录：仓库根下的 ``config/``。
+
+    配置（app.json / cameras.json / oilcheck.json）固定放在仓库的 ``config/``，
+    与代码同处一个检出里：UI 里改的值、判定实际读的值、仓库里的文件三者
+    永远是同一份。日志、事件、截图、训练录制等运行数据仍写在
+    :func:`data_root`，不随配置走。
+
+    覆盖：设置 ``OILCHECK_CONFIG_ROOT``（支持绝对或相对路径）。测试与
+    离线工具用它指向临时目录。
+    """
+    override = os.environ.get("OILCHECK_CONFIG_ROOT")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve()
+    return runtime_root() / "config"
+
+
 def user_data_root(app_name: str = "OilCheckData") -> Path:
     """返回用户级持久化数据目录。
 
@@ -54,7 +74,9 @@ def user_data_root(app_name: str = "OilCheckData") -> Path:
 
 
 def data_root(app_name: str = "OilCheckData") -> Path:
-    """返回配置/日志/截图/事件的持久化根目录。
+    """返回日志/截图/事件/录制等运行数据的持久化根目录。
+
+    注意：**配置不在这里**，见 :func:`config_root`。
 
     默认：用户级数据目录（开发运行也使用该路径）。
     覆盖：设置 `OILCHECK_DATA_ROOT`（支持绝对或相对路径）。

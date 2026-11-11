@@ -928,7 +928,7 @@ class MonitorPage(QWidget):
         if session is None:
             return
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = (self._cfg_service.repo_root / self._app_cfg.snapshot_dir).resolve()
+        out_dir = (self._cfg_service.data_root / self._app_cfg.snapshot_dir).resolve()
         out_path = out_dir / f"{station.camera_id}_{stamp}.bmp"
         try:
             session.snapshot(out_path)

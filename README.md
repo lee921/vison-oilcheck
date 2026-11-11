@@ -27,13 +27,16 @@ uv sync
 uv run python main.py
 ```
 
-首次运行会在用户主目录下创建统一的数据目录：
+**配置只有一份，在仓库的 `config/` 下**（`app.json`、`cameras.json`、
+`oilcheck.json`）。UI 里保存的值、判定实际读取的值、仓库里的文件是同一个文件，
+不会出现「改了没生效」或两份配置不一致。
+
+运行数据（日志、截图、事件、训练录制）在用户主目录：
 
 - 所有平台：`~/OilCheckData/`（Windows 为 `%USERPROFILE%\OilCheckData\`）
-- 配置、日志、截图、事件、训练录制都放在这里，便于备份和迁移
-- 可用 `OILCHECK_DATA_ROOT` 覆盖
+- 可用 `OILCHECK_DATA_ROOT` 覆盖；配置目录可用 `OILCHECK_CONFIG_ROOT` 覆盖
 
-如需把配置/日志/事件/录制写回仓库目录：
+如需把运行数据也放进仓库目录：
 
 ```bash
 OILCHECK_DATA_ROOT=$(pwd) uv run python main.py
@@ -49,7 +52,7 @@ app/oilcheck/video_source.py  示例视频帧源（回放 mp4，按视频节拍�
 app/camera_manager.py  相机会话与重连
 hik/                   海康 SDK 封装
 ui/pages/              监控、复核、训练录制、设备、设置、日志页面
-config/                配置模板（复制到数据目录后生效）
+config/                配置文件（唯一一份，UI 与判定都读写这里）
 docs/                  各模块设计/使用文档（必读）
 tests/                 取料/涂油判定、关联、跟踪、事件、配置单元测试
 tools/detect_video.py  离线跑示例视频，输出带框视频与逐帧检测 JSONL

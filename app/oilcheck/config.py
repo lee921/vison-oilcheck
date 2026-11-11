@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.paths import runtime_root
+from app.paths import config_root, runtime_root
 
 from .roi import Roi
 
@@ -1003,14 +1003,21 @@ class OilCheckConfig:
 
 
 class OilCheckConfigService:
-    """读写 ``<数据目录>/config/oilcheck.json``。"""
+    """读写 ``<仓库>/config/oilcheck.json``。
 
-    def __init__(self, data_root: Path) -> None:
-        self._data_root = Path(data_root).resolve()
+    配置固定在仓库的 ``config/`` 里，不再复制到数据目录：UI 保存的值、
+    判定实际读的值、仓库里的文件是同一份，不会再出现「改了仓库配置不
+    生效」或「数据目录那份和仓库那份不一致」。
+    """
+
+    def __init__(self, config_dir: Path | None = None) -> None:
+        # 生产路径不传参：读取仓库的 config/（见 app.paths.config_root）。
+        # 测试与离线工具显式传入临时目录。
+        self._config_dir = Path(config_dir).resolve() if config_dir else config_root()
 
     @property
     def config_dir(self) -> Path:
-        return self._data_root / "config"
+        return self._config_dir
 
     @property
     def config_path(self) -> Path:
@@ -1318,9 +1325,8 @@ class OilCheckConfigService:
     def source_info(self) -> dict[str, Any]:
         """当前生效配置文件的位置与状态，供 UI/日志核对。
 
-        配置只在首次运行时从模板复制，之后一直读数据目录里的那份。现场最
-        常见的误判是「改了仓库模板却不生效」——把实际路径亮出来，比解释
-        规则更有用。
+        配置就在仓库的 ``config/`` 下，UI 保存与代码读取都是这一份。
+        路径仍亮出来，便于现场确认程序确实读的是这个检出里的文件。
         """
 
         template = runtime_root() / "config" / "oilcheck.json"
@@ -1328,7 +1334,7 @@ class OilCheckConfigService:
             "path": str(self.config_path),
             "exists": self.config_path.exists(),
             "template": str(template),
-            "data_root": str(self._data_root),
+            "config_dir": str(self.config_dir),
             "mtime": None,
             "size": None,
             "same_as_template": False,

@@ -22,7 +22,9 @@ APP_NAME = "oilcheck"
 def main() -> int:
     app_root = runtime_root()
     storage_root = data_root()
-    cfg_service = ConfigService(repo_root=storage_root)
+    # 配置固定在仓库的 config/（见 app.paths.config_root），运行数据仍在
+    # storage_root：日志、事件、截图、训练录制不随代码检出走。
+    cfg_service = ConfigService(storage_root=storage_root)
     cfg_service.ensure_defaults()
     app_cfg = cfg_service.load_app_config()
 
@@ -41,7 +43,7 @@ def main() -> int:
         sdk_ctx=sdk_ctx, cfg_service=cfg_service, app_cfg=app_cfg, logger=logger
     )
 
-    oil_cfg_service = OilCheckConfigService(storage_root)
+    oil_cfg_service = OilCheckConfigService()
     oil_cfg_service.ensure_defaults()
     oil_cfg = oil_cfg_service.load()
 

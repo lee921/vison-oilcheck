@@ -26,7 +26,7 @@ import cv2  # noqa: E402
 
 from app.oilcheck.config import DetectorConfig, OilCheckConfigService  # noqa: E402
 from app.oilcheck.detector import YoloDetector  # noqa: E402
-from app.paths import data_root, resolve_runtime_file, runtime_root  # noqa: E402
+from app.paths import resolve_runtime_file, runtime_root  # noqa: E402
 
 COLORS = {
     "hand": (10, 159, 255),
@@ -174,11 +174,11 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="每段视频最多处理帧数")
     parser.add_argument("--out", default="", help="输出目录")
     parser.add_argument(
-        "--config", default="", help="配置文件路径（默认数据目录下的 oilcheck.json）"
+        "--config", default="", help="配置目录（默认仓库 config/）"
     )
     args = parser.parse_args()
 
-    cfg_service = OilCheckConfigService(Path(args.config) if args.config else data_root())
+    cfg_service = OilCheckConfigService(Path(args.config) if args.config else None)
     cfg = cfg_service.load()
     station = cfg.enabled_stations()[0] if cfg.stations else None
     if station is None:

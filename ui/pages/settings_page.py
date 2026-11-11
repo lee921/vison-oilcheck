@@ -297,9 +297,9 @@ class SettingsPage(QWidget):
     def _update_config_source(self) -> None:
         """把实际生效的配置文件路径写进按钮提示。
 
-        配置只在首次运行时从仓库模板复制，之后一直读数据目录那份；改仓库
-        里的模板不会生效。这条信息不放版面上（不需要常看），放在「打开 ROI
-        标定」的悬停提示里，排查时移上去就能看到。
+        配置固定在仓库的 ``config/`` 下，UI 保存的位置就是判定读取的位置。
+        这条信息不放版面上（不需要常看），放在「打开 ROI 标定」的悬停提示里，
+        排查时移上去就能看到。
         """
 
         info = self._oil_cfg_service.source_info()
@@ -311,7 +311,7 @@ class SettingsPage(QWidget):
         self._btn_roi.setToolTip(
             f"生效配置：{info['path']}\n"
             f"修改时间：{stamp}\n"
-            f"数据目录：{info['data_root']}"
+            f"配置目录：{info.get('config_dir', '-')}"
         )
 
     def _open_roi_calibration(self) -> None:
