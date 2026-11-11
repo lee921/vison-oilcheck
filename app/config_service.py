@@ -3,14 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import tempfile
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 
 from .models import AppConfig, CameraConfig
-from .paths import config_root, data_root, runtime_root
+from .paths import config_root, data_root
 
 logger = logging.getLogger("oilcheck.config")
 
@@ -63,7 +62,7 @@ class ConfigService:
     def ensure_defaults(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
-        self._copy_missing_templates()
+        self._warn_orphaned_data_config()
 
         if not self.app_config_path.exists():
             self.save_app_config(AppConfig(layout=1, snapshot_dir="snapshots"))
@@ -93,25 +92,37 @@ class ConfigService:
                 ]
             )
 
-    def _copy_missing_templates(self) -> None:
-        template_dir = runtime_root() / "config"
-        if (
-            not template_dir.exists()
-            or template_dir.resolve() == self.config_dir.resolve()
-        ):
-            return
+    def _warn_orphaned_data_config(self) -> None:
+        """配置已挪到仓库 config/；数据目录里若还留着旧配置，提醒一次。
 
-        for name in ("app.json", "cameras.json", "oilcheck.json"):
-            self._copy_if_missing(template_dir / name, self.config_dir / name)
+        旧版本把 app.json / cameras.json / oilcheck.json 写在数据目录，升级后
+        程序只读仓库 config/，数据目录那份不再生效。现场最容易踩的坑是：
+        相机 IP、账号、ROI 都在旧文件里，升级后读的是仓库里的模板默认值，
+        表现为「相机突然连不上」「ROI 全变了」，但配置文件看上去「还在」。
+        """
 
-    @staticmethod
-    def _copy_if_missing(src: Path, dst: Path) -> None:
-        if dst.exists() or not src.exists():
-            return
+        orphan_dir = self.data_root / "config"
         try:
-            shutil.copy2(src, dst)
-        except Exception as e:
-            logger.warning("复制默认配置失败 (%s -> %s): %s", src, dst, e)
+            if orphan_dir.resolve() == self.config_dir.resolve():
+                return
+        except OSError:
+            return
+        stale = [
+            name
+            for name in ("app.json", "cameras.json", "oilcheck.json")
+            if (orphan_dir / name).exists()
+        ]
+        if not stale:
+            return
+        logger.warning(
+            "数据目录里发现旧配置，已不再生效：%s（%s）。"
+            "配置现在只读写仓库 config/：%s。若其中的相机/ROI 需要保留，"
+            "请把对应文件拷到 %s 后重启。",
+            orphan_dir,
+            ", ".join(stale),
+            self.config_dir,
+            self.config_dir,
+        )
 
     def load_app_config(self, *, create_if_missing: bool = False) -> AppConfig:
         if create_if_missing:

@@ -545,6 +545,27 @@ def test_legacy_rod_label_field_is_migrated(tmp_path):
     assert cfg.stations[0].detector.screw_label == "screw"
 
 
+def test_orphaned_data_config_is_reported(tmp_path, caplog):
+    """数据目录里遗留旧配置时要在日志里点名，别让现场以为配置还在生效。"""
+
+    from app.config_service import ConfigService
+
+    data_dir = tmp_path / "data"
+    (data_dir / "config").mkdir(parents=True)
+    (data_dir / "config" / "cameras.json").write_text("[]", encoding="utf-8")
+
+    # repo_root 显式传入时配置目录是 <repo>/config，与 data_dir/config 不同，
+    # 正好复刻「升级前配置在数据目录」的现场布局。
+    service = ConfigService(repo_root=tmp_path / "repo")
+    service._data_root = data_dir  # 运行数据根指向带旧配置的目录
+
+    with caplog.at_level("WARNING"):
+        service.ensure_defaults()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("已不再生效" in msg and "cameras.json" in msg for msg in messages)
+
+
 def test_config_dir_is_the_repo_config_by_default(monkeypatch, tmp_path):
     """不传参时读写仓库的 config/，不是数据目录下的副本。
 
