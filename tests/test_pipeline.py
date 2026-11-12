@@ -286,6 +286,130 @@ def test_empty_hand_in_then_leaving_with_screw_emits_pick_once():
     assert "SCREW_LEFT_TRAY_WITH_HAND" in task.evidence
 
 
+def test_grip_detected_when_screw_sticks_out_of_hand_corner():
+    """杆从手框右上角伸出、杆心已在手框外：仍要判成「握着」，取料不能丢。
+
+    实际握姿是拳头攥住杆身，杆从虎口伸出——杆心落在手框外、IoU 也上不去
+    （丝杆面积只有手框的一小部分，IoU 的结构上限就是面积比）。示例③在
+    60 帧附近的取料就是因为只认「杆心在手框内 / IoU ≥ 0.15」而整件漏掉。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    def corner_held(cx: float, cy: float) -> Detection:
+        """杆横着从手框右上角伸出去：杆心在手框右侧外，杆尾压在手框右上区。"""
+
+        return Detection(
+            label="screw",
+            confidence=0.88,
+            box=BBox(cx + 10, cy - 45, cx + 110, cy - 20),
+            angle=0.0,
+        )
+
+    outside = (350.0, 650.0)
+    # 盘外空手走几帧，确立「进盘时是空手」。
+    for step in range(3):
+        feed(pipeline, next(ts_iter), hand_at(outside[0] - step * 10, outside[1]))
+    # 空手进盘。
+    for step in range(5):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(ENTRY_HAND[0] - step * 20, ENTRY_HAND[1] - step * 10),
+            screw_at(*TRAY_SCREW),
+        )
+    # 带料离盘：杆从手框右上角伸出去。
+    for step in range(1, 6):
+        t = step / 5
+        cx = ENTRY_HAND[0] - 40 + (outside[0] - ENTRY_HAND[0] + 40) * t
+        cy = ENTRY_HAND[1] - 20 + (outside[1] - ENTRY_HAND[1] + 20) * t
+        feed(pipeline, next(ts_iter), hand_at(cx, cy), corner_held(cx, cy), screw_at(*TRAY_SCREW))
+    for _ in range(4):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*outside),
+            corner_held(*outside),
+            screw_at(*TRAY_SCREW),
+        )
+
+    assert [e for e in events if e.event_type == EventType.PICK], "杆从虎口伸出时取料被判丢了"
+
+
+def test_parked_screw_in_tray_does_not_count_as_grip_after_exit():
+    """空手离盘、盘里的静置杆恰好落在手框右上区：不能算「带料离盘」。
+
+    涂油盘区（夹具）是 x 400–600、y 20–520。手从盘沿退到 y=530 时，盘里
+    那根静置杆（杆心仍 y<520）正好横在手框右上角区域里。若握持判据不排除
+    盘内的杆，这次空手离盘会被判成「带料离盘」，凭空多一件取料。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    # 盘内静置杆：杆心 (560, 497) 在涂油盘区内，杆身在手的右上角区域里。
+    parked = Detection(
+        label="screw",
+        confidence=0.9,
+        box=BBox(520.0, 485.0, 600.0, 509.0),
+        angle=0.0,
+    )
+
+    # 盘外空手走近盘边。
+    for step in range(3):
+        feed(pipeline, next(ts_iter), hand_at(350.0, 700.0 - step * 30))
+    # 空手进盘并停留（满足 pick_confirm_s）。
+    for step in range(5):
+        feed(pipeline, next(ts_iter), hand_at(ENTRY_HAND[0], ENTRY_HAND[1] - step * 6), parked)
+    # 空手退到盘沿外（盘区到 y=520，这里停在 530）。
+    for _ in range(8):
+        feed(pipeline, next(ts_iter), hand_at(ENTRY_HAND[0], 530.0), parked)
+
+    assert [e for e in events if e.event_type == EventType.PICK] == []
+
+
+def test_parked_screw_in_tray_does_not_make_entry_look_loaded():
+    """手在盘外、盘里的静置杆落在手框内：不能据此判成「带料进盘」。
+
+    手要经过盘边时，手框必然把盘里那排静置杆框进去，这些杆的中心落在手框
+    内，命中「杆心在手框内」那条基础判据。一条这样的观测进了盘外历史，
+    本次进盘就被判成「带料进盘」，整件取料丢掉——示例② 第 95 帧附近的
+    取料即如此（手在盘外 x=1377，盘区从 x=1383 开始，盘内 (1544,319)
+    那根静置杆被判成了握持）。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    # 涂油盘区（夹具）是 x 400–600、y 20–520。这根静置杆的中心 (505, 515)
+    # 刚好在盘区下沿之内，而手框中心抬到 y=560 时它落进手框（90×90）。
+    parked = Detection(
+        label="screw",
+        confidence=0.9,
+        box=BBox(495.0, 498.0, 515.0, 532.0),
+        angle=math.pi * 0.5,
+    )
+
+    # 手在盘外（中心 y > 520），贴着盘区下沿往盘边走：
+    # 中心 y=556 时手框上沿到 511，盘内那根静置杆的中心 (505,515) 落进手框。
+    for step in range(4):
+        feed(pipeline, next(ts_iter), hand_at(ENTRY_HAND[0], 556.0 - step * 2), parked)
+    # 空手进盘并停留。
+    for step in range(5):
+        feed(pipeline, next(ts_iter), hand_at(ENTRY_HAND[0], ENTRY_HAND[1] - step * 6), parked)
+    # 离盘时手里真有杆。
+    for step in range(1, 6):
+        t = step / 5
+        cx = ENTRY_HAND[0] - 40 + (HAND_TARGET[0] - ENTRY_HAND[0] + 40) * t
+        cy = ENTRY_HAND[1] - 20 + (HAND_TARGET[1] - ENTRY_HAND[1] + 20) * t
+        feed(pipeline, next(ts_iter), hand_at(cx, cy), held_screw_at(cx, cy), parked)
+    for _ in range(4):
+        feed(pipeline, next(ts_iter), hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET), parked)
+
+    assert [e for e in events if e.event_type == EventType.PICK], "盘内静置杆把真取料判成了「带料进盘」"
+
+
 def test_entering_and_leaving_with_screw_does_not_pick():
     """带料进盘又带料离盘（把丝杆放回去再拿走）不算取料。"""
 

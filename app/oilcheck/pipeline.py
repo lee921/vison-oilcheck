@@ -187,6 +187,34 @@ def _majority(samples: deque[bool] | list[bool]) -> bool:
     return sum(1 for value in samples if value) * 2 > len(samples)
 
 
+# 握持判据里「手框右上角区域」的取法：右边 50%、上边 50% 的那一块。
+# 实测拳头攥住杆身、杆从虎口（右上角）伸出去，杆框与这块区域明显相交；
+# 而盘边蹭到的静置杆只在手框边缘有一点点交叠。
+_GRIP_CORNER_RX = 0.5
+_GRIP_CORNER_RY = 0.5
+# 杆框至少要有多大比例落在右上角区域里才算「握着」。丝杆又细又长，
+# 斜着握时与右上区只有部分重叠，门限取 0.3：示例③握持段 0.44~0.68，
+# 空手在盘边蹭到的静置杆 0.25~0.42（另有盘内静置杆排除条件兜底）。
+_GRIP_CORNER_MIN_FRAC = 0.30
+
+
+def _gripped_by_corner(hand_box: BBox, screw_box: BBox) -> bool:
+    """杆框与手框右上角区域相交，且杆有足够比例落在这块区域里。
+
+    这是「拳头握住杆身、杆从虎口伸出」的几何特征：杆心已经跑到手框外，
+    ``_box_center_in`` 判不出来；丝杆面积只有手框的 17~26%，IoU 也不够。
+    """
+
+    x1 = hand_box.x2 - hand_box.width * _GRIP_CORNER_RX
+    y2 = hand_box.y1 + hand_box.height * _GRIP_CORNER_RY
+    corner = BBox(x1, hand_box.y1, hand_box.x2, y2)
+    inter = corner.intersection_area(screw_box)
+    if inter <= 0:
+        return False
+    area = screw_box.width * screw_box.height
+    return area > 0 and inter / area >= _GRIP_CORNER_MIN_FRAC
+
+
 @dataclass
 class _Cycle:
     """一个作业周期：取料 → 涂油 → 复位。"""
@@ -956,13 +984,40 @@ class StationPipeline:
     def _record_outside_holding(
         self, hand_id: int, holding: Detection | None, ts: float
     ) -> None:
-        """记录一次「手在盘外、手里有没有杆」的观测。"""
+        """记录一次「手在盘外、手里有没有杆」的观测。
 
+        这条历史只用于**进盘定性**（这一趟是空手进盘还是带料进盘），
+        记录前要剔除盘内的杆：
+
+        手要经过盘边时，手框（实测 348×399 px，接近盘宽）必然把盘里那排
+        静置杆框进去，这些杆的**中心**就落在手框内，命中「杆心在手框内」
+        那条基础判据。一条这样的观测进了历史，本次进盘就被判成「带料进盘」，
+        整件取料丢掉——示例② 第 95 帧附近的取料即如此（f94 手在盘外，
+        盘内 (1544,319) 那根静置杆被判成握持）。
+
+        只在这里剔除、不动 ``_holding_screw`` 本身：离盘后的握持采样仍要
+        认盘内的杆——取料瞬间手里那根杆往往还压在盘区上方，那正是这一件
+        料被带走的证据（视频② f463 那次取料的前两个采样点就落在盘区内，
+        提前剔除会把整件取料判丢）。
+        """
+
+        if holding is not None and self._screw_parked_in_tray(holding):
+            holding = None
         window = max(0.0, self._entry_grace_s())
         history = self._outside_holding.setdefault(hand_id, deque())
         history.append((holding is None, ts))
         while history and ts - history[0][1] > window:
             history.popleft()
+
+    def _screw_parked_in_tray(self, screw: Detection) -> bool:
+        """这根杆是不是盘里的静置杆（中心落在涂油盘区内）。
+
+        手在盘外时盘里的杆一定是静置的；手在盘内时这个判断没有意义，
+        调用方只在「手已判在盘外」的分支里用它。
+        """
+
+        tray_box = self._tray_region_box(self._last_frame_ts or 0.0, self._frame_size)
+        return tray_box is not None and _box_center_in(screw.box, tray_box)
 
     def _mostly_empty_outside(
         self, hand_id: int, ts: float, *, default_empty: bool = False
@@ -1039,18 +1094,32 @@ class StationPipeline:
         )
 
     def _holding_screw(self, hand_box: BBox) -> Detection | None:
-        """手里拿着的那根丝杆：与手框**真实交叠或落在手框内**的丝杆检测。
+        """手里拿着的那根丝杆。
 
-        只按中心距离判定是不够的：手停在涂油盘边、尚未伸进去时，盘内丝杆的
-        中心也可能落在 ``hand_screw_max_distance`` 内，于是“空手进盘”被误判成
-        “带料进盘”，取料事件整个漏掉（现场视频 140911 就是这样）。手握丝杆时
-        丝杆一定会被手框遮住，因此要求交叠/包含才认作持有。
+        三条判据，依次是：
+
+        1. **杆心落在手框内**，或两者 IoU ≥ 0.15 —— 杆被手完全握住/遮住；
+        2. **手框右上角区域与杆框相交** —— 实际握姿是拳头攥住杆身、杆从虎口
+           （手框右上角）伸出去，此时杆心已经在手框外、IoU 也上不去。丝杆
+           又细又长（面积只有手框的 17~26%），IoU 的结构上限就是面积比，
+           0.15 这条门限在握持状态下几乎不可达（示例③实测握持段 IoU 只有
+           0.03~0.13，而「杆心在手框内」会随手的朝向时真时假）；
+        3. 第 2 条的**盘外限定**：手在盘外时，落在涂油盘内部的杆是盘里的
+           静置杆，不算握着。不加这条，手伸向盘边挑料时，盘里那排静止杆
+           正好落在手框右上区里，会被判成「带料进盘」（视频①②实测会因为
+           进盘定性被判成持有而丢掉整件取料）。
+
+        盘内不启用第 2 条：手伸在盘上方必然蹭到盘里的静置杆，那条读数与
+        实际有没有握着无关（盘内握持读数本来就不参与投票，见 ``_HandVisit``）。
         """
 
         width, height = self._frame_size
         diag = max(1.0, math.hypot(width, height))
         label = self.station.detector.screw_label
         hx, hy = hand_box.center
+        # 盘外限定：手在涂油盘区里时，盘内的杆是静置杆，不能当握持证据。
+        tray_box = self._tray_region_box(self._last_frame_ts or 0.0, (width, height))
+        hand_outside = tray_box is None or not _box_center_in(hand_box, tray_box)
         best: tuple[float, Detection] | None = None
         for det in self._last_detections:
             if det.label != label:
@@ -1059,11 +1128,14 @@ class StationPipeline:
             distance = math.hypot(cx - hx, cy - hy) / diag
             if distance > self.cfg.hand_screw_max_distance:
                 continue
-            # 手握丝杆时丝杆中心落在手框内；只是指尖蹭到盘边丝杆时，
-            # 两者仅有百分之几的交叠，不能算持有。
             gripped = (
                 _box_center_in(det.box, hand_box)
                 or hand_box.iou(det.box) >= 0.15
+                or (
+                    hand_outside
+                    and not self._screw_parked_in_tray(det)
+                    and _gripped_by_corner(hand_box, det.box)
+                )
             )
             if not gripped:
                 continue
