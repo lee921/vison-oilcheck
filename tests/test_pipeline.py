@@ -75,7 +75,13 @@ def make_pipeline(
         brush_contact_distance=0.06,
         brush_hold_s=0.5,
         holding_lost_timeout_s=0.6,
-        completed_retain_s=30.0,
+        # 与线上默认一致：已结束周期按条数保留，时间兜底取 3600s。
+        # 需要验证「按时间回收」的用例显式传更小的值。
+        completed_keep_count=4,
+        completed_retain_s=3600.0,
+        # 超时判 NG 默认关闭，让各用例只验证自己关心的那条路径；需要它的
+        # 用例显式传 ``oiling_timeout_s=...`` 打开。
+        oiling_timeout_s=0.0,
     )
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -887,6 +893,193 @@ def test_completed_oiling_before_next_pick_is_not_ng():
     assert all(t.final_result != TaskResult.NG for t in pipeline.tasks)
 
 
+def test_all_events_carry_review_summary():
+    """三类事件都带通用复核摘要，复核页无需认识任何 SOP 专有键名。"""
+
+    from app.review import SUMMARY_KEY, summary_from_event
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_timeout_s=10.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    feed_brush(pipeline, ts_iter, frames=4)
+    do_pick(pipeline, ts_iter)          # 第二次取料打断上一件 → 但上一件已涂完
+    do_pick(pipeline, ts_iter)          # 这次上一件没涂完 → NG
+
+    for event in events:
+        summary = summary_from_event(event.evidence)
+        assert summary is not None, event.event_type
+        assert summary.check_name
+        assert summary.verdict
+        assert summary.metrics
+        assert SUMMARY_KEY in event.evidence
+
+
+def test_ng_review_summary_explains_why():
+    """NG 摘要要能直接回答「刷没刷、差多少」，并给出可执行建议。"""
+
+    from app.review import summary_from_event
+
+    pipeline, events = make_pipeline(brush_hold_s=1.0, oiling_timeout_s=0.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    feed_brush(pipeline, ts_iter, frames=2)   # 只短暂靠近，远不够 1.0s
+    do_pick(pipeline, ts_iter)
+
+    ng = [e for e in events if e.event_type == EventType.OILING_MISSING]
+    assert len(ng) == 1
+    summary = summary_from_event(ng[0].evidence)
+    assert summary is not None
+    assert summary.verdict == "漏涂 NG"
+
+    metrics = {m.key: m for m in summary.metrics}
+    # 核心指标：接触累计没达标，且明确显示要求
+    assert metrics["brush_hold_s"].passed is False
+    assert metrics["brush_hold_s"].required == "≥ 1.00 s"
+    # 刷头确实碰到过（短暂靠近），所以最近距离应当在门限内
+    assert metrics["brush_min_distance"].passed is True
+    # 「被下一次取料打断」的处置建议
+    assert any("打断" in hint for hint in summary.hints)
+    # 时间线里应有取料与 NG 两个节点
+    names = [name for name, _ in summary.timeline]
+    assert "PICKED" in names
+    assert "NG" in names
+
+
+def test_ng_summary_warns_when_brush_never_approached():
+    """刷头全程没靠近过：摘要要提示「可能没刷，也可能工作点估偏」。"""
+
+    from app.review import summary_from_event
+
+    pipeline, events = make_pipeline(brush_hold_s=1.0, oiling_timeout_s=0.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    # 刷子一直远离
+    for _ in range(6):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*HAND_TARGET),
+            held_screw_at(*HAND_TARGET),
+            brush_at(HAND_TARGET[0] + 300, HAND_TARGET[1] - 300),
+        )
+    do_pick(pipeline, ts_iter)
+
+    ng = [e for e in events if e.event_type == EventType.OILING_MISSING]
+    assert len(ng) == 1
+    summary = summary_from_event(ng[0].evidence)
+    assert summary is not None
+    metrics = {m.key: m for m in summary.metrics}
+    assert metrics["brush_near_frames"].value == "0 帧"
+    assert any("brush_point_offset" in hint for hint in summary.hints)
+
+
+def test_oiling_timeout_summary_mentions_timeout_config():
+    """超时触发时，摘要要给「调大 oiling_timeout_s」的建议。"""
+
+    from app.review import summary_from_event
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_timeout_s=2.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    ts = 1.0
+    while ts < 30.0:
+        ts = next(ts_iter)
+        feed(pipeline, ts, hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET))
+
+    ng = [e for e in events if e.event_type == EventType.OILING_MISSING]
+    assert len(ng) == 1
+    summary = summary_from_event(ng[0].evidence)
+    assert summary is not None
+    assert any("oiling_timeout_s" in hint for hint in summary.hints)
+    metrics = {m.key: m for m in summary.metrics}
+    assert metrics["elapsed_s"].required == "超时 2.00 s"
+
+
+def test_oiling_timeout_marks_ng_even_if_video_ends():
+    """取料后 10 秒仍未完成二次涂油 ⇒ 判 NG，不等下一次取料。
+
+    最后一件取走后视频就结束的现场很多（换班、停线），旧行为下这种「悬空
+    周期」永远不会被结算。超时把「这一件漏涂」及时报出来。
+    """
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_timeout_s=10.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    # 刷子一直没靠近；喂到取料后超过 10s。
+    ts = 0.0
+    for _ in range(80):
+        ts = next(ts_iter)
+        feed(pipeline, ts, hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET))
+
+    ng = [e for e in events if e.event_type == EventType.OILING_MISSING]
+    assert len(ng) == 1
+    assert ng[0].result == EventResult.NEEDS_REVIEW
+    assert ng[0].evidence["reason"] == "oiling_missing_timeout"
+    assert ng[0].evidence["timeout_s"] == 10.0
+    assert ng[0].evidence["elapsed_s"] > 10.0
+    assert "MANUAL_OILING_TIMEOUT" in ng[0].evidence["evidence"]
+
+    task = pipeline.tasks[0]
+    assert task.final_result == TaskResult.NG
+    assert task.completed_at is not None, "NG 之后周期应立即结束，不再等涂油"
+
+
+def test_oiling_timeout_not_triggered_when_oiled_in_time():
+    """超时之前就涂完的，不会被超时误判。"""
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_timeout_s=10.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    feed_brush(pipeline, ts_iter, frames=4)
+    for _ in range(80):
+        feed(pipeline, next(ts_iter), hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET))
+
+    assert [e for e in events if e.event_type == EventType.OILING_MISSING] == []
+    assert pipeline.tasks[0].final_result == TaskResult.COMPLETED
+
+
+def test_oiling_timeout_disabled_by_zero():
+    """``oiling_timeout_s = 0`` 关闭超时：只由下一次取料结算（旧行为）。"""
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_timeout_s=0.0)
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    for _ in range(200):
+        feed(pipeline, next(ts_iter), hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET))
+
+    assert [e for e in events if e.event_type == EventType.OILING_MISSING] == []
+    assert pipeline.tasks[0].final_result == TaskResult.PROCESSING
+
+
+def test_oiling_timeout_is_wall_time_not_frame_count():
+    """超时按真实时长算，与帧率无关：5fps 与 15fps 在同一时刻判 NG。"""
+
+    results = {}
+    for step, label in ((0.2, "15fps"), (1.0, "1fps")):
+        pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_timeout_s=10.0)
+        ts_iter = timestamps(step=step)
+        pick_ts = do_pick(pipeline, ts_iter)
+        # 取料后再喂 15 秒（按各自帧间隔），两种帧率下都该在取料后 10s 判 NG。
+        ts = pick_ts
+        while ts <= pick_ts + 15.0:
+            ts = next(ts_iter)
+            feed(pipeline, ts, hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET))
+        ng = [e for e in events if e.event_type == EventType.OILING_MISSING]
+        assert len(ng) == 1, label
+        results[label] = round(ng[0].evidence["elapsed_s"], 1)
+
+    # 两种帧率下判 NG 的时刻都落在取料后 10s 出头，相差不超过一个 1fps 帧间隔。
+    assert results["15fps"] >= 10.0 and results["1fps"] >= 10.0
+    assert abs(results["15fps"] - results["1fps"]) <= 1.5
+
+
 def test_ng_cycle_ends_and_new_cycle_can_complete():
     """NG 之后新周期照常能完成涂油，不影响后续判定。"""
 
@@ -903,6 +1096,109 @@ def test_ng_cycle_ends_and_new_cycle_can_complete():
     assert len(oils) == 1
     assert oils[0].task_id != ng[0].task_id
     assert pipeline.tasks[1].final_result == TaskResult.COMPLETED
+
+
+def test_finished_cycles_kept_by_count_not_by_time():
+    """已结束的周期按条数保留，不在结束 10 秒后清空。
+
+    监控页任务卡片要一直显示最近几件的结果；按时间清理会让卡片栏在每个
+    周期做完 10 秒后空掉，现场看不到刚才那几件的结论。
+    """
+
+    pipeline, events = make_pipeline(
+        brush_hold_s=0.5,
+        oiling_timeout_s=0.0,
+        completed_keep_count=4,
+        completed_retain_s=0.0,
+    )
+    ts_iter = timestamps()
+
+    # 连续做 3 件，每件都涂完。
+    for _ in range(3):
+        do_pick(pipeline, ts_iter)
+        feed_brush(pipeline, ts_iter, frames=4)
+
+    # 全部完成，3 条都在。
+    assert len(pipeline.tasks) == 3
+    assert all(t.final_result == TaskResult.COMPLETED for t in pipeline.tasks)
+
+    # 空跑很久（远超旧的 completed_retain_s=10）：卡片内容不能消失。
+    ts = 0.0
+    for _ in range(200):
+        ts = next(ts_iter)
+        feed(pipeline, ts, hand_at(700.0, 900.0))
+    assert len(pipeline.tasks) == 3, "已完成的周期被按时间清掉了"
+
+
+def test_finished_cycles_trimmed_to_keep_count():
+    """超过 ``completed_keep_count`` 的旧周期才回收，且回收最旧的。"""
+
+    pipeline, events = make_pipeline(
+        brush_hold_s=0.5,
+        oiling_timeout_s=0.0,
+        completed_keep_count=2,
+        completed_retain_s=0.0,
+    )
+    ts_iter = timestamps()
+
+    for _ in range(4):
+        do_pick(pipeline, ts_iter)
+        feed_brush(pipeline, ts_iter, frames=4)
+
+    kept = [t.task_id for t in pipeline.tasks]
+    assert len(kept) == 2
+    assert kept == ["TASK-000003", "TASK-000004"], "应保留最近两条"
+
+
+def test_completed_retain_s_caps_memory_after_long_idle():
+    """``completed_retain_s`` 是时间兜底：与「保留条数」取交集，防内存增长。
+
+    卡片栏要常驻最近几件的结果，但长跑时不能让已结束周期无限留在内存里。
+    默认 3600 秒：一小时后回收，设 0 则不限时。
+    """
+
+    def idle_after_work(retain_s: float, idle_frames: int) -> int:
+        pipeline, _events = make_pipeline(
+            brush_hold_s=0.5,
+            oiling_timeout_s=0.0,
+            completed_keep_count=4,
+            completed_retain_s=retain_s,
+        )
+        ts_iter = timestamps(step=1.0)  # 1 秒一帧，便于控制空闲时长
+        for _ in range(3):
+            do_pick(pipeline, ts_iter)
+            feed_brush(pipeline, ts_iter, frames=4)
+        assert len(pipeline.tasks) == 3
+        for _ in range(idle_frames):
+            feed(pipeline, next(ts_iter), hand_at(700.0, 900.0))
+        return len(pipeline.tasks)
+
+    # 1 小时内：保持显示
+    assert idle_after_work(3600.0, 100) == 3
+    # 超过 1 小时：回收
+    assert idle_after_work(3600.0, 3700) == 0
+    # 设 0：不限时，一直保留（只受条数限制）
+    assert idle_after_work(0.0, 3700) == 3
+
+
+def test_active_cycle_is_never_trimmed_by_keep_count():
+    """进行中的周期不受「保留条数」限制：正在做的那件不能被卡片栏挤掉。"""
+
+    pipeline, events = make_pipeline(
+        brush_hold_s=0.5,
+        oiling_timeout_s=0.0,
+        completed_keep_count=1,
+        completed_retain_s=0.0,
+    )
+    ts_iter = timestamps()
+
+    do_pick(pipeline, ts_iter)
+    feed_brush(pipeline, ts_iter, frames=4)   # 第 1 件完成
+    do_pick(pipeline, ts_iter)                # 第 2 件进行中
+
+    tasks = pipeline.tasks
+    assert any(t.final_result == TaskResult.PROCESSING for t in tasks)
+    assert len(tasks) == 2, "进行中的周期被保留条数清掉了"
 
 
 def test_hand_track_max_active_is_configurable():

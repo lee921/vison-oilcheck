@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QLabel,
+    QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -20,12 +21,14 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    PlainTextEdit,
     PushButton,
     TableWidget,
 )
 
 from app.oilcheck.events import EventStore
 from app.oilcheck.types import EventResult, ReviewResult, format_timestamp
+from app.review import fallback_lines, summary_from_event
 
 
 class ReviewPage(QWidget):
@@ -89,12 +92,26 @@ class ReviewPage(QWidget):
         self._table.setColumnWidth(4, 90)
         self._table.setColumnWidth(5, 90)
 
+        # 详情区：按通用复核摘要结构渲染，不认识任何 SOP 专有键名。
+        # 旧事件（没有 review_summary）走 fallback_lines 平铺原始字段。
+        self._detail = PlainTextEdit()
+        self._detail.setReadOnly(True)
+        self._detail.setMinimumHeight(180)
+        self._detail.setPlaceholderText("选中一条事件查看判定依据与实测指标")
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self._table)
+        splitter.addWidget(self._detail)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 12, 16, 12)
         root.addLayout(top)
-        root.addWidget(self._table, 1)
+        root.addWidget(splitter, 1)
         root.addLayout(action)
 
+        self._table.itemSelectionChanged.connect(self._refresh_detail)
         self._btn_refresh.clicked.connect(self._refresh)
         self._btn_open.clicked.connect(self._open_clip)
         self._btn_abnormal.clicked.connect(
@@ -119,6 +136,17 @@ class ReviewPage(QWidget):
             self._refresh()
 
     def _refresh(self) -> None:
+        current = self._selected_event()
+        self._refresh_rows()
+        # 重建表格会丢选中行：尽量恢复，否则详情区会在提交后立刻变空。
+        if current is not None and current.event_id in self._event_ids:
+            row = self._event_ids.index(current.event_id)
+            self._table.selectRow(row)
+        elif self._table.rowCount() > 0:
+            self._table.selectRow(0)
+        self._refresh_detail()
+
+    def _refresh_rows(self) -> None:
         self._last_version = self._store.version
         mode = self._filter.currentText()
         events = self._store.recent(500)
@@ -161,6 +189,53 @@ class ReviewPage(QWidget):
         ):
             button.setEnabled(has_rows)
 
+    def _refresh_detail(self) -> None:
+        """把选中事件的证据渲染到详情区。
+
+        有 ``review_summary`` 时按通用结构渲染（任何 SOP 都适用）；没有时
+        回退到原始键值平铺——历史事件和尚未接入摘要的检测项也能看到全部
+        字段，不会是一片空白。
+        """
+
+        event = self._selected_event()
+        self._load_note(event)
+        if event is None:
+            self._detail.setPlainText("")
+            return
+
+        final = str(event.evidence.get("final_result") or "").strip()
+        result_text = (
+            f"{event.result_label}（周期结论 {final}）" if final else event.result_label
+        )
+        summary = summary_from_event(event.evidence)
+        # 事件类型是枚举限定的（PICK / MANUAL_OILING / OILING_MISSING），
+        # 别的 SOP 暂时只能复用其中之一。摘要里有更准确的检查项名时以它为准，
+        # 免得「螺丝扭矩 NG」在表头显示成「人工二次涂油未完成」。
+        check = summary.check_name if summary is not None else ""
+        if not check or check in event.event_label:
+            header = event.event_label
+        else:
+            header = f"{event.event_label} / {check}"
+        lines: list[str] = [
+            f"任务 {event.task_id} · {header} · {result_text}",
+            f"开始 {format_timestamp(event.timestamp_start)}"
+            f"    结束 {format_timestamp(event.timestamp_end)}",
+        ]
+        if event.timestamp_end > event.timestamp_start:
+            lines.append(
+                f"持续 {event.timestamp_end - event.timestamp_start:.2f} s"
+            )
+        lines.append(f"复核：{event.review_label}")
+        if event.review_note:
+            lines.append(f"复核备注：{event.review_note}")
+        lines.append("")
+
+        if summary is not None:
+            lines.extend(summary.lines())
+        else:
+            lines.extend(fallback_lines(event.evidence))
+        self._detail.setPlainText("\n".join(lines))
+
     def select_event(self, event_id: str) -> None:
         self._refresh()
         if not event_id:
@@ -171,6 +246,11 @@ class ReviewPage(QWidget):
             return
         self._table.selectRow(row)
         self._table.scrollToItem(self._table.item(row, 0))
+
+    def _load_note(self, event) -> None:
+        """把已保存的复核备注回填到输入框，便于改判时在此基础上修改。"""
+
+        self._note.setText("" if event is None else (event.review_note or ""))
 
     def _selected_event(self):
         row = self._table.currentRow()
@@ -202,7 +282,7 @@ class ReviewPage(QWidget):
             duration=1500,
             parent=self,
         )
-        self._note.clear()
+        # 刷新后详情区会从事件里把刚保存的备注回填回来，不必清空输入框。
         self._refresh()
 
     def _open_clip(self) -> None:

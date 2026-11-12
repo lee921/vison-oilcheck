@@ -300,12 +300,33 @@ class PipelineConfig:
     # 人工二次涂油：刷头工作点持续在丝杆接触邻域内累计到该时长即判完成
     brush_contact_distance: float = 0.060
     brush_hold_s: float = 1.00
+    # 取料后超过该时长仍未完成二次涂油 ⇒ 判漏涂 NG，不等下一次取料。
+    # 0 = 不限时（只靠下一次取料结算，旧行为）。
+    #
+    # 计时起点是取料确认时刻，按媒体时间累计，掉帧不暂停。与
+    # ``screw_reacquire_timeout_s`` 有取舍关系：后者默认 0（工人拿着杆走出
+    # 画面、过一会儿再回来涂油仍算这一件），开了本项之后这段时间会被计入
+    # 超时，超出即判 NG。
+    oiling_timeout_s: float = 10.0
 
     # 周期与保留
     holding_lost_timeout_s: float = 2.0
     single_active_task: bool = True
     task_max_active: int = 4
-    completed_retain_s: float = 10.0
+    # 已结束（完成 / NG）的周期在内存里保留最近多少条。
+    #
+    # 监控页的任务卡片要一直显示最近几件的结果，所以不能按时间清：原来
+    # ``completed_retain_s`` 到点就删，卡片栏做完 10 秒就空掉，现场看不到
+    # 刚才那几件的结论。现在改为「按条数保留」，只留最近
+    # ``completed_keep_count`` 条，更早的才回收。
+    completed_keep_count: int = 4
+    # 兜底的时间上限：已结束周期在内存里最多再留这么久，超过即回收。
+    #
+    # 与 ``completed_keep_count`` 是「与」的关系——两个条件任意一个满足就回收。
+    # 默认 3600 秒（1 小时）：卡片栏要常驻最近几件的结果，但内存不能随运行
+    # 时长无限增长。一小时足够覆盖换班之间的查看需求，长时间停机后也不会有
+    # 一堆早就不关心的事件占着内存。设 0 = 不限时，只按条数保留。
+    completed_retain_s: float = 3600.0
 
     # 涂油盘定位（只作为取料参考区域）
     tray_max_distance: float = 0.20
@@ -451,6 +472,7 @@ class PipelineConfig:
                 "oiling_min_duration_s",
                 default=d.brush_hold_s,
             ),
+            oiling_timeout_s=_f("oiling_timeout_s", d.oiling_timeout_s, 0.0),
             holding_lost_timeout_s=_f(
                 "holding_lost_timeout_s", d.holding_lost_timeout_s, 0.0
             ),
@@ -462,6 +484,9 @@ class PipelineConfig:
                 else d.task_max_active,
                 1,
                 64,
+            ),
+            completed_keep_count=_i(
+                "completed_keep_count", d.completed_keep_count, 1, 64
             ),
             completed_retain_s=_f(
                 "completed_retain_s", d.completed_retain_s, 0.0
@@ -553,9 +578,11 @@ class PipelineConfig:
             "brush_track_max_active": self.brush_track_max_active,
             "brush_contact_distance": self.brush_contact_distance,
             "brush_hold_s": self.brush_hold_s,
+            "oiling_timeout_s": self.oiling_timeout_s,
             "holding_lost_timeout_s": self.holding_lost_timeout_s,
             "single_active_task": self.single_active_task,
             "task_max_active": self.task_max_active,
+            "completed_keep_count": self.completed_keep_count,
             "completed_retain_s": self.completed_retain_s,
             "tray_max_distance": self.tray_max_distance,
             "tray_max_missing_s": self.tray_max_missing_s,
@@ -1433,6 +1460,10 @@ CONFIG_COMMENTS: dict[str, str] = {
         "刷头靠近累计到该时长即判「人工二次涂油完成」。纯时间阈值，"
         "不随帧率缩放"
     ),
+    "pipeline.oiling_timeout_s": (
+        "取料后超过该时长仍未完成二次涂油即判漏涂 NG，不等下一次取料；"
+        "0=不限时。按媒体时间累计，掉帧不暂停"
+    ),
     "pipeline.brush_hold_max_gap_s": (
         "刷头整帧漏检时允许补回的最大空档。用于低帧率下不丢时间；"
         "刷子检测到了但离得远不补"
@@ -1445,7 +1476,12 @@ CONFIG_COMMENTS: dict[str, str] = {
         "预留项：当前判定逻辑本身就只维护一个活动周期，改这里不会变成多任务"
     ),
     "pipeline.task_max_active": "内存中最多保留多少个作业周期",
-    "pipeline.completed_retain_s": "周期完成后在 UI 上保留多久再清理",
+    "pipeline.completed_keep_count": (
+        "已结束（完成/NG）的周期保留最近多少条，供监控页任务卡片显示"
+    ),
+    "pipeline.completed_retain_s": (
+        "已结束周期最多再保留这么久即回收（与上一项取交集）；0=不限时"
+    ),
     # ---- pipeline：涂油盘定位 ----
     "pipeline.tray_max_distance": "涂油盘跟踪的匹配距离（盘体上下移动时用）",
     "pipeline.tray_max_missing_s": "涂油盘检测漏检后保留预测框的时长",

@@ -205,12 +205,23 @@ class TaskCard(QFrame):
             )
             self._detail.setText("-")
             self._progress.setValue(0)
+            self._progress.setFormat("等待取料")
             return
 
         self._title.setText(task.task_id)
-        self._stage.setText(task.stage_label)
+        # 左上芯片负责「这一件做到哪一步」，右上放最近一次状态变化的时刻。
+        # 原来这里显示阶段名（已取料 / 涂油完成），与芯片文案重复；改成时间
+        # 后，现场能直接看出这一件停了多久没动。
+        activity = task.activity_label
+        self._stage.setText(
+            datetime.fromtimestamp(task.stage_since).strftime("%H:%M:%S")
+            if task.stage_since
+            else ""
+        )
         color = RESULT_COLORS.get(task.final_result, "#374151")
-        self._chip.setText(task.result_label)
+        # 用「取料完成 / 涂油进行中 / 涂油完成」这类具体操作，而不是笼统的
+        # 「进行中」——卡片上要一眼看出这一件走到哪一步。
+        self._chip.setText(activity)
         self._chip.setStyleSheet(
             f"background:{color};color:#ffffff;border-radius:9px;"
             "padding:2px 10px;font-size:12px;"
@@ -221,6 +232,12 @@ class TaskCard(QFrame):
             f"{task.brush_hold_target_s:.2f}s"
         )
         self._progress.setValue(task.brush_hold_percent)
+        # 还没进入二次涂油时，进度条停在 0% 没有信息量，写明在等什么。
+        self._progress.setFormat(
+            "刷子靠近 %p%"
+            if task.stage == TaskStage.PICKED or task.stage == TaskStage.OILED
+            else "等待取料"
+        )
         timeline = " → ".join(
             f"{name}@{datetime.fromtimestamp(ts).strftime('%H:%M:%S')}"
             for name, ts in task.timeline
@@ -635,7 +652,14 @@ class MonitorPage(QWidget):
         )
 
     def _update_task_cards(self, snapshot: StationSnapshot | None) -> None:
-        tasks = list(snapshot.tasks if snapshot else ())[-4:][::-1]
+        # 按创建时间倒序取最近 4 条：进行中的周期一定是最新的那一条，
+        # 已结束的按结束先后排在后面。不过滤活动周期，否则「正在做的这件」
+        # 会被挤掉。
+        tasks = sorted(
+            snapshot.tasks if snapshot else (),
+            key=lambda item: (item.created_at, item.task_id),
+            reverse=True,
+        )[:4]
         cards = list(self._task_cards.values())
         for index, card in enumerate(cards):
             task = tasks[index] if index < len(tasks) else None

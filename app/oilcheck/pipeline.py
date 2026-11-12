@@ -29,9 +29,16 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Any
 
+from app.review import SUMMARY_KEY, ReviewSummary
+
 from .association import brush_work_point
 from .bytetrack_adapter import ByteTrackObjectTracker
 from .config import PipelineConfig, StationConfig
+from .review import (
+    build_oiling_missing_summary,
+    build_oiling_summary,
+    build_pick_summary,
+)
 from .tracker import ObjectTracker, Track, TrayTrack, TrayTracker
 from .types import (
     BBox,
@@ -248,6 +255,24 @@ class _Cycle:
     screw_gripped_at: tuple[float, float] | None = None
     # 最近一次「刷子靠近」的时刻，用于跨过一两帧漏检把空档补回来。
     last_brush_ts: float | None = None
+    # ---- 复核用的统计量（只读埋点，不参与判定）----
+    # 刷头工作点落进接触邻域内的帧数：直观区分「偶尔蹭到」与「一直在刷」。
+    brush_near_frames: int = 0
+    # 本周期内刷头工作点到杆心的最小归一化距离；从未靠近过为 None。
+    brush_min_distance: float | None = None
+    # 最长**连续**接触时长。断续靠近时它远小于 brush_hold_s 累计值。
+    brush_longest_run_s: float = 0.0
+    # 当前连续接触段的起点，以及段内最后一次「刷头靠近」的时刻（内部用）。
+    # 用后者而不是「收尾那帧的 ts」算段长：杆不可见时会提前 return，
+    # 拿收尾帧的 ts 会把看不见杆的时间也算进连续段里。
+    brush_run_start_ts: float | None = None
+    brush_last_near_ts: float | None = None
+    # 手持丝杆被定位到的帧数（分子）与取料后经过的帧数（分母），
+    # 两者之比即「手持丝杆可见比例」。分母用**全部**帧而不是「涂油判定
+    # 阶段的帧」——杆不可见时 ``_update_oiling`` 会提前返回，那些帧根本
+    # 不会进入涂油阶段，用后者算出来的比例永远是 100%。
+    tap_frames: int = 0
+    oiling_frames: int = 0
     timeline: list[tuple[str, float]] = field(default_factory=list)
     events_sent: set[str] = field(default_factory=set)
 
@@ -488,7 +513,14 @@ class StationPipeline:
         self._brush_tracks = brush_out.active
 
         self._update_pick(ts=ts, tray_box=tray_box)
+        # 复核统计：处于 PICKED 阶段的周期，每帧都算一次「取料后经过的帧数」。
+        # 放在 _update_oiling 之前，杆不可见而提前返回的帧也能计入。
+        for task in self._cycles.values():
+            if task.active and task.stage == TaskStage.PICKED:
+                task.oiling_frames += 1
         self._update_oiling(ts=ts, dt=dt)
+        # 超时检查放在涂油判定之后：本帧刚好凑够 brush_hold_s 的，先算完成。
+        self._check_oiling_timeout(ts=ts)
         self._cleanup(ts)
         return self.snapshot()
 
@@ -1178,6 +1210,7 @@ class StationPipeline:
             },
             start_ts=ts - dwell_s,
             end_ts=ts,
+            review=build_pick_summary(task, dwell_s=dwell_s),
         )
         self._logger.info(
             "取料完成 %s（手部轨迹=%s，盘内停留 %.2fs）",
@@ -1202,13 +1235,14 @@ class StationPipeline:
         )
         if task is None:
             return
-
         screw_box = self._current_screw_box(task, ts)
         if screw_box is None:
             # 手持丝杆当帧不可见、也超出预测保持时长：不累计接触时长，
             # 但不结束周期，等丝杆重新出现。
             return
         task.last_seen_ts = ts
+        # 复核统计：手持丝杆被定位到的帧数（可见比例的分母）。
+        task.tap_frames += 1
 
         brush = self._nearest_brush(screw_box)
         if brush is None:
@@ -1218,8 +1252,21 @@ class StationPipeline:
             # - 刷子检测到了但离得远 → 确实没在刷，累计中断，清空桥接点。
             if self._has_live_brush():
                 task.last_brush_ts = None
+                # 复核统计：连续接触段在此中断。
+                self._close_brush_run(task)
             return
         task.brush_track_id = brush.track_id
+        # 复核统计：接触帧数、最近距离、连续段时长（不改任何判定结果）。
+        task.brush_near_frames += 1
+        distance = self._brush_work_distance(screw_box, brush)
+        if task.brush_min_distance is None or distance < task.brush_min_distance:
+            task.brush_min_distance = distance
+        task.brush_last_near_ts = ts
+        if task.brush_run_start_ts is None:
+            task.brush_run_start_ts = ts
+        task.brush_longest_run_s = max(
+            task.brush_longest_run_s, ts - task.brush_run_start_ts
+        )
         if dt <= 0:
             # 时间没前进（同时间戳重复帧）：不累计，但要记住靠近状态。
             task.last_brush_ts = ts
@@ -1567,6 +1614,36 @@ class StationPipeline:
             for brush in self._brush_tracks
         )
 
+    def _brush_work_distance(self, screw_box: BBox, brush: Track) -> float:
+        """刷头工作点到丝杆中心的归一化距离（复核统计用）。
+
+        与 :meth:`_nearest_brush` 同一算法（都用 ``brush_work_point``），
+        不另立口径——否则复核时看到的距离与判定用的距离会对不上。
+        """
+
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        sx, sy = screw_box.center
+        point = brush_work_point(brush, self.station.detector)
+        return math.hypot(point[0] - sx, point[1] - sy) / diag
+
+    def _close_brush_run(self, task: _Cycle) -> None:
+        """结束当前连续接触段，把它的时长并入「最长连续接触」。
+
+        段长取「段内最后一次刷头靠近的时刻 - 段起点」，不用收尾那帧的 ts：
+        杆不可见时 ``_update_oiling`` 会提前 return，那段空档并没有累计进
+        ``brush_hold_s``，也不该算进连续接触时长。
+        """
+
+        if task.brush_run_start_ts is None:
+            return
+        end = task.brush_last_near_ts or task.brush_run_start_ts
+        task.brush_longest_run_s = max(
+            task.brush_longest_run_s, end - task.brush_run_start_ts
+        )
+        task.brush_run_start_ts = None
+        task.brush_last_near_ts = None
+
     def _nearest_brush(self, screw_box: BBox) -> Track | None:
         """离丝杆接触邻域最近、且已被本帧检测到的刷头。"""
 
@@ -1586,6 +1663,7 @@ class StationPipeline:
         return None if best is None else best[1]
 
     def _complete_oiling(self, task: _Cycle, ts: float) -> None:
+        self._close_brush_run(task)
         task.stage = TaskStage.OILED
         task.stage_since = ts
         task.completed_at = ts
@@ -1605,6 +1683,7 @@ class StationPipeline:
             },
             start_ts=task.picked_at or task.created_at,
             end_ts=ts,
+            review=build_oiling_summary(task, required_s=self.cfg.brush_hold_s),
         )
         self._logger.info(
             "人工二次涂油完成 %s（手持丝杆，刷头靠近 %.2fs）",
@@ -1615,45 +1694,120 @@ class StationPipeline:
     # ------------------------------------------------------------------
     # 周期管理
     # ------------------------------------------------------------------
-    def _supersede_unfinished(self, task: _Cycle, ts: float) -> None:
-        """上一周期只取料、没完成二次涂油 ⇒ ``NG``。
+    def _check_oiling_timeout(self, *, ts: float) -> None:
+        """取料后超时仍未完成二次涂油 ⇒ 判漏涂 NG。
 
-        判定只在「新的取料被确认」这一刻触发，不等超时：现场工艺里一件丝杆
-        取走后没刷完就取下一件，就是漏涂。周期立即结束，事件类型
-        ``OILING_MISSING``，结果 ``NEEDS_REVIEW`` 交给人工复核。
+        ``oiling_timeout_s = 0`` 时不启用，行为与原来一致：只由下一次取料
+        触发 ``OILING_MISSING``。
+
+        计时用媒体时间（``task.picked_at`` 到本帧 ts），与取料/涂油判定同一
+        口径：慢放快放不改变结果，视频结束也不会凭空判一件、下一件全部 NG。
+
+        超时判 NG 之后周期结束、``_cycles`` 里没有活动周期，之后真来了一次
+        涂油不会被计入这一件（它已经判过 NG 了）。这是取舍：超时那一刻画面
+        里已经没有正在刷的证据，再等待就失去了「及时发现漏涂」的意义。
+        """
+
+        if self.cfg.oiling_timeout_s <= 0:
+            return
+        task = next(
+            (
+                item
+                for item in self._cycles.values()
+                if item.active and item.stage == TaskStage.PICKED
+            ),
+            None,
+        )
+        if task is None or task.picked_at is None:
+            return
+        if ts - task.picked_at <= self.cfg.oiling_timeout_s:
+            return
+        self._supersede_unfinished(task, ts, trigger="oiling_timeout")
+
+    def _supersede_unfinished(
+        self,
+        task: _Cycle,
+        ts: float,
+        *,
+        trigger: str = "superseded_by_pick",
+    ) -> None:
+        """只取料、没完成二次涂油 ⇒ ``NG``。
+
+        两个触发点，判的是同一件事（这一件没刷完），只是发现方式不同：
+
+        - ``superseded_by_pick``：来了下一次取料。现场工艺里一件取走后没
+          刷完就取下一件，就是漏涂；
+        - ``oiling_timeout``：取料后超过 ``oiling_timeout_s`` 仍未完成，
+          不再等下一次取料（``_check_oiling_timeout``）。
+
+        周期立即结束，事件类型 ``OILING_MISSING``，结果 ``NEEDS_REVIEW``
+        交给人工复核。
         """
 
         if task.stage != TaskStage.PICKED or task.picked_at is None:
             # 还没取料的周期不会漏涂，直接丢弃（当前流程不会出现，留作防御）。
             self._cycles.pop(task.task_id, None)
             return
+        timed_out = trigger == "oiling_timeout"
+        # 复核统计：收尾当前连续接触段，摘要里的「最长连续接触」才是完整的。
+        self._close_brush_run(task)
         task.stage_since = ts
         task.completed_at = ts
         task.final_result = TaskResult.NG
-        task.reason_code = "OILING_MISSING_SUPERSEDED"
-        task.evidence.append("NEXT_PICK_BEFORE_MANUAL_OILING")
+        task.reason_code = (
+            "OILING_MISSING_TIMEOUT" if timed_out else "OILING_MISSING_SUPERSEDED"
+        )
+        task.evidence.append(
+            "MANUAL_OILING_TIMEOUT" if timed_out else "NEXT_PICK_BEFORE_MANUAL_OILING"
+        )
         task.timeline.append(("NG", ts))
+        extra: dict[str, Any] = {
+            "hand_track_id": task.hand_track_id,
+            "brush_hold_s": round(task.brush_hold_s, 3),
+            "required_s": self.cfg.brush_hold_s,
+            "picked_at": task.picked_at,
+        }
+        if timed_out:
+            extra["timeout_s"] = self.cfg.oiling_timeout_s
+            extra["elapsed_s"] = round(ts - (task.picked_at or ts), 3)
+        else:
+            extra["superseded_at"] = ts
         self._emit_event(
             task,
             event_type=EventType.OILING_MISSING,
-            reason="oiling_missing_superseded_by_pick",
+            reason=(
+                "oiling_missing_timeout"
+                if timed_out
+                else "oiling_missing_superseded_by_pick"
+            ),
             result=EventResult.NEEDS_REVIEW,
-            extra={
-                "hand_track_id": task.hand_track_id,
-                "brush_hold_s": round(task.brush_hold_s, 3),
-                "required_s": self.cfg.brush_hold_s,
-                "picked_at": task.picked_at,
-                "superseded_at": ts,
-            },
+            extra=extra,
             start_ts=task.picked_at,
             end_ts=ts,
+            review=build_oiling_missing_summary(
+                task,
+                trigger="oiling_timeout" if timed_out else "superseded_by_pick",
+                ts=ts,
+                cfg=self.cfg,
+            ),
         )
-        self._logger.info(
-            "周期 %s 取料后未完成二次涂油（累计 %.2fs/%.2fs），判 NG",
-            task.task_id,
-            task.brush_hold_s,
-            self.cfg.brush_hold_s,
-        )
+        if timed_out:
+            self._logger.info(
+                "周期 %s 取料后 %.1fs 仍未完成二次涂油（累计 %.2fs/%.2fs，"
+                "超时 %.1fs），判 NG",
+                task.task_id,
+                extra["elapsed_s"],
+                task.brush_hold_s,
+                self.cfg.brush_hold_s,
+                self.cfg.oiling_timeout_s,
+            )
+        else:
+            self._logger.info(
+                "周期 %s 取料后未完成二次涂油（累计 %.2fs/%.2fs），判 NG",
+                task.task_id,
+                task.brush_hold_s,
+                self.cfg.brush_hold_s,
+            )
 
     def _ensure_cycle(self, ts: float, *, hand_track_id: int | None) -> _Cycle:
         """新建当前周期；若上一周期只取料未涂油，先判它 NG。"""
@@ -1682,24 +1836,53 @@ class StationPipeline:
         return task
 
     def _cleanup(self, ts: float) -> None:
-        remove: list[str] = []
-        for task_id, task in self._cycles.items():
-            if task.active:
-                continue
-            finished = task.completed_at or task.stage_since
-            if ts - finished >= self.cfg.completed_retain_s:
-                remove.append(task_id)
-        for task_id in remove:
-            self._cycles.pop(task_id, None)
+        """回收已结束的周期，只保留最近几条。
 
-        if len(self._cycles) <= self.cfg.task_max_active:
-            return
-        ordered = sorted(
-            self._cycles.values(),
-            key=lambda item: (item.active, item.created_at),
-        )
-        for task in ordered[: len(self._cycles) - self.cfg.task_max_active]:
-            self._cycles.pop(task.task_id, None)
+        保留策略是**按条数**而不是按时间：监控页的任务卡片要一直显示最近
+        几件的结果，按时间删（旧的 ``completed_retain_s=10``）会让卡片栏在
+        每件做完 10 秒后就空掉，现场看不到刚才那几件的结论。
+
+        - ``completed_keep_count``：已结束周期保留最近 N 条（默认 4，与卡片
+          栏格数一致）；
+        - ``completed_retain_s``：兼容项，>0 时额外限制「结束后超过该时长
+          也回收」，默认 0 表示不按时间清。
+
+        活动周期永远不在这里回收：它要么由判定流程结束，要么由 ``reset``
+        清空。``task_max_active`` 只用于给活动周期兜底，不参与结束周期。
+        """
+
+        finished = [
+            task
+            for task in self._cycles.values()
+            if not task.active
+        ]
+        # 1) 兼容项：按时间回收（默认关闭）。
+        if self.cfg.completed_retain_s > 0:
+            for task in list(finished):
+                end = task.completed_at or task.stage_since
+                if ts - end >= self.cfg.completed_retain_s:
+                    self._cycles.pop(task.task_id, None)
+            finished = [t for t in finished if t.task_id in self._cycles]
+
+        # 2) 按条数保留最近 N 条已结束周期。
+        keep = max(1, int(self.cfg.completed_keep_count))
+        if len(finished) > keep:
+            finished.sort(
+                key=lambda item: (
+                    item.completed_at or item.stage_since,
+                    item.created_at,
+                )
+            )
+            for task in finished[: len(finished) - keep]:
+                self._cycles.pop(task.task_id, None)
+
+        # 3) 活动周期兜底：正常情况下同时只有一个，留点余量防异常。
+        active = [task for task in self._cycles.values() if task.active]
+        limit = max(1, int(self.cfg.task_max_active))
+        if len(active) > limit:
+            active.sort(key=lambda item: item.created_at)
+            for task in active[: len(active) - limit]:
+                self._cycles.pop(task.task_id, None)
 
     # ------------------------------------------------------------------
     # 事件
@@ -1714,6 +1897,7 @@ class StationPipeline:
         start_ts: float | None = None,
         end_ts: float | None = None,
         result: EventResult = EventResult.CONFIRMED,
+        review: ReviewSummary | None = None,
     ) -> EventRecord | None:
         key = f"{event_type.value}:{reason}"
         if key in task.events_sent:
@@ -1729,6 +1913,10 @@ class StationPipeline:
         }
         if extra:
             evidence.update(extra)
+        # 通用复核摘要：复核页按这个结构渲染，不认识任何 SOP 专有键名。
+        # 放在 extra 之后，避免被同名的 extra 键覆盖。
+        if review is not None:
+            evidence[SUMMARY_KEY] = review.to_dict()
         event = EventRecord.create(
             timestamp_start=float(
                 start_ts if start_ts is not None else task.created_at

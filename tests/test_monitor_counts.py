@@ -230,3 +230,44 @@ def test_source_combo_follows_demo_video_changes():
     finally:
         page.deleteLater()
         app.processEvents()
+
+
+def test_task_activity_label_shows_concrete_step():
+    """任务卡要显示具体操作，而不是笼统的「进行中」。
+
+    「进行中」看不出这一件是刚取完料还是已经在刷；卡片上按阶段细分，
+    并把「取料完成」与「涂油进行中」区分开（两者都是 PICKED 阶段，
+    区别在刷头接触累计是否大于 0）。
+    """
+
+    from app.oilcheck.types import TaskResult, TaskSnapshot, TaskStage
+
+    base = TaskSnapshot(
+        task_id="TASK-000001",
+        created_at=0.0,
+        stage=TaskStage.PICKED,
+        stage_since=0.0,
+        final_result=TaskResult.PROCESSING,
+        brush_hold_target_s=1.0,
+    )
+
+    assert replace(base, stage=TaskStage.WAITING_PICK).activity_label == "等待取料"
+    assert replace(base, brush_hold_s=0.0).activity_label == "取料完成"
+    assert replace(base, brush_hold_s=0.42).activity_label == "涂油进行中"
+    assert (
+        replace(
+            base,
+            stage=TaskStage.OILED,
+            final_result=TaskResult.COMPLETED,
+            brush_hold_s=1.0,
+        ).activity_label
+        == "涂油完成"
+    )
+    # 漏涂仍显示 NG 文案，不能被「涂油完成」盖掉
+    assert (
+        replace(base, final_result=TaskResult.NG, brush_hold_s=0.2).activity_label
+        == "NG（漏涂）"
+    )
+    # 等待取料 / 已完成 这两种状态不该出现笼统的「进行中」
+    for stage in (TaskStage.WAITING_PICK, TaskStage.OILED):
+        assert replace(base, stage=stage).activity_label != "进行中"

@@ -257,6 +257,30 @@ class TaskSnapshot:
         return TASK_RESULT_LABELS.get(self.final_result, self.final_result.value)
 
     @property
+    def activity_label(self) -> str:
+        """当前正在做的具体操作，比 ``result_label`` 的「进行中」更可读。
+
+        卡片上要让人一眼看出这一件走到哪一步了：只写「进行中」，看不出是
+        刚取完料还是已经在刷。所以按阶段细分，并额外区分「取料完成、还没
+        开始涂油」与「已经刷上了」——两者都是 ``PICKED`` 阶段，区别在于
+        刷头接触累计是否大于 0。
+
+        终态也尽量说清做到哪一步：``COMPLETED`` 必然是二次涂油完成（周期
+        只有这一条成功路径），所以显示「涂油完成」而不是笼统的「已完成」。
+        """
+
+        if self.final_result == TaskResult.NG:
+            return self.result_label
+        if self.final_result == TaskResult.COMPLETED:
+            return "涂油完成"
+        if self.stage == TaskStage.WAITING_PICK:
+            return "等待取料"
+        if self.stage == TaskStage.OILED:
+            return "涂油完成"
+        # PICKED：已取料、等待或正在二次涂油。
+        return "涂油进行中" if self.brush_hold_s > 0.0 else "取料完成"
+
+    @property
     def brush_hold_percent(self) -> int:
         target = max(1e-6, float(self.brush_hold_target_s))
         ratio = max(0.0, min(1.0, self.brush_hold_s / target))

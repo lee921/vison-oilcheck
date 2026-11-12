@@ -85,6 +85,7 @@ class SettingsPage(QWidget):
         self._pick_confirm = _double_spin(0.0, 10.0, 0.05, 2)
         self._brush_distance = _double_spin(0.005, 0.5, 0.005, 3)
         self._brush_hold = _double_spin(0.0, 60.0, 0.1, 2)
+        self._oiling_timeout = _double_spin(0.0, 3600.0, 1.0, 1)
         self._holding_lost_timeout = _double_spin(0.0, 30.0, 0.1, 2)
 
         # 盘体跟踪参数
@@ -149,6 +150,7 @@ class SettingsPage(QWidget):
         pipeline_form.addRow("盘内停留确认时长（秒）", self._pick_confirm)
         pipeline_form.addRow("刷头-丝杆接触距离（归一化）", self._brush_distance)
         pipeline_form.addRow("刷子靠近判完成时长（秒）", self._brush_hold)
+        pipeline_form.addRow("未涂油超时判 NG（秒，0=不限时）", self._oiling_timeout)
         pipeline_form.addRow("手持丢失判定超时（秒）", self._holding_lost_timeout)
 
         assoc_form = QFormLayout()
@@ -173,7 +175,7 @@ class SettingsPage(QWidget):
         tracking_form.addRow("刷头短时漏检保留（秒）", self._brush_track_missing)
         tracking_form.addRow("刷头最少命中帧数", self._brush_track_min_hits)
         tracking_form.addRow("最大同时任务数", self._task_max_active)
-        tracking_form.addRow("完成后保留（秒）", self._completed_retain)
+        tracking_form.addRow("完成记录最长保留（秒，0=不限）", self._completed_retain)
 
         record_form = QFormLayout()
         record_form.addRow("训练视频目录", self._training_dir)
@@ -249,6 +251,7 @@ class SettingsPage(QWidget):
         self._pick_confirm.setValue(float(pipeline.pick_confirm_s))
         self._brush_distance.setValue(float(pipeline.brush_contact_distance))
         self._brush_hold.setValue(float(pipeline.brush_hold_s))
+        self._oiling_timeout.setValue(float(pipeline.oiling_timeout_s))
         self._holding_lost_timeout.setValue(float(pipeline.holding_lost_timeout_s))
 
         self._tray_distance.setValue(float(pipeline.tray_max_distance))
@@ -351,6 +354,7 @@ class SettingsPage(QWidget):
             pick_confirm_s=float(self._pick_confirm.value()),
             brush_contact_distance=float(self._brush_distance.value()),
             brush_hold_s=float(self._brush_hold.value()),
+            oiling_timeout_s=float(self._oiling_timeout.value()),
             holding_lost_timeout_s=float(self._holding_lost_timeout.value()),
             tray_max_distance=float(self._tray_distance.value()),
             tray_max_missing_s=float(self._tray_missing.value()),
