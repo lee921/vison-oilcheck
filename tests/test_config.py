@@ -429,10 +429,14 @@ def test_missing_demo_section_is_filled_with_template_videos(tmp_path):
     _write_config(tmp_path, lambda data: data.pop("demo"))
     cfg = OilCheckConfigService(tmp_path / "config").load()
 
-    assert [video.name for video in cfg.demo.videos] == [
-        "示例① 105708",
-        "示例② 140911",
-    ]
+    # 断言「与模板清单一致」而不是写死条数：模板里新增示例视频时不该连带
+    # 改这条测试（写死两份清单会让加视频和改测试互相绊住）。
+    from app.oilcheck.config import load_json_with_comments
+
+    template = load_json_with_comments(runtime_root() / "config" / "oilcheck.json")
+    expected = [item["name"] for item in template["demo"]["videos"]]
+    assert expected, "模板里的示例视频清单不应为空"
+    assert [video.name for video in cfg.demo.videos] == expected
 
 
 def test_missing_videos_key_is_filled_with_template_videos(tmp_path):
