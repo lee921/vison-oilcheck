@@ -10,7 +10,7 @@ from pathlib import Path
 from app.oilcheck.config import PipelineConfig, StationConfig
 from app.oilcheck.pipeline import StationPipeline
 from app.oilcheck.types import BBox, Detection, FrameDetections, TrackSnapshot
-from ui.pages.monitor_page import work_area_counts
+from ui.pages.monitor_page import screws_in_roi, work_area_counts
 
 WIDTH = 1000
 HEIGHT = 1000
@@ -25,6 +25,8 @@ def _station() -> StationConfig:
         "tray_roi": {"kind": "rect", "points": [[0.40, 0.02], [0.60, 0.52]]},
         # 工作追踪区：x 100–600、y 300–950
         "work_roi": {"kind": "rect", "points": [[0.10, 0.30], [0.60, 0.95]]},
+        # 涂油区：x 100–400、y 500–900
+        "oiling_roi": {"kind": "rect", "points": [[0.10, 0.50], [0.40, 0.90]]},
         "detector": {
             "kind": "null",
             "screw_label": "screw",
@@ -138,6 +140,25 @@ def test_raw_mode_counts_full_frame_and_says_so():
     counts, suffix = work_area_counts(station, snapshot)
     assert counts["screw"] == 1
     assert "raw_mode" in suffix
+
+
+def test_screws_in_oiling_roi_counts_only_screws_inside():
+    """涂油区卡片显示区内丝杆数：只数中心落在涂油区里的，不数手/刷具。"""
+
+    station = _station()
+    roi = station.oiling_roi
+    inside = roi.pixel_bbox(WIDTH, HEIGHT)
+    snapshot = _snapshot(
+        station,
+        tracks=(_track(1, "hand", 300, 600),),
+        detections=(
+            _screw(inside.x1 + inside.width * 0.5, inside.y1 + inside.height * 0.5),
+            _screw(inside.x1 + inside.width * 0.2, inside.y1 + inside.height * 0.2),
+            _screw(500, 600),  # 工作追踪区内，但在涂油区外（x > 400）
+        ),
+    )
+    assert screws_in_roi(station, snapshot, roi) == 2
+    assert screws_in_roi(station, None, roi) == 0
 
 
 # ----------------------------------------------------------------------
@@ -271,3 +292,106 @@ def test_task_activity_label_shows_concrete_step():
     # 等待取料 / 已完成 这两种状态不该出现笼统的「进行中」
     for stage in (TaskStage.WAITING_PICK, TaskStage.OILED):
         assert replace(base, stage=stage).activity_label != "进行中"
+
+
+# ----------------------------------------------------------------------
+# 事件表：最近事件分页浏览
+# ----------------------------------------------------------------------
+def test_event_table_pages_through_event_history():
+    """事件表默认一页 50 条，翻页能看到最多 5000 条历史。
+
+    之前只取 20 条且没有翻页入口，现场想回看稍早的记录只能去复核页翻。
+    """
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:  # pragma: no cover - 无 Qt 环境
+        return
+
+    from app.models import AppConfig
+    from app.oilcheck.config import OilCheckConfig
+    from app.oilcheck.events import EVENT_HISTORY_LIMIT, EventStore
+    from app.oilcheck.types import EventRecord, EventResult, EventType, RecordingStatus
+    from ui.pages.monitor_page import EVENT_PAGE_SIZE, MonitorPage
+
+    class _Service:
+        def __init__(self) -> None:
+            self.event_store = EventStore(Path(tempfile.mkdtemp()))
+            self.config = OilCheckConfig(stations=(_station(),))
+            ts = 1_700_000_000.0
+            for _ in range(120):
+                ts += 1.0
+                self.event_store.add(
+                    EventRecord.create(
+                        timestamp_start=ts - 1.0,
+                        timestamp_end=ts,
+                        station_id="ST01",
+                        camera_id="cam_test",
+                        event_type=EventType.PICK,
+                        result=EventResult.CONFIRMED,
+                        task_id="TASK-000001",
+                    )
+                )
+
+        def demo_videos(self):
+            return ()
+
+        def stations(self):
+            return self.config.stations
+
+        def station_snapshot(self, station_id):  # noqa: ANN001, ARG002
+            return None
+
+        def camera_state(self, camera_id):  # noqa: ANN001, ARG002
+            return "missing"
+
+        def active_video(self, station_id):  # noqa: ANN001, ARG002
+            return None
+
+        def demo_speed(self):
+            return 1.0
+
+        def latest_frame(self, camera_id):  # noqa: ANN001, ARG002
+            return None
+
+        def recent_events(self, limit=100, **_kwargs):
+            return self.event_store.recent(limit)
+
+        def recording_status(self, camera_id):
+            return RecordingStatus(camera_id=camera_id, active=False)
+
+        def video_status(self, station_id):  # noqa: ANN001, ARG002
+            return {}
+
+    class _Manager:
+        def get_session(self, camera_id):  # noqa: ANN001, ARG002
+            return None
+
+    app = QApplication.instance() or QApplication([])
+    page = MonitorPage(
+        service=_Service(),
+        manager=_Manager(),
+        cfg_service=None,
+        app_cfg=AppConfig(),
+    )
+    try:
+        page._update_events("ST01")
+        assert EVENT_PAGE_SIZE == 50
+        assert page._event_table.rowCount() == EVENT_PAGE_SIZE
+        assert page._btn_page_prev.isEnabled() is False
+        assert page._btn_page_next.isEnabled() is True
+
+        page._change_event_page(1)
+        assert page._event_page == 1
+        assert page._event_table.rowCount() == EVENT_PAGE_SIZE
+
+        page._change_event_page(1)
+        assert page._event_page == 2
+        # 120 条，第三页只有 20 条，且不能再往后翻。
+        assert page._event_table.rowCount() == 20
+        assert page._btn_page_next.isEnabled() is False
+        assert EVENT_HISTORY_LIMIT >= 5000
+    finally:
+        page.deleteLater()
+        app.processEvents()

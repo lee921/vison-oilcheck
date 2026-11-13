@@ -26,13 +26,17 @@ from .types import EventRecord, EventResult, ReviewResult
 
 logger = logging.getLogger("oilcheck.events")
 
+# 监控页事件列表可翻页浏览的最大条数。内存容量至少要覆盖这个窗口，
+# 否则翻到后面会被静默截断，现场会以为记录丢了。
+EVENT_HISTORY_LIMIT = 5000
+
 
 class EventStore:
     def __init__(
         self,
         root: Path,
         *,
-        capacity: int = 2000,
+        capacity: int = EVENT_HISTORY_LIMIT,
         logger_: logging.Logger | None = None,
     ) -> None:
         self._root = Path(root)

@@ -42,6 +42,7 @@ from qfluentwidgets import (
 from app.camera_manager import CameraManager
 from app.config_service import ConfigService
 from app.models import AppConfig
+from app.oilcheck.events import EVENT_HISTORY_LIMIT
 from app.oilcheck.service import OilCheckService
 from app.oilcheck.types import (
     BBox,
@@ -60,6 +61,9 @@ SPEED_OPTIONS: tuple[tuple[str, float], ...] = (
     ("1×", 1.0),
     ("2×", 2.0),
 )
+
+# 事件表每页条数：一页正好填满默认表格高度，滚轮可在页内看历史。
+EVENT_PAGE_SIZE = 50
 
 STAGE_COLORS: dict[TaskStage, str] = {
     TaskStage.WAITING_PICK: "#6b7280",
@@ -392,8 +396,9 @@ class MonitorPage(QWidget):
         )
         self._event_table.horizontalHeader().setStretchLastSection(True)
         self._event_table.setColumnWidth(0, 100)
-        self._event_table.setColumnWidth(1, 92)
-        self._event_table.setColumnWidth(2, 140)
+        # 「人工二次涂油未完成」这类事件名要能整行显示，不能被截成「人工二…」。
+        self._event_table.setColumnWidth(1, 150)
+        self._event_table.setColumnWidth(2, 120)
         self._event_table.setMinimumHeight(220)
         self._event_table.cellDoubleClicked.connect(self._on_event_double_clicked)
 
@@ -402,8 +407,25 @@ class MonitorPage(QWidget):
         self._btn_clear = PushButton("清空事件")
         self._btn_clear.clicked.connect(self._on_clear_events)
 
+        # 事件翻页：每页 50 条，最多翻到最近 EVENT_HISTORY_LIMIT 条。
+        self._event_page = 0
+        self._btn_page_prev = PushButton("上一页")
+        self._btn_page_prev.setFixedWidth(78)
+        self._btn_page_prev.clicked.connect(lambda: self._change_event_page(-1))
+        self._btn_page_next = PushButton("下一页")
+        self._btn_page_next.setFixedWidth(78)
+        self._btn_page_next.clicked.connect(lambda: self._change_event_page(1))
+        self._event_page_label = QLabel("第 1 页")
+        self._event_page_label.setStyleSheet("color:#9ca3af;font-size:11px;")
+
         events_title = QLabel("最近事件")
         events_title.setStyleSheet("color:#e5e7eb;font-weight:600;")
+        page_row = QHBoxLayout()
+        page_row.setContentsMargins(0, 0, 0, 0)
+        page_row.addWidget(self._event_page_label)
+        page_row.addStretch(1)
+        page_row.addWidget(self._btn_page_prev)
+        page_row.addWidget(self._btn_page_next)
 
         right = QVBoxLayout()
         right.setContentsMargins(12, 0, 0, 0)
@@ -420,6 +442,7 @@ class MonitorPage(QWidget):
         right.addSpacing(8)
         right.addWidget(events_title)
         right.addWidget(self._event_table, 1)
+        right.addLayout(page_row)
         bottom_buttons = QHBoxLayout()
         bottom_buttons.addWidget(self._btn_review, 1)
         bottom_buttons.addWidget(self._btn_clear)
@@ -427,7 +450,8 @@ class MonitorPage(QWidget):
 
         right_widget = QWidget()
         right_widget.setLayout(right)
-        right_widget.setMinimumWidth(400)
+        # 事件列加宽后，右栏最窄也要能放下 时间/事件/任务 三列不换行。
+        right_widget.setMinimumWidth(440)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -506,6 +530,7 @@ class MonitorPage(QWidget):
 
         self._event_ids.clear()
         self._last_events_version = -1
+        self._event_page = 0
         self._event_table.setRowCount(0)
         self._last_frame_ts = 0.0
         self._frame_pos_text = ""
@@ -645,10 +670,11 @@ class MonitorPage(QWidget):
             f"手 {hand_count} 只 · 刷具 {brush_count} 个"
             + (suffix if suffix else "（区内跟踪）"),
         )
+        oiling_screws = screws_in_roi(station, snapshot, station.oiling_roi)
         self._region_cards["oiling"].set_state(
-            "已标定" if station.oiling_roi is not None else "未标定",
-            "#2563eb",
-            "预留涂油范围约束（本轮仅显示）",
+            f"丝杆 {oiling_screws} 个",
+            "#15803d" if oiling_screws else "#374151",
+            "涂油区内实时计数（本轮不参与判定）",
         )
 
     def _update_task_cards(self, snapshot: StationSnapshot | None) -> None:
@@ -719,10 +745,21 @@ class MonitorPage(QWidget):
         if version == self._last_events_version:
             return
         self._last_events_version = version
-        events = self._service.recent_events(20, station_id=station_id)
-        self._event_ids = [event.event_id for event in events]
-        self._event_table.setRowCount(len(events))
-        for row, event in enumerate(events):
+        self._render_events(station_id)
+
+    def _render_events(self, station_id: str) -> None:
+        events = self._service.recent_events(
+            EVENT_HISTORY_LIMIT, station_id=station_id
+        )
+        # 新事件会让总数变化，页码可能越界；翻页时这里把页码夹回最后一页。
+        last_page = max(0, (len(events) - 1) // EVENT_PAGE_SIZE)
+        self._event_page = max(0, min(self._event_page, last_page))
+        start = self._event_page * EVENT_PAGE_SIZE
+        page_events = events[start : start + EVENT_PAGE_SIZE]
+
+        self._event_ids = [event.event_id for event in page_events]
+        self._event_table.setRowCount(len(page_events))
+        for row, event in enumerate(page_events):
             result_text = event.result_label
             if event.review_result is not None:
                 result_text = f"{event.result_label}/{event.review_label}"
@@ -737,6 +774,23 @@ class MonitorPage(QWidget):
                 if event.result.value != "CONFIRMED":
                     item.setForeground(QColor("#fbbf24"))
                 self._event_table.setItem(row, col, item)
+        self._event_table.scrollToTop()
+
+        self._event_page_label.setText(
+            f"第 {self._event_page + 1}/{last_page + 1} 页"
+            f" · {start + len(page_events)}/{len(events)} 条"
+            if events
+            else "暂无事件"
+        )
+        self._btn_page_prev.setEnabled(self._event_page > 0)
+        self._btn_page_next.setEnabled(self._event_page < last_page)
+
+    def _change_event_page(self, delta: int) -> None:
+        station = self._current_station()
+        if station is None:
+            return
+        self._event_page = max(0, self._event_page + delta)
+        self._render_events(station.station_id)
 
     # ------------------------------------------------------------------
     # 操作
@@ -1022,6 +1076,28 @@ class MonitorPage(QWidget):
         self._station_combo.setCurrentIndex(index)
         self._station_combo.blockSignals(False)
         self._apply_station(index)
+
+
+def screws_in_roi(station, snapshot: StationSnapshot | None, roi) -> int:
+    """统计中心落在指定区域内的丝杆数（用于涂油区实时计数）。
+
+    丝杆不建轨迹，按本帧检测框统计。``snapshot.detections`` 已经过管线过滤
+    （工作追踪区 ∪ 涂油盘区），而涂油区本身就落在工作追踪区内，所以这里
+    只需再按涂油区过滤一次，不会漏数。``raw_mode`` 下是全画面检测，
+    按区过滤同样成立。
+    """
+
+    label = station.detector.screw_label
+    if snapshot is None or roi is None:
+        return 0
+    width, height = snapshot.frame_size
+    if width <= 0 or height <= 0:
+        return 0
+    return sum(
+        1
+        for det in snapshot.detections
+        if det.label == label and roi.contains_box_center(det.box, width, height)
+    )
 
 
 def work_area_counts(

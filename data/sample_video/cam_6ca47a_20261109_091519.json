@@ -1,0 +1,61 @@
+{
+  "type": "training_video",
+  "status": "finished",
+  "path": "/home/zw/OilCheckData/recordings/training/cam_6ca47a/2026-11-09/cam_6ca47a_20261109_091519.mp4",
+  "camera_id": "cam_6ca47a",
+  "camera_name": "1号位",
+  "station_id": "ST01",
+  "station_name": "1号取料工位",
+  "started_at": "2026-11-09T09:15:19.004+08:00",
+  "ended_at": "2026-11-09T09:15:40.649+08:00",
+  "started_at_epoch": 1794186919.004731,
+  "ended_at_epoch": 1794186940.649994,
+  "fps": 15,
+  "width": 2560,
+  "height": 1440,
+  "frame_count": 294,
+  "dropped_frames": 0,
+  "codec": "mp4v",
+  "rois": {
+    "tray_roi": {
+      "kind": "rect",
+      "points": [
+        [
+          0.498162,
+          0.058824
+        ],
+        [
+          0.706801,
+          0.338235
+        ]
+      ]
+    },
+    "hand_roi": {
+      "kind": "rect",
+      "points": [
+        [
+          0.341912,
+          0.408497
+        ],
+        [
+          0.903493,
+          0.996732
+        ]
+      ]
+    },
+    "brush_roi": {
+      "kind": "rect",
+      "points": [
+        [
+          0.373162,
+          0.390523
+        ],
+        [
+          0.847426,
+          0.993464
+        ]
+      ]
+    },
+    "exclude_rois": []
+  }
+}
