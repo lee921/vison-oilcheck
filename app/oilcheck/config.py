@@ -39,7 +39,7 @@ from .roi import Roi
 logger = logging.getLogger("oilcheck.config")
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.6"
+_CONFIG_VERSION = "2.7"
 
 # 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
 _TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
@@ -296,6 +296,12 @@ class PipelineConfig:
     brush_track_max_missing_s: float = 0.80
     brush_track_min_hits: int = 1
     brush_track_max_active: int = 4
+    # 刷头轨迹的**出生**准入距离：当帧刷头检测离任一 hand/screw 检测的中心
+    # 都超过该值时不新建轨迹（只把置信度压到 new_thresh 以下，已有轨迹照常
+    # 延续）。刷子干活时必然在手边，远离手与丝杆的「刷头」基本都是白色
+    # 物件误检。0 = 关闭。默认关闭：示例视频上它让刷头 ID 6→3，但 105708
+    # 的刷头 ID 3→4，收益不普适，等现场数据再定。
+    brush_spawn_max_distance: float = 0.0
 
     # 人工二次涂油：刷头工作点持续在丝杆接触邻域内累计到该时长即判完成
     brush_contact_distance: float = 0.060
@@ -380,12 +386,22 @@ class PipelineConfig:
     # 跟踪后端（手/刷头使用 ByteTrack）
     hand_tracker_backend: str = "auto"
     brush_tracker_backend: str = "auto"
-    bytetrack_high_thresh: float = 0.30
+    # 第一阶段（高置信度）关联门的置信度下限。0.30 → 0.45 是按示例视频实测
+    # 调的：手的检测置信度有 6~32% 低于 0.5，刷头低分框里混着白毛巾、白导轨
+    # 这类误检，0.30 会把它们放进第一阶段并长成轨迹；提到 0.45 后刷头的大
+    # 跳变（同一 ID 相邻帧位移 >10% 对角线）从 2/1 次降到 0/0 次，手部与全部
+    # 事件计数不变。低分框仍可由第二阶段补救关联接回已有轨迹。
+    bytetrack_high_thresh: float = 0.45
     bytetrack_low_thresh: float = 0.10
     bytetrack_new_thresh: float = 0.30
     # 关联代价阈值。门控未命中的代价固定为 1.5（高于任何阈值），因此 1.0 表示
     # 「只看距离/IoU 门限」，与 *_track_max_distance 的语义一致；调小可加严。
     bytetrack_match_thresh: float = 1.00
+    # 交给 ByteTrack 内部的轨迹缓冲区（按 max_fps 换算成帧数）。注意它**不是**
+    # 有效寿命：适配器在 ``hand_track_max_missing_s`` / ``brush_track_max_missing_s``
+    # 到了就把轨迹退役，并从 ByteTrack 的 tracked/lost/removed 三个池里剔除。
+    # 所以 buffer_s 大于 max_missing_s 时，多出来的部分完全用不上——想延长
+    # 轨迹寿命要调 max_missing_s，不是这一项。
     bytetrack_buffer_s: float = 2.00
     bytetrack_cost_alpha: float = 0.40
 
@@ -460,6 +476,14 @@ class PipelineConfig:
             ),
             brush_track_max_active=_i(
                 "brush_track_max_active", d.brush_track_max_active, 1, 32
+            ),
+            brush_spawn_max_distance=min(
+                1.0,
+                _f(
+                    "brush_spawn_max_distance",
+                    d.brush_spawn_max_distance,
+                    0.0,
+                ),
             ),
             brush_contact_distance=_legacy(
                 "brush_contact_distance",
@@ -576,6 +600,7 @@ class PipelineConfig:
             "brush_track_max_missing_s": self.brush_track_max_missing_s,
             "brush_track_min_hits": self.brush_track_min_hits,
             "brush_track_max_active": self.brush_track_max_active,
+            "brush_spawn_max_distance": self.brush_spawn_max_distance,
             "brush_contact_distance": self.brush_contact_distance,
             "brush_hold_s": self.brush_hold_s,
             "oiling_timeout_s": self.oiling_timeout_s,
@@ -1099,6 +1124,9 @@ class OilCheckConfigService:
         # 会被写成 "videos": []，之后按版本号补 demo 的分支不再触发，服务器
         # 上从此一条示例视频都没有（文件里段在、视频也在，下拉里却是空的）。
         demo_videos_outdated = old_parts < (2, 6)
+        # 2.7 刷头跟踪稳定性：高置信度阈值 0.30 → 0.45（低分框里混着白毛巾/
+        # 白导轨误检）；新增 brush_spawn_max_distance（默认关闭）。
+        tracking_outdated = old_parts < (2, 7)
 
         changed: list[str] = []
 
@@ -1233,6 +1261,22 @@ class OilCheckConfigService:
                 # 1.0 才是「只用距离门限」，等价于把配置写的行为还回来。
                 pipeline["bytetrack_match_thresh"] = 1.0
                 changed.append("pipeline.bytetrack_match_thresh")
+
+        # 4.44) 2.7 刷头跟踪稳定性：把仍是旧默认值 0.30 的高置信度阈值提到 0.45。
+        #       现场手工调过的值（不等于 0.30）一律保留。
+        #
+        #       背景：刷头低分框里混着白毛巾、白导轨这类误检，0.30 会把它们
+        #       放进第一阶段并长成轨迹，表现为同一个刷头 ID 一帧跳 0.29 对角线。
+        #       示例视频实测 0.45：刷头大跳变 2/1 → 0/0，手部与全部事件计数不变。
+        if tracking_outdated:
+            high_thresh = pipeline.get("bytetrack_high_thresh")
+            if high_thresh is None:
+                pass  # 缺键由第 6 步键集合同步按新默认值补上
+            elif isinstance(high_thresh, (int, float)) and abs(
+                float(high_thresh) - 0.30
+            ) < 1e-9:
+                pipeline["bytetrack_high_thresh"] = 0.45
+                changed.append("pipeline.bytetrack_high_thresh")
 
         # 4.45) 检测置信度必须低于 ByteTrack 高置信度阈值，否则低分框在
         #       检测层就被丢掉，第二阶段补救关联永远收不到输入。旧配置里
@@ -1452,6 +1496,11 @@ CONFIG_COMMENTS: dict[str, str] = {
     "pipeline.brush_track_max_missing_s": "刷头轨迹漏检后保留时长",
     "pipeline.brush_track_max_active": "同时保留的刷头轨迹上限",
     "pipeline.brush_track_min_hits": "刷头轨迹需命中多少帧才参与靠近判定",
+    "pipeline.brush_spawn_max_distance": (
+        "刷头轨迹的出生准入距离：刷头检测离任一 hand/screw 检测中心都超过\n"
+        "该值时不新建轨迹（已有轨迹照常延续）。刷子干活时必然在手边，远离手\n"
+        "与丝杆的「刷头」多是白色物件误检。0 = 关闭（默认）"
+    ),
     # ---- pipeline：二次涂油判定 ----
     "pipeline.brush_contact_distance": (
         "刷头工作点到手持丝杆中心的归一化距离小于该值，本帧计为「靠近」"
@@ -1525,7 +1574,10 @@ CONFIG_COMMENTS: dict[str, str] = {
     # ---- pipeline：跟踪后端 ----
     "pipeline.hand_tracker_backend": "auto=优先 ByteTrack，失败回退自研；可选 bytetrack / object",
     "pipeline.brush_tracker_backend": "同上，刷头专用",
-    "pipeline.bytetrack_high_thresh": "ByteTrack 高置信度检测阈值（第一阶段关联）",
+    "pipeline.bytetrack_high_thresh": (
+        "ByteTrack 高置信度检测阈值（第一阶段关联）。低分刷头框里混着白毛巾/\n"
+        "白导轨误检，0.30 会喂进第一阶段并长成轨迹，实测 0.45 更稳"
+    ),
     "pipeline.bytetrack_low_thresh": "ByteTrack 低置信度检测阈值（第二阶段补救关联）",
     "pipeline.bytetrack_new_thresh": "达到该置信度才允许新建轨迹",
     "pipeline.bytetrack_match_thresh": (
@@ -1533,7 +1585,8 @@ CONFIG_COMMENTS: dict[str, str] = {
         "调小可加严（现场标定用）"
     ),
     "pipeline.bytetrack_buffer_s": (
-        "轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）"
+        "ByteTrack 内部轨迹缓冲区（按 max_fps 换算成帧数）。不决定轨迹寿命——"
+        "适配器在 *_track_max_missing_s 到点即退役并剔除，想延长寿命调那一项"
     ),
     "pipeline.bytetrack_cost_alpha": (
         "关联代价权重：α·(1-IoU) + (1-α)·(中心距离/上限)。"

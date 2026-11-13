@@ -1,6 +1,6 @@
 {
   // 配置结构版本，供自动迁移判断，不要手工改
-  "version": "2.6",
+  "version": "2.7",
   // 时序判定参数。单位：时间=秒，距离=按画面对角线归一化
   "pipeline": {
     // 检测最大帧率。也是帧率自适应的基准：实际帧间隔超过 1/max_fps 时，距离门限按倍率放大（见 frame_scale_max）
@@ -30,6 +30,10 @@
     "brush_track_min_hits": 1,
     // 同时保留的刷头轨迹上限
     "brush_track_max_active": 3,
+    // 刷头轨迹的出生准入距离：刷头检测离任一 hand/screw 检测中心都超过
+    // 该值时不新建轨迹（已有轨迹照常延续）。刷子干活时必然在手边，远离手
+    // 与丝杆的「刷头」多是白色物件误检。0 = 关闭（默认）
+    "brush_spawn_max_distance": 0.0,
     // 刷头工作点到手持丝杆中心的归一化距离小于该值，本帧计为「靠近」
     "brush_contact_distance": 0.06,
     // 刷头靠近累计到该时长即判「人工二次涂油完成」。纯时间阈值，不随帧率缩放
@@ -80,8 +84,9 @@
     "hand_tracker_backend": "bytetrack",
     // 同上，刷头专用
     "brush_tracker_backend": "bytetrack",
-    // ByteTrack 高置信度检测阈值（第一阶段关联）
-    "bytetrack_high_thresh": 0.3,
+    // ByteTrack 高置信度检测阈值（第一阶段关联）。低分刷头框里混着白毛巾/
+    // 白导轨误检，0.30 会喂进第一阶段并长成轨迹，实测 0.45 更稳
+    "bytetrack_high_thresh": 0.45,
     // ByteTrack 低置信度检测阈值（第二阶段补救关联）
     "bytetrack_low_thresh": 0.1,
     // 达到该置信度才允许新建轨迹
@@ -89,7 +94,7 @@
     // 关联代价阈值。未进门限的代价固定为 1.5，所以 1.0 表示「只看距离/IoU 门限」；
     // 调小可加严（现场标定用）
     "bytetrack_match_thresh": 1.0,
-    // 轨迹丢失后保留的时长（按 max_fps 换算成帧数交给 ByteTrack）
+    // ByteTrack 内部轨迹缓冲区（按 max_fps 换算成帧数）。不决定轨迹寿命——适配器在 *_track_max_missing_s 到点即退役并剔除，想延长寿命调那一项
     "bytetrack_buffer_s": 3.0,
     // 关联代价权重：α·(1-IoU) + (1-α)·(中心距离/上限)。调大更看重框重叠，调小更看重中心距离
     "bytetrack_cost_alpha": 0.4

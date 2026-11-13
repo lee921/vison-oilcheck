@@ -499,6 +499,15 @@ class StationPipeline:
             tracker=self._brush_tracker,
             ts=ts,
         )
+        # 刷头出生准入：刷子干活时必然在手边或丝杆边，远离两者的「刷头」
+        # 基本都是白色毛巾/导轨误检。只压制**新建轨迹**，已有轨迹的延续不受
+        # 影响（分数压到 new_thresh 以下，仍可走第二阶段接回）。
+        brushes = self._demote_isolated_brushes(
+            brushes=brushes,
+            hands=hands,
+            screws=detections.by_label(cfg.screw_label),
+            frame_size=frame_size,
+        )
 
         # 距离门限按帧间隔放大：同一个动作在低帧率下单帧位移更大，
         # 不放大就会把「还是这只手/这个刷子」判成新目标。
@@ -700,6 +709,39 @@ class StationPipeline:
         if not extra:
             return in_roi
         return in_roi + tuple(extra)
+
+    def _demote_isolated_brushes(
+        self,
+        *,
+        brushes: tuple[Detection, ...],
+        hands: tuple[Detection, ...],
+        screws: tuple[Detection, ...],
+        frame_size: tuple[int, int],
+    ) -> tuple[Detection, ...]:
+        """把离手与丝杆都太远、注定是误检的刷头检测压到低置信度带。
+
+        ``brush_spawn_max_distance=0`` 时原样返回。锚点用**当帧检测**而不是
+        轨迹，避免漏检帧把真刷子也判成孤立：刷子抬手时手一定同时在画面里。
+        """
+
+        limit = float(self.cfg.brush_spawn_max_distance)
+        if limit <= 0 or not brushes:
+            return brushes
+        anchors = [
+            det.box.center for det in hands
+        ] + [det.box.center for det in screws]
+        if not anchors:
+            return brushes
+        width, height = frame_size
+        diag = max(1.0, math.hypot(width, height))
+        kept: list[Detection] = []
+        for det in brushes:
+            cx, cy = det.box.center
+            near = any(
+                math.hypot(cx - ax, cy - ay) / diag <= limit for ax, ay in anchors
+            )
+            kept.append(det if near else _demote_for_continuation(det, self.cfg))
+        return tuple(kept)
 
     def _tray_region_box(self, ts: float, frame_size: tuple[int, int]) -> BBox | None:
         """涂油盘区：手工 ``tray_roi`` 与模型检出 ``oil_station`` 框的并集。
@@ -1603,8 +1645,16 @@ class StationPipeline:
         return hand
 
     def _hand_center(self, hand_track_id: int | None) -> tuple[float, float] | None:
+        """本周期那只手的中心，用于丝杆锚点初始化。
+
+        与其余判定（握持、进盘/离盘、锚点交叠）统一用 ``observation_box()``
+        ——原始检测框。``box`` 是卡尔曼滤波后的状态，快速移动时明显滞后
+        （实测 200px 的跳变只走到 155px）；锚点初始化时用滤波框会把杆锁到
+        手「上一帧所在」的位置，取料瞬间尤其容易锁错。
+        """
+
         hand = self._live_hand(hand_track_id)
-        return None if hand is None else hand.box.center
+        return None if hand is None else hand.observation_box().center
 
     def _has_live_brush(self) -> bool:
         """本帧是否有任一已匹配的刷头轨迹（用于区分漏检和远离）。"""

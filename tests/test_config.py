@@ -22,8 +22,8 @@ def test_repo_oilcheck_template_is_valid():
     data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
-    assert cfg.version == "2.6"
-    assert data["version"] == "2.6"
+    assert cfg.version == "2.7"
+    assert data["version"] == "2.7"
     assert cfg.stations
     station = cfg.stations[0]
     assert station.station_id == "ST01"
@@ -200,7 +200,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.6"
+    assert cfg.version == "2.7"
     assert station.detector.kind == "yolo"
     assert station.detector.model_path.endswith("best.pt")
     assert station.detector.brush_label == "brush"
@@ -269,7 +269,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.6"
+    assert cfg.version == "2.7"
     # 用户调过的 ROI 与判定参数保留
     assert station.tray_roi.points == ((0.5, 0.1), (0.72, 0.44))
     assert station.work_roi.points == ((0.35, 0.0), (0.99, 0.95))
@@ -437,6 +437,32 @@ def test_missing_demo_section_is_filled_with_template_videos(tmp_path):
     expected = [item["name"] for item in template["demo"]["videos"]]
     assert expected, "模板里的示例视频清单不应为空"
     assert [video.name for video in cfg.demo.videos] == expected
+
+
+def test_tracking_threshold_migrates_only_from_old_default(tmp_path):
+    """2.7 把仍是旧默认 0.30 的高置信度阈值提到 0.45，现场调过的值保留。"""
+
+    from app.oilcheck.config import OilCheckConfigService
+
+    def _old_default(data) -> None:  # noqa: ANN001
+        data["version"] = "2.6"
+        data["pipeline"]["bytetrack_high_thresh"] = 0.30
+        data["pipeline"].pop("brush_spawn_max_distance", None)
+
+    path = _write_config(tmp_path, _old_default)
+    cfg = OilCheckConfigService(path.parent).load()
+    assert cfg.version == "2.7"
+    assert cfg.pipeline.bytetrack_high_thresh == 0.45
+    # 新键补默认值（关闭），不会因为迁移被打开
+    assert cfg.pipeline.brush_spawn_max_distance == 0.0
+
+    def _tuned(data) -> None:  # noqa: ANN001
+        data["version"] = "2.6"
+        data["pipeline"]["bytetrack_high_thresh"] = 0.36
+
+    tuned_path = _write_config(tmp_path / "tuned", _tuned)
+    tuned = OilCheckConfigService(tuned_path.parent).load()
+    assert tuned.pipeline.bytetrack_high_thresh == 0.36
 
 
 def test_missing_videos_key_is_filled_with_template_videos(tmp_path):
@@ -661,7 +687,7 @@ def test_repo_template_is_commented():
     text = path.read_text(encoding="utf-8")
     assert "//" in text, "模板应带注释"
     # 注释不破坏可解析性
-    assert json.loads(strip_json_comments(text))["version"] == "2.6"
+    assert json.loads(strip_json_comments(text))["version"] == "2.7"
 
 
 def test_save_preserves_comments(tmp_path):
