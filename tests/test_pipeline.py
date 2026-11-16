@@ -343,6 +343,56 @@ def test_grip_detected_when_screw_sticks_out_of_hand_corner():
     assert [e for e in events if e.event_type == EventType.PICK], "杆从虎口伸出时取料被判丢了"
 
 
+def test_screw_still_inside_tray_but_already_moving_counts_as_grip():
+    """手里那根杆的中心还没离开盘区、但已经在动：必须算「带料离盘」。
+
+    手工 ``tray_roi`` 把盘体下方的手臂活动范围一起框进去了，取料瞬间手里
+    那根杆的中心常常仍落在盘区内（示例④ 第 3 次取料的 f348~f351 整段如此）。
+    以前按「杆心在不在盘区」排除静置杆，这些帧全被当成盘里的静置杆，整段
+    离盘初期一根正面证据都攒不到，取料判不出来。
+
+    区别在**位置稳定性**：盘里那排杆纹丝不动，被带走的杆即使中心还在盘区
+    内，框也已经在动。这个用例让手持杆在盘区下沿附近持续移动（杆心仍在
+    盘区内、与手框右上区的重叠只有 5% 左右，低于静置杆那一档门限），
+    同时另喂一根真正静置的盘内杆。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    # 真正静置的盘内杆：离手框远，只用来证明「静置杆仍然被排除」。
+    parked = screw_at(470.0, 120.0)
+
+    # 盘外空手走近。
+    for step in range(3):
+        feed(pipeline, next(ts_iter), hand_at(350.0, 700.0 - step * 30))
+    # 空手进盘并停留（满足 pick_confirm_s）。
+    for step in range(5):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(ENTRY_HAND[0], ENTRY_HAND[1] - step * 6),
+            parked,
+        )
+    # 离盘：手走到盘区下沿外，手里的杆跟着横向移动，杆心仍在盘区内
+    # （盘区到 y=520）。前几帧不动，把静置判定窗口喂满；随后杆开始移动——
+    # 被带走的杆与「八帧前那个位置」的 IoU 会掉下来。
+    for _ in range(3):
+        feed(pipeline, next(ts_iter), hand_at(500.0, 545.0),
+             held_screw_at(570.0, 495.0), parked)
+    path = [(540.0, 495.0), (525.0, 495.0), (510.0, 495.0), (495.0, 495.0),
+            (480.0, 495.0), (465.0, 495.0)]
+    for cx, cy in path:
+        feed(pipeline, next(ts_iter), hand_at(cx + 30, 545.0),
+             held_screw_at(cx, cy), parked)
+    for _ in range(4):
+        feed(pipeline, next(ts_iter), hand_at(440.0, 600.0),
+             held_screw_at(440.0, 600.0), parked)
+
+    assert [e for e in events if e.event_type == EventType.PICK], \
+        "杆心仍在盘区内但已经随手动，这次取料被判丢了"
+
+
 def test_parked_screw_in_tray_does_not_count_as_grip_after_exit():
     """空手离盘、盘里的静置杆恰好落在手框右上区：不能算「带料离盘」。
 

@@ -71,6 +71,25 @@ _ROI_TRACK_LIMIT_ABS = 0.10
 # 盘体漏检超过该时长，涂油盘区退回手工标定区（不再用外推框）。
 _TRAY_PREDICT_TRUST_S = 0.30
 
+# 「盘里的静置杆」判定窗口与门限。
+#
+# 盘内那排丝杆是**位置长期不动**的；被手带走的杆即使在中心还没离开盘区时，
+# 框也已经在动。只按「杆心在不在盘区」排除静置杆会漏判：手工 tray_roi 覆盖
+# 了盘体下方的手臂活动范围，取料瞬间手里那根杆的中心往往还落在盘区内
+# （示例④ 第 2、3 次取料的整段离盘初期都是这样），于是被当成静置杆丢掉，
+# 整件取料判不出来。
+#
+# 实测四段示例视频：静置杆与 _SCREW_STATIC_BACK 帧前的位置 IoU 在 0.5 以上
+# （p50 0.9+），被带走的杆 0.3 以下；分界清晰，取 0.5。
+_SCREW_STATIC_BACK = 8
+_SCREW_STATIC_IOU = 0.5
+_SCREW_HISTORY_MAX = _SCREW_STATIC_BACK + 2
+
+# 对**确认静置**的盘内杆，握持仍要求杆有足够面积落在手框右上区（实测盘边
+# 蹭到的静置杆 0.25~0.42，真正攥住的 ≥0.44）；对已经脱离原位的杆，只要与
+# 右上区相交即算——它不可能是盘里的静置杆。
+_GRIP_PARKED_MIN_FRAC = 0.50
+
 # 「纯位置连续性」跟进手持丝杆的单帧位移上限（不随帧率放大）。
 #
 # 与「杆与本周期那只手交叠」的证据强度不同：握持是强证据，取料瞬间手带杆
@@ -200,26 +219,41 @@ def _majority(samples: deque[bool] | list[bool]) -> bool:
 _GRIP_CORNER_RX = 0.5
 _GRIP_CORNER_RY = 0.5
 # 杆框至少要有多大比例落在右上角区域里才算「握着」。丝杆又细又长，
-# 斜着握时与右上区只有部分重叠，门限取 0.3：示例③握持段 0.44~0.68，
-# 空手在盘边蹭到的静置杆 0.25~0.42（另有盘内静置杆排除条件兜底）。
+# 斜着握时与右上区只有部分重叠；示例③握持段 0.44~0.68，空手在盘边蹭到的
+# 静置杆 0.25~0.42。这个值现在是 ``_gripped_by_corner`` 的默认门限，
+# 调用方按杆的状态另选（见 ``_GRIP_PARKED_MIN_FRAC`` 与 ``min_frac=0``）。
 _GRIP_CORNER_MIN_FRAC = 0.30
 
 
-def _gripped_by_corner(hand_box: BBox, screw_box: BBox) -> bool:
+def _grip_corner_fraction(hand_box: BBox, screw_box: BBox) -> float:
+    """杆有多大比例的面积落在手框右上角区域里（0~1）。"""
+
+    x1 = hand_box.x2 - hand_box.width * _GRIP_CORNER_RX
+    y2 = hand_box.y1 + hand_box.height * _GRIP_CORNER_RY
+    inter = BBox(x1, hand_box.y1, hand_box.x2, y2).intersection_area(screw_box)
+    area = screw_box.width * screw_box.height
+    return inter / area if area > 0 else 0.0
+
+
+def _gripped_by_corner(
+    hand_box: BBox,
+    screw_box: BBox,
+    *,
+    min_frac: float = _GRIP_CORNER_MIN_FRAC,
+) -> bool:
     """杆框与手框右上角区域相交，且杆有足够比例落在这块区域里。
 
     这是「拳头握住杆身、杆从虎口伸出」的几何特征：杆心已经跑到手框外，
     ``_box_center_in`` 判不出来；丝杆面积只有手框的 17~26%，IoU 也不够。
+
+    ``min_frac`` 由调用方按杆的状态选择：确认静置的盘内杆要求更高的重叠
+    （盘边蹭到的静置杆也能交到 0.25~0.42），已经脱离原位的杆取 0 即可。
     """
 
-    x1 = hand_box.x2 - hand_box.width * _GRIP_CORNER_RX
-    y2 = hand_box.y1 + hand_box.height * _GRIP_CORNER_RY
-    corner = BBox(x1, hand_box.y1, hand_box.x2, y2)
-    inter = corner.intersection_area(screw_box)
-    if inter <= 0:
+    if screw_box.width <= 0 or screw_box.height <= 0:
         return False
-    area = screw_box.width * screw_box.height
-    return area > 0 and inter / area >= _GRIP_CORNER_MIN_FRAC
+    frac = _grip_corner_fraction(hand_box, screw_box)
+    return frac > 0 and frac >= min_frac
 
 
 @dataclass
@@ -357,6 +391,11 @@ class StationPipeline:
         self._last_frame_ts: float | None = None
         self._frame_size: tuple[int, int] = (0, 0)
         self._last_detections: tuple[Detection, ...] = ()
+        # 最近若干帧的丝杆检测框，用于区分「盘里的静置杆」与「被手带走的杆」
+        # （见 ``_screw_parked_in_tray``）。每帧一份，按帧序追加。
+        self._screw_history: deque[tuple[BBox, ...]] = deque(
+            maxlen=_SCREW_HISTORY_MAX
+        )
         self._hand_tracks: tuple[Track, ...] = ()
         self._brush_tracks: tuple[Track, ...] = ()
         self._frames_processed = 0
@@ -405,6 +444,7 @@ class StationPipeline:
         self._last_frame_ts = None
         self._frame_size = (0, 0)
         self._last_detections = ()
+        self._screw_history.clear()
         self._hand_tracks = ()
         self._brush_tracks = ()
         self._frame_gap_events = 0
@@ -522,6 +562,15 @@ class StationPipeline:
         self._brush_tracks = brush_out.active
 
         self._update_pick(ts=ts, tray_box=tray_box)
+        # 本帧的丝杆框在**判定之后**入库：``_screw_history`` 表示「此前若干
+        # 帧」的位置，静置杆判据拿 [-BACK] 与之比较，多入一帧会整体错位。
+        self._screw_history.append(
+            tuple(
+                det.box
+                for det in detections.detections
+                if det.label == cfg.screw_label
+            )
+        )
         # 复核统计：处于 PICKED 阶段的周期，每帧都算一次「取料后经过的帧数」。
         # 放在 _update_oiling 之前，杆不可见而提前返回的帧也能计入。
         for task in self._cycles.values():
@@ -1084,14 +1133,29 @@ class StationPipeline:
             history.popleft()
 
     def _screw_parked_in_tray(self, screw: Detection) -> bool:
-        """这根杆是不是盘里的静置杆（中心落在涂油盘区内）。
+        """这根杆是不是盘里那根**没被动过**的静置杆。
 
-        手在盘外时盘里的杆一定是静置的；手在盘内时这个判断没有意义，
-        调用方只在「手已判在盘外」的分支里用它。
+        只看「中心在不在盘区」不够：手工 ``tray_roi`` 把盘体下方的手臂活动
+        范围也框进去了，取料时手里那根杆的中心常常还落在盘区内（示例④第 2、
+        3 次取料的离盘初期整段如此），按中心判定就会把正被带走的杆当成静置
+        杆排除掉，整件取料判不出来。
+
+        真正的区别在**位置稳定性**：盘里那排杆在 ``_SCREW_STATIC_BACK`` 帧
+        尺度上纹丝不动，被手带走的杆即使中心还没出盘区，框也已经在动。
+        实测四段示例视频里静置杆对该窗口内位置的 IoU ≥0.5（中位 0.9+），
+        被带走的杆 ≤0.3。
+
+        中心不在盘区的杆一律不是静置杆；历史不足时按静置处理（保守：
+        盘区外的手在这一点上不做宽松推断）。
         """
 
         tray_box = self._tray_region_box(self._last_frame_ts or 0.0, self._frame_size)
-        return tray_box is not None and _box_center_in(screw.box, tray_box)
+        if tray_box is None or not _box_center_in(screw.box, tray_box):
+            return False
+        if len(self._screw_history) < _SCREW_STATIC_BACK:
+            return True
+        past = self._screw_history[-_SCREW_STATIC_BACK]
+        return any(box.iou(screw.box) >= _SCREW_STATIC_IOU for box in past)
 
     def _mostly_empty_outside(
         self, hand_id: int, ts: float, *, default_empty: bool = False
@@ -1183,6 +1247,14 @@ class StationPipeline:
            正好落在手框右上区里，会被判成「带料进盘」（视频①②实测会因为
            进盘定性被判成持有而丢掉整件取料）。
 
+        第 2 条对「盘里的静置杆」与「已经在动的杆」用两档门限：确认静置的
+        杆要求杆有 ``_GRIP_PARKED_MIN_FRAC`` 的面积落进右上区（盘边蹭到的
+        静置杆实测 0.25~0.42，真攥住的 ≥0.44）；已经脱离原位的杆只要求与
+        右上区相交——它不可能是盘里那排静置杆，没必要再抬门限。杆被带走时
+        手常常是「握着杆身、杆从虎口伸出去」，与右上区的重叠刚好落在两档
+        之间，用同一个 0.30 会把整段离盘初期判成空手（示例④ 第 3 次取料
+        f353~f358 即如此）。
+
         盘内不启用第 2 条：手伸在盘上方必然蹭到盘里的静置杆，那条读数与
         实际有没有握着无关（盘内握持读数本来就不参与投票，见 ``_HandVisit``）。
         """
@@ -1202,15 +1274,16 @@ class StationPipeline:
             distance = math.hypot(cx - hx, cy - hy) / diag
             if distance > self.cfg.hand_screw_max_distance:
                 continue
-            gripped = (
-                _box_center_in(det.box, hand_box)
-                or hand_box.iou(det.box) >= 0.15
-                or (
-                    hand_outside
-                    and not self._screw_parked_in_tray(det)
-                    and _gripped_by_corner(hand_box, det.box)
-                )
-            )
+            gripped = _box_center_in(det.box, hand_box) or hand_box.iou(det.box) >= 0.15
+            if not gripped and hand_outside:
+                if self._screw_parked_in_tray(det):
+                    # 盘里没被动过的那排：要求杆明显落进右上区，避免盘边蹭到。
+                    gripped = (
+                        _grip_corner_fraction(hand_box, det.box)
+                        >= _GRIP_PARKED_MIN_FRAC
+                    )
+                else:
+                    gripped = _gripped_by_corner(hand_box, det.box, min_frac=0.0)
             if not gripped:
                 continue
             if best is None or distance < best[0]:
