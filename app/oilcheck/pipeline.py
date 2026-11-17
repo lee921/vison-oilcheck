@@ -81,9 +81,9 @@ _SCREW_STATIC_BACK = 8
 _SCREW_STATIC_IOU = 0.5
 _SCREW_HISTORY_MAX = _SCREW_STATIC_BACK + 2
 
-# 对**确认静置**的盘内杆，握持仍要求杆有足够面积落在手框右上区（实测盘边
-# 蹭到的静置杆 0.25~0.42，真正攥住的 ≥0.44）；对已经脱离原位的杆，只要与
-# 右上区相交即算——它不可能是盘里的静置杆。
+# 对**位置没动过**的杆，握持要求杆有足够面积落在手框右上区（实测盘边蹭到的
+# 静置杆 0.25~0.42，真正攥住的 ≥0.44）；对已经在动的杆，只要与右上区相交
+# 即算——它不可能是静置杆。
 _GRIP_PARKED_MIN_FRAC = 0.50
 
 # 「纯位置连续性」跟进手持丝杆的单帧位移上限（不随帧率放大）。
@@ -93,6 +93,11 @@ _GRIP_PARKED_MIN_FRAC = 0.50
 # 附近」，允许的跨度必须小得多，否则锚点会一步跳到旁边另一根杆上（实测
 # 在 0.15 的跨度下会被另一只手的杆抢走）。
 _CONTINUITY_STEP_ABS = 0.08
+
+# 「同一根杆」的判定距离（归一化）：位置没动过的杆只有在离锚点这么近时才
+# 仍被当成锚点自己那根。盘里相邻丝杆间距 0.02~0.03，取 0.02 以内的重叠
+# 不会把旁边的静置杆误认成锚点（见 ``_static_anchor_ok``）。
+_ANCHOR_SAME_SCREW_DISTANCE = 0.02
 
 
 @dataclass
@@ -1054,6 +1059,23 @@ class StationPipeline:
         while history and ts - history[0][1] > window:
             history.popleft()
 
+    def _screw_static(self, box: BBox) -> bool:
+        """这根杆的位置是否**没动过**（与 ``_SCREW_STATIC_BACK`` 帧前同位）。
+
+        只按位置稳定性判断，与杆在不在盘区里无关：盘里那排杆、零件盒里的
+        整排杆都不动；被手带走的杆即使中心还没离开盘区，框也已经在动。
+        实测四段示例视频里不动的杆对该窗口内位置的 IoU ≥0.5（中位 0.9+），
+        被带走的杆 ≤0.3。
+
+        历史不足时不作判断（返回 False）：开局/复位后的前几帧没有对照，
+        此时不能凭它否定握持，否则真取料会被吞掉。
+        """
+
+        if len(self._screw_history) < _SCREW_STATIC_BACK:
+            return False
+        past = self._screw_history[-_SCREW_STATIC_BACK]
+        return any(box.iou(past_box) >= _SCREW_STATIC_IOU for past_box in past)
+
     def _screw_parked_in_tray(self, screw: Detection) -> bool:
         """这根杆是不是盘里那根**没被动过**的静置杆。
 
@@ -1062,10 +1084,7 @@ class StationPipeline:
         3 次取料的离盘初期整段如此），按中心判定就会把正被带走的杆当成静置
         杆排除掉，整件取料判不出来。
 
-        真正的区别在**位置稳定性**：盘里那排杆在 ``_SCREW_STATIC_BACK`` 帧
-        尺度上纹丝不动，被手带走的杆即使中心还没出盘区，框也已经在动。
-        实测四段示例视频里静置杆对该窗口内位置的 IoU ≥0.5（中位 0.9+），
-        被带走的杆 ≤0.3。
+        真正的区别在**位置稳定性**（见 :meth:`_screw_static`）。
 
         中心不在盘区的杆一律不是静置杆；历史不足时按静置处理（保守：
         盘区外的手在这一点上不做宽松推断）。
@@ -1076,8 +1095,7 @@ class StationPipeline:
             return False
         if len(self._screw_history) < _SCREW_STATIC_BACK:
             return True
-        past = self._screw_history[-_SCREW_STATIC_BACK]
-        return any(box.iou(screw.box) >= _SCREW_STATIC_IOU for box in past)
+        return self._screw_static(screw.box)
 
     def _mostly_empty_outside(
         self, hand_id: int, ts: float, *, default_empty: bool = False
@@ -1154,30 +1172,28 @@ class StationPipeline:
         )
 
     def _holding_screw(self, hand_box: BBox) -> Detection | None:
-        """手里拿着的那根丝杆。
+        """手里拿着的那根丝杆。严格按「空手进盘、带丝杆出盘」的口径：
 
-        三条判据，依次是：
-
-        1. **杆心落在手框内**，或两者 IoU ≥ 0.15 —— 杆被手完全握住/遮住；
-        2. **手框右上角区域与杆框相交** —— 实际握姿是拳头攥住杆身、杆从虎口
+        1. **杆必须已经出盘**。手在盘外时，杆心仍落在手工 ``tray_roi`` 里
+           的一律不算手里拿着——那是盘里的料。取料的定义就是「带丝杆**出**
+           盘」，杆心还在盘区里就还没出盘。这条不加，「离盘」这一帧手上
+           蹭到的盘内杆会被当成取料证据：示例① 第 88~103 帧工人只是把手
+           伸进盘里点按夹具，离盘瞬间杆心还在盘区内的那根杆和手框交叠，
+           于是凭空多判一件取料；
+        2. **杆心落在手框内**，或两者 IoU ≥ 0.15 —— 杆被手完全握住/遮住；
+        3. **手框右上角区域与杆框相交** —— 实际握姿是拳头攥住杆身、杆从虎口
            （手框右上角）伸出去，此时杆心已经在手框外、IoU 也上不去。丝杆
            又细又长（面积只有手框的 17~26%），IoU 的结构上限就是面积比，
            0.15 这条门限在握持状态下几乎不可达（示例③实测握持段 IoU 只有
-           0.03~0.13，而「杆心在手框内」会随手的朝向时真时假）；
-        3. 第 2 条的**盘外限定**：手在盘外时，落在涂油盘内部的杆是盘里的
-           静置杆，不算握着。不加这条，手伸向盘边挑料时，盘里那排静止杆
-           正好落在手框右上区里，会被判成「带料进盘」（视频①②实测会因为
-           进盘定性被判成持有而丢掉整件取料）。
+           0.03~0.13，而「杆心在手框内」会随手的朝向时真时假）。
 
-        第 2 条对「盘里的静置杆」与「已经在动的杆」用两档门限：确认静置的
-        杆要求杆有 ``_GRIP_PARKED_MIN_FRAC`` 的面积落进右上区（盘边蹭到的
-        静置杆实测 0.25~0.42，真攥住的 ≥0.44）；已经脱离原位的杆只要求与
-        右上区相交——它不可能是盘里那排静置杆，没必要再抬门限。杆被带走时
-        手常常是「握着杆身、杆从虎口伸出去」，与右上区的重叠刚好落在两档
-        之间，用同一个 0.30 会把整段离盘初期判成空手（示例④ 第 3 次取料
-        f353~f358 即如此）。
+        第 3 条只对**已经在动**的杆放开到「相交即可」；位置没动过的杆
+        要求杆有 ``_GRIP_PARKED_MIN_FRAC`` 的面积落进右上区（盘边蹭到的
+        实测 0.25~0.42，真攥住的 ≥0.44）。杆被带走时手常常是「握着杆身、
+        杆从虎口伸出去」，与右上区的重叠刚好落在两档之间，用同一个 0.30
+        会把整段离盘初期判成空手（示例④ 第 3 次取料 f353~f358 即如此）。
 
-        盘内不启用第 2 条：手伸在盘上方必然蹭到盘里的静置杆，那条读数与
+        盘内不启用第 2、3 条：手伸在盘上方必然蹭到盘里的杆，那条读数与
         实际有没有握着无关（盘内握持读数本来就不参与投票，见 ``_HandVisit``）。
         """
 
@@ -1185,7 +1201,6 @@ class StationPipeline:
         diag = max(1.0, math.hypot(width, height))
         label = self.station.detector.screw_label
         hx, hy = hand_box.center
-        # 盘外限定：手在涂油盘区里时，盘内的杆是静置杆，不能当握持证据。
         tray_box = self._tray_region_box((width, height))
         hand_outside = tray_box is None or not _box_center_in(hand_box, tray_box)
         best: tuple[float, Detection] | None = None
@@ -1196,10 +1211,17 @@ class StationPipeline:
             distance = math.hypot(cx - hx, cy - hy) / diag
             if distance > self.cfg.hand_screw_max_distance:
                 continue
+            if (
+                hand_outside
+                and tray_box is not None
+                and _box_center_in(det.box, tray_box)
+            ):
+                # 杆心还在手工盘区内：手在盘外，说明这根还没被带出盘。
+                continue
             gripped = _box_center_in(det.box, hand_box) or hand_box.iou(det.box) >= 0.15
             if not gripped and hand_outside:
-                if self._screw_parked_in_tray(det):
-                    # 盘里没被动过的那排：要求杆明显落进右上区，避免盘边蹭到。
+                if self._screw_static(det.box):
+                    # 位置没动过的杆不可能在手里：盘边/夹具边蹭到的不算。
                     gripped = (
                         _grip_corner_fraction(hand_box, det.box)
                         >= _GRIP_PARKED_MIN_FRAC
@@ -1333,6 +1355,29 @@ class StationPipeline:
         if task.brush_hold_s >= self.cfg.brush_hold_s - 1e-9:
             self._complete_oiling(task, ts)
 
+    def _static_anchor_ok(self, box: BBox, anchor: tuple[float, float] | None) -> bool:
+        """这根杆能不能当「手里那根」的候选。
+
+        位置没动过的杆（盘里的料、零件盒里的整排、夹具上的）一律排除——
+        手框很大，随手一放就与整排杆交叠，那些杆不可能是正被带走/正被刷的
+        这一根。示例① 第一次涂油时，锚点从工件漂到零件盒里的静置杆上，
+        刷子在真杆上刷了 5 秒、接触累计却只有 0.13s，整件被判漏涂。
+
+        例外：**就是锚点当前那根**。拳头压着杆、杆贴着夹具刷油时这一刻
+        确实可能不动；允许它继续，否则锚点每抖一下就要丢一次。
+        """
+
+        if not self._screw_static(box):
+            return True
+        if anchor is None:
+            return False
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        return (
+            math.hypot(box.center[0] - anchor[0], box.center[1] - anchor[1]) / diag
+            <= _ANCHOR_SAME_SCREW_DISTANCE
+        )
+
     def _current_screw_box(self, task: _Cycle, ts: float) -> BBox | None:
         """当前手持丝杆的位置：**丝杆锚点跟踪**，不依赖手部视觉 ID。
 
@@ -1378,6 +1423,11 @@ class StationPipeline:
         hand_center = self._hand_center(task.hand_track_id)
 
         # 1) 握在手里的杆：与**本周期那只手**的框交叠的那些。
+        #
+        # 加一条「位置没动过的不算」：手框很大（实测 348×399 px），手在盘中
+        # 或零件盒边随手一放就与整排杆交叠；那些杆纹丝不动，不可能是手里
+        # 正在被带走的这一根。锚点已经锁定的那根除外——拳头压着杆时它可能
+        # 连续几帧不动。
         cycle_hand = self._live_hand(task.hand_track_id)
         gripped: list[tuple[float, BBox]] = []
         for det in self._last_detections:
@@ -1386,6 +1436,8 @@ class StationPipeline:
             if cycle_hand is None or not _overlaps(
                 det.box, cycle_hand.observation_box()
             ):
+                continue
+            if not self._static_anchor_ok(det.box, anchor):
                 continue
             cx, cy = det.box.center
             distance = (
@@ -1437,6 +1489,8 @@ class StationPipeline:
             nearest: tuple[float, BBox] | None = None
             for det in self._last_detections:
                 if det.label != label:
+                    continue
+                if not self._static_anchor_ok(det.box, anchor):
                     continue
                 cx, cy = det.box.center
                 distance = math.hypot(cx - anchor[0], cy - anchor[1]) / diag
@@ -1573,6 +1627,11 @@ class StationPipeline:
                 or hand_box.iou(det.box) >= 0.15
             )
             if not gripped:
+                continue
+            # 位置没动过的杆不算：手臂从零件盒/盘上方经过时整排杆都落在
+            # 手框内，接成锚点之后刷手里那根永远累计不上（同
+            # ``_static_anchor_ok``）。
+            if not self._static_anchor_ok(det.box, task.screw_anchor):
                 continue
             # 多根都满足时取离旧锚点最近的（离得远说明是别人手里的）。
             cx, cy = det.box.center

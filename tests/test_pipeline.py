@@ -343,18 +343,25 @@ def test_grip_detected_when_screw_sticks_out_of_hand_corner():
     assert [e for e in events if e.event_type == EventType.PICK], "杆从虎口伸出时取料被判丢了"
 
 
-def test_screw_still_inside_tray_but_already_moving_counts_as_grip():
-    """手里那根杆的中心还没离开盘区、但已经在动：必须算「带料离盘」。
+def test_screw_still_inside_tray_does_not_count_as_leaving_tray():
+    """杆心还在手工盘区内、只是随手动了一下：不算「带丝杆出盘」。
 
-    手工 ``tray_roi`` 把盘体下方的手臂活动范围一起框进去了，取料瞬间手里
-    那根杆的中心常常仍落在盘区内（示例④ 第 3 次取料的 f348~f351 整段如此）。
-    以前按「杆心在不在盘区」排除静置杆，这些帧全被当成盘里的静置杆，整段
-    离盘初期一根正面证据都攒不到，取料判不出来。
+    取料的口径是**空手入盘、带丝杆出盘**，盘区就是手工划定的那块
+    ``tray_roi``。手已经退到盘外、但手里那根杆的中心仍落在盘区内时，这根
+    还没出盘，不能当作取料证据。
 
-    区别在**位置稳定性**：盘里那排杆纹丝不动，被带走的杆即使中心还在盘区
-    内，框也已经在动。这个用例让手持杆在盘区下沿附近持续移动（杆心仍在
-    盘区内、与手框右上区的重叠只有 5% 左右，低于静置杆那一档门限），
-    同时另喂一根真正静置的盘内杆。
+    这条曾经被放开（按「位置稳定性」而不是按盘区），代价是示例① 第
+    88~103 帧那类动作被凭空判成取料：工人只是把手伸进盘点按夹具，离盘
+    瞬间盘内 (1489,501) 那根杆与手框交叠，静置判定又因为手在动、杆的框
+    跟着抖了一下而失手，于是多出一件 PICK，下一件真取料反被判漏涂。
+
+    这个用例让手持杆在盘区下沿附近持续横向移动（杆心仍在盘区内）：
+    出盘之前这段不能判取料，进盘过程按「空手离盘」结算。
+
+    「离盘后才把杆带出盘区」不会补判：离盘后的盘外握持采样攒满
+    ``pick_history_samples`` 点即定论，此时杆还没出盘，结论就是空手。
+    现场的真取料是在离盘后一两帧内就把杆带到盘区外（四段示例视频全部
+    如此），不受这条影响。
     """
 
     pipeline, events = make_pipeline()
@@ -375,8 +382,7 @@ def test_screw_still_inside_tray_but_already_moving_counts_as_grip():
             parked,
         )
     # 离盘：手走到盘区下沿外，手里的杆跟着横向移动，杆心仍在盘区内
-    # （盘区到 y=520）。前几帧不动，把静置判定窗口喂满；随后杆开始移动——
-    # 被带走的杆与「八帧前那个位置」的 IoU 会掉下来。
+    # （盘区到 y=520）——这一段不能判取料。
     for _ in range(3):
         feed(pipeline, next(ts_iter), hand_at(500.0, 545.0),
              held_screw_at(570.0, 495.0), parked)
@@ -385,12 +391,13 @@ def test_screw_still_inside_tray_but_already_moving_counts_as_grip():
     for cx, cy in path:
         feed(pipeline, next(ts_iter), hand_at(cx + 30, 545.0),
              held_screw_at(cx, cy), parked)
+    # 随后才带出盘区。
     for _ in range(4):
         feed(pipeline, next(ts_iter), hand_at(440.0, 600.0),
              held_screw_at(440.0, 600.0), parked)
 
-    assert [e for e in events if e.event_type == EventType.PICK], \
-        "杆心仍在盘区内但已经随手动，这次取料被判丢了"
+    assert [e for e in events if e.event_type == EventType.PICK] == [], \
+        "杆心还在盘区内就判了取料"
 
 
 def test_parked_screw_in_tray_does_not_count_as_grip_after_exit():
@@ -1313,6 +1320,42 @@ def test_screw_anchor_prefers_screw_gripped_by_hand():
     assert anchor is not None
     ax, ay = anchor
     assert math.hypot(ax - HAND_TARGET[0], ay - HAND_TARGET[1]) < 60
+
+
+def test_screw_anchor_never_locks_onto_a_still_screw():
+    """锚点不能接到「位置没动过」的杆上：那是盘里/零件盒里的料。
+
+    手框实测 348×399 px，手在零件盒边随手一放就与整排静置杆交叠。示例①
+    第一次涂油时锚点就从手里那根杆漂到了零件盒里的静置杆上：刷子在真杆上
+    刷了 5 秒，接触累计只有 0.13 s，整件被判漏涂。
+
+    这里让手里那根杆短暂不可见（被手遮住），旁边摆一根纹丝不动的杆，
+    距离在「纯位置连续性」的步长之内。锚点必须停在原处等真杆回来，
+    不能被静置杆接走。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+    do_pick(pipeline, ts_iter)
+    task = pipeline._cycles[pipeline.tasks[0].task_id]
+    anchor_before = task.screw_anchor
+    assert anchor_before is not None
+
+    # 静置杆在零件盒里：离锚点 50px（归一化 0.05，在 0.08 的连续性步长内）。
+    # 先让它在场 12 帧、一动不动（位置稳定性判定要 8 帧历史）。
+    still = screw_at(400.0, 650.0)
+    for _ in range(12):
+        feed(pipeline, next(ts_iter), hand_at(*HAND_TARGET),
+             held_screw_at(*HAND_TARGET), still)
+
+    # 手里那根杆被手完全遮住，只剩手和静置杆被检出。
+    for _ in range(6):
+        feed(pipeline, next(ts_iter), hand_at(*HAND_TARGET), still)
+
+    ax, ay = task.screw_anchor
+    assert math.hypot(ax - anchor_before[0], ay - anchor_before[1]) < 30, (
+        "锚点被位置没动过的静置杆接走了"
+    )
 
 
 def test_frame_scale_adapts_to_actual_frame_interval():
