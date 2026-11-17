@@ -19,3 +19,4 @@ data/*
 SdkLog_*/
 SDKLOG/
 *.log
+model/detect.zip
