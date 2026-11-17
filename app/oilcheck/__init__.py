@@ -15,7 +15,7 @@ from .events import EventStore
 from .pipeline import StationPipeline
 from .recorder import TrainingRecorder, list_segments
 from .service import OilCheckService
-from .tracker import ObjectTracker, Track, TrayTracker
+from .tracker import ObjectTracker, Track
 from .types import (
     Detection,
     EventRecord,
@@ -28,7 +28,6 @@ from .types import (
     TaskResult,
     TaskSnapshot,
     TaskStage,
-    TraySnapshot,
 )
 from .video_source import VideoFileSource
 
@@ -60,8 +59,6 @@ __all__ = [
     "TaskStage",
     "Track",
     "TrainingRecorder",
-    "TraySnapshot",
-    "TrayTracker",
     "VideoFileSource",
     "YoloDetector",
     "create_detector",

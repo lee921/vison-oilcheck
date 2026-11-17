@@ -60,6 +60,7 @@ docs/                  各模块设计/使用文档（必读）
 tests/                 取料/涂油判定、关联、跟踪、事件、配置单元测试
 tools/detect_video.py  离线跑示例视频，输出带框视频与逐帧检测 JSONL
 tools/tracker_ab.py    离线对比跟踪参数/策略下的手与刷头轨迹质量
+tools/plc_check.py     PLC（警示灯）Modbus TCP 只读体检：连通性、寄存器、字节序、时延
 lib/                   海康 SDK 运行库与 Python 封装
 ```
 

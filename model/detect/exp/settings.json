@@ -3,14 +3,14 @@
     "project": "/home/zw/xanylabeling_data/trainer/ultralytics/runs/detect",
     "name": "exp",
     "env": "/home/zw/vison-oilcheck/.venv/bin/python",
-    "model": "/home/zw/xanylabeling_data/trainer/ultralytics/weights/yolo11n.pt",
+    "model": "/home/zw/xanylabeling_data/trainer/ultralytics/weights/yolo11s.pt",
     "data": "/home/zw/xanylabeling_data/trainer/ultralytics/datasets/oilcheck_4cls_20261106_v4/data.yaml",
     "device": "cuda",
     "dataset_ratio": 0.8,
     "pose_config": ""
   },
   "train": {
-    "epochs": 100,
+    "epochs": 200,
     "batch": 32,
     "imgsz": 1024,
     "workers": 4,

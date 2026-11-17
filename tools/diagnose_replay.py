@@ -22,7 +22,6 @@ sys.path.insert(0, str(REPO_ROOT))
 from app.oilcheck.config import OilCheckConfigService  # noqa: E402
 from app.oilcheck.detector import create_detector  # noqa: E402
 from app.oilcheck.pipeline import StationPipeline  # noqa: E402
-from app.oilcheck.roi import Roi  # noqa: E402
 from app.paths import resolve_runtime_file, runtime_root  # noqa: E402
 
 
@@ -182,18 +181,10 @@ def main() -> int:
         )
         in_work_counts.append(screw_in)
 
-        # 取料判定的起点是「手空手进入涂油盘区」。盘区 = 手工 tray_roi ∪ 模型
-        # 检出的 oil_station 框。这里统计有多少帧真的出现了「手在盘内」——
-        # 若为 0，无论后面的参数怎么调都不可能有 PICK。
+        # 取料判定的起点是「手空手进入涂油盘区」。盘区**只**来自手工 tray_roi
+        # （模型检出的 oil_station 框不参与判定）。这里统计有多少帧真的出现了
+        # 「手在盘内」——若为 0，无论后面的参数怎么调都不可能有 PICK。
         tray_rois = [station.tray_roi]
-        tray_label = station.detector.tray_label
-        tray_rois.extend(
-            Roi(kind="rect", points=(
-                (d.box.x1 / snapshot.frame_size[0], d.box.y1 / snapshot.frame_size[1]),
-                (d.box.x2 / snapshot.frame_size[0], d.box.y2 / snapshot.frame_size[1]),
-            ))
-            for d in raw if d.label == tray_label
-        )
         hands = [d for d in raw if d.label == station.detector.hand_label]
         if any(d.label == station.detector.screw_label for d in raw):
             frames_with_screw_detected += 1

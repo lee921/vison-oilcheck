@@ -222,6 +222,9 @@ def test_source_combo_follows_demo_video_changes():
         def video_status(self, station_id):  # noqa: ANN001, ARG002
             return {}
 
+        def plc_status(self):
+            return {"enabled": False}
+
     class _Manager:
         def get_session(self, camera_id):  # noqa: ANN001, ARG002
             return None
@@ -363,6 +366,9 @@ def test_event_table_pages_through_event_history():
 
         def video_status(self, station_id):  # noqa: ANN001, ARG002
             return {}
+
+        def plc_status(self):
+            return {"enabled": False}
 
     class _Manager:
         def get_session(self, camera_id):  # noqa: ANN001, ARG002

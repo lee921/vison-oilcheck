@@ -591,8 +591,8 @@ def test_targets_outside_work_area_are_not_tracked():
     assert [e for e in events if e.event_type == EventType.PICK] == []
 
 
-def test_tray_detection_extends_tray_region():
-    """模型检出的 oil_station 框扩大涂油盘区，框内手仍按“进盘”处理。"""
+def test_tray_detection_does_not_extend_tray_region():
+    """涂油盘区只用手工 ``tray_roi``；模型检出的 oil_station 框不参与判定。"""
 
     pipeline, events = make_pipeline()
     ts_iter = timestamps()
@@ -611,7 +611,8 @@ def test_tray_detection_extends_tray_region():
             screw_at(*screw_pos),
         )
 
-    assert pipeline._visits, "oil_station 框内的手应被当作已进盘"
+    # 手在检测框内、但不在手工 tray_roi 内 ⇒ 不算进盘（进盘过程不会建立）。
+    assert all(not visit.entered_confirmed for visit in pipeline._visits.values())
 
 
 def test_tray_motion_does_not_break_hand_tracking():

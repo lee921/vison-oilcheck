@@ -14,9 +14,9 @@
 文件里却缺的键补写回文件（只补不删、不改已有值），让文件里的键与实际
 生效的参数始终一致。旧版配置中的 ``pick_roi``、
 ``oiling_roi``、``hand_roi``、``brush_roi``、``slot_layout`` 等旧字段在读取时
-会自动迁移为 ``work_roi`` / ``oiling_roi``。涂油盘区 = 手工标定的
-``tray_roi`` 与模型检出的 ``oil_station`` 框的并集：手工区覆盖盘体下方的
-手臂活动范围，检测框跟随盘体上下移动。
+会自动迁移为 ``work_roi`` / ``oiling_roi``。涂油盘区**只由手工标定的
+``tray_roi`` 决定**：它必须覆盖盘体连同下方的手臂活动范围（模型只框得出
+盘体本身），模型检出的 ``oil_station`` 框不参与判定，只供显示与排查。
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from .roi import Roi
 logger = logging.getLogger("oilcheck.config")
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.7"
+_CONFIG_VERSION = "2.9"
 
 # 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
 _TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
@@ -116,6 +116,15 @@ _STATION_REMOVED_2_4: tuple[str, ...] = (
     "occlusion_rois",
     "slot_auto_count",
     "slot_follow_tray",
+)
+
+# 2.9 删除的管线字段：涂油盘区改为只用手工 ``tray_roi`` 后，盘体跟踪不再
+# 参与任何判定，这三个参数没有任何消费方。留在现场配置里只会误导——
+# 改它们不会有任何效果。迁移时清掉，键集合同步也不会再补回来。
+_PIPELINE_REMOVED_2_9: tuple[str, ...] = (
+    "tray_max_distance",
+    "tray_max_missing_s",
+    "tray_min_confidence",
 )
 
 # 2.1 新增的检测器字段及其默认值，迁移时补齐。
@@ -334,11 +343,6 @@ class PipelineConfig:
     # 一堆早就不关心的事件占着内存。设 0 = 不限时，只按条数保留。
     completed_retain_s: float = 3600.0
 
-    # 涂油盘定位（只作为取料参考区域）
-    tray_max_distance: float = 0.20
-    tray_max_missing_s: float = 1.0
-    tray_min_confidence: float = 0.30
-
     # 手-丝杆关联（空间距离 + 交互关系）
     hand_screw_max_distance: float = 0.10
     hand_interaction_margin: float = 0.02
@@ -515,16 +519,6 @@ class PipelineConfig:
             completed_retain_s=_f(
                 "completed_retain_s", d.completed_retain_s, 0.0
             ),
-            tray_max_distance=_f(
-                "tray_max_distance", d.tray_max_distance, 0.01
-            ),
-            tray_max_missing_s=_f(
-                "tray_max_missing_s", d.tray_max_missing_s, 0.0
-            ),
-            tray_min_confidence=max(
-                0.0,
-                min(1.0, _f("tray_min_confidence", d.tray_min_confidence, 0.0)),
-            ),
             hand_screw_max_distance=_f(
                 "hand_screw_max_distance", d.hand_screw_max_distance, 0.005
             ),
@@ -609,9 +603,6 @@ class PipelineConfig:
             "task_max_active": self.task_max_active,
             "completed_keep_count": self.completed_keep_count,
             "completed_retain_s": self.completed_retain_s,
-            "tray_max_distance": self.tray_max_distance,
-            "tray_max_missing_s": self.tray_max_missing_s,
-            "tray_min_confidence": self.tray_min_confidence,
             "hand_screw_max_distance": self.hand_screw_max_distance,
             "hand_interaction_margin": self.hand_interaction_margin,
             "held_infer_distance": self.held_infer_distance,
@@ -773,16 +764,145 @@ class DemoConfig:
         return None
 
 
+# PLC 允许的字节序。``lsb`` = 寄存器低字节是编号较小的 VB，这是本现场协议表
+# 四个例子自证出来的读法（见 docs/12 §3.2）。
+_PLC_BYTE_ORDERS = frozenset({"lsb", "msb"})
+
+_DEFAULT_PLC_BACKOFF_MS = (200, 500, 1000, 2000, 5000)
+
+
+@dataclass(frozen=True)
+class PlcConfig:
+    """PLC 警示灯（Modbus TCP）配置。
+
+    默认**关闭**且**只读**：装上代码不会自动写 PLC。现场确认字节序与工步
+    编号之后再开 ``enabled`` / 关 ``dry_run``。
+    """
+
+    enabled: bool = False
+    # 只读联调：照常算帧、照常打日志，但不写 PLC
+    dry_run: bool = True
+    host: str = "192.168.1.88"
+    port: int = 502
+    unit_id: int = 1
+    # 首地址从 0 开始（不是 40001）
+    register_base: int = 0
+    byte_order: str = "lsb"
+    # 空 = 取第一个启用的工位
+    station_id: str = ""
+    # 一拍 200ms：兼顾工步切换延迟与保活（PLC 空闲 10~18s 会断连）
+    poll_interval_ms: int = 200
+    # 期望值没变也按这个周期重写，用于 PLC 重启后自愈
+    refresh_interval_s: float = 1.0
+    connect_timeout_s: float = 1.0
+    request_timeout_s: float = 0.5
+    # 断链退避（毫秒）。实测同一时刻连发第二条建连要等约 1s，不能 0ms 猛重试
+    reconnect_backoff_ms: tuple[int, ...] = _DEFAULT_PLC_BACKOFF_MS
+    # 终态（涂油完成/异常）在 PLC 上保持多久再回工步 1
+    hold_s: float = 1.0
+    # 工步编号：取料记在第几步、涂油结论记在第几步
+    steps: dict[str, int] = field(default_factory=lambda: {"pick": 1, "oiling": 3})
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> PlcConfig:
+        data = dict(data or {})
+        d = cls()
+
+        def _float(key: str, default: float, lo: float, hi: float) -> float:
+            try:
+                value = float(data.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(hi, value))
+
+        def _int(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                value = int(data.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return max(lo, min(hi, value))
+
+        backoff_raw = data.get("reconnect_backoff_ms", d.reconnect_backoff_ms)
+        backoff: list[int] = []
+        if isinstance(backoff_raw, (list, tuple)):
+            for item in backoff_raw:
+                try:
+                    value = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if value >= 0:
+                    backoff.append(min(60000, value))
+        if not backoff:
+            backoff = list(_DEFAULT_PLC_BACKOFF_MS)
+
+        steps_raw = data.get("steps")
+        steps = dict(d.steps)
+        if isinstance(steps_raw, dict):
+            for key in ("pick", "oiling"):
+                if key in steps_raw:
+                    try:
+                        value = int(steps_raw[key])
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= value <= 8:
+                        steps[key] = value
+
+        order = str(data.get("byte_order", d.byte_order)).strip().lower()
+        return cls(
+            enabled=bool(data.get("enabled", d.enabled)),
+            dry_run=bool(data.get("dry_run", d.dry_run)),
+            host=str(data.get("host", d.host)).strip() or d.host,
+            port=_int("port", d.port, 1, 65535),
+            unit_id=_int("unit_id", d.unit_id, 0, 255),
+            register_base=_int("register_base", d.register_base, 0, 65535),
+            byte_order=order if order in _PLC_BYTE_ORDERS else d.byte_order,
+            station_id=str(data.get("station_id", d.station_id)).strip(),
+            poll_interval_ms=_int("poll_interval_ms", d.poll_interval_ms, 20, 5000),
+            refresh_interval_s=_float(
+                "refresh_interval_s", d.refresh_interval_s, 0.1, 60.0
+            ),
+            connect_timeout_s=_float(
+                "connect_timeout_s", d.connect_timeout_s, 0.1, 30.0
+            ),
+            request_timeout_s=_float(
+                "request_timeout_s", d.request_timeout_s, 0.05, 30.0
+            ),
+            reconnect_backoff_ms=tuple(backoff),
+            hold_s=_float("hold_s", d.hold_s, 0.0, 60.0),
+            steps=steps,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "dry_run": self.dry_run,
+            "host": self.host,
+            "port": self.port,
+            "unit_id": self.unit_id,
+            "register_base": self.register_base,
+            "byte_order": self.byte_order,
+            "station_id": self.station_id,
+            "poll_interval_ms": self.poll_interval_ms,
+            "refresh_interval_s": self.refresh_interval_s,
+            "connect_timeout_s": self.connect_timeout_s,
+            "request_timeout_s": self.request_timeout_s,
+            "reconnect_backoff_ms": list(self.reconnect_backoff_ms),
+            "hold_s": self.hold_s,
+            "steps": dict(self.steps),
+        }
+
+
 @dataclass(frozen=True)
 class StationConfig:
     """一个工位的 ROI 与检测配置。
 
     工位有三个区域：
 
-    - ``tray_roi``：涂油盘区的**手工底区**，用于判断“手进盘/离盘”。
+    - ``tray_roi``：涂油盘区，用于判断“手进盘/离盘”。
       它覆盖盘体下方的手臂活动范围——模型只框得出盘体本身，手伸下去取料时
-      会在盘体下方 100~280px，只靠检测框会把取料全部漏掉。运行时与模型检出
-      的 ``oil_station`` 框取并集，跟随盘体上下移动。
+      会在盘体下方 100~280px，只靠检测框会把取料全部漏掉。盘区**只由这个
+      手工区决定**，模型检出的 ``oil_station`` 框不参与判定（盘体检测只供
+      显示与排查）。
     - ``work_roi``：工作追踪区，跟踪与判定只处理中心落在该区域
       （或涂油盘区内）的目标。
     - ``oiling_roi``：涂油区，标定与显示用，预留给后续涂油范围约束。
@@ -1016,6 +1136,7 @@ class OilCheckConfig:
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
+    plc: PlcConfig = field(default_factory=PlcConfig)
     stations: tuple[StationConfig, ...] = ()
 
     @classmethod
@@ -1032,6 +1153,7 @@ class OilCheckConfig:
             pipeline=PipelineConfig.from_dict(data.get("pipeline")),
             recording=RecordingConfig.from_dict(data.get("recording")),
             demo=DemoConfig.from_dict(data.get("demo")),
+            plc=PlcConfig.from_dict(data.get("plc")),
             stations=tuple(stations),
         )
 
@@ -1041,6 +1163,7 @@ class OilCheckConfig:
             "pipeline": self.pipeline.to_dict(),
             "recording": self.recording.to_dict(),
             "demo": self.demo.to_dict(),
+            "plc": self.plc.to_dict(),
             "stations": [station.to_dict() for station in self.stations],
         }
 
@@ -1127,6 +1250,12 @@ class OilCheckConfigService:
         # 2.7 刷头跟踪稳定性：高置信度阈值 0.30 → 0.45（低分框里混着白毛巾/
         # 白导轨误检）；新增 brush_spawn_max_distance（默认关闭）。
         tracking_outdated = old_parts < (2, 7)
+        # 2.8 新增 plc 段（警示灯）。默认关闭 + 只读，装上代码不会自动写 PLC。
+        # 具体补键交给下面第 6 步「键集合同步」，这里不需要单独分支。
+        # 2.9 涂油盘区改为只用手工 tray_roi，删除盘体跟踪参数（见
+        # _PIPELINE_REMOVED_2_9）。这一项**不看版本号**：2.9 之前的任何配置
+        # 都可能带着这三个永不生效的键，按版本号判断会漏掉已升到 2.8 的现场；
+        # 只在键存在时删除，幂等。
 
         changed: list[str] = []
 
@@ -1277,6 +1406,14 @@ class OilCheckConfigService:
             ) < 1e-9:
                 pipeline["bytetrack_high_thresh"] = 0.45
                 changed.append("pipeline.bytetrack_high_thresh")
+
+        # 4.6) 2.9 涂油盘区改为只用手工 tray_roi：删掉盘体跟踪参数。不看
+        #      版本号（见上面 2.9 注释），键存在就删，幂等。
+        if isinstance(pipeline, dict):
+            for key in _PIPELINE_REMOVED_2_9:
+                if key in pipeline:
+                    pipeline.pop(key)
+                    changed.append(f"-pipeline.{key}")
 
         # 4.45) 检测置信度必须低于 ByteTrack 高置信度阈值，否则低分框在
         #       检测层就被丢掉，第二阶段补救关联永远收不到输入。旧配置里
@@ -1532,9 +1669,6 @@ CONFIG_COMMENTS: dict[str, str] = {
         "已结束周期最多再保留这么久即回收（与上一项取交集）；0=不限时"
     ),
     # ---- pipeline：涂油盘定位 ----
-    "pipeline.tray_max_distance": "涂油盘跟踪的匹配距离（盘体上下移动时用）",
-    "pipeline.tray_max_missing_s": "涂油盘检测漏检后保留预测框的时长",
-    "pipeline.tray_min_confidence": "低于该置信度的盘体检测不参与盘区更新",
     # ---- pipeline：手-丝杆与丝杆锚点 ----
     "pipeline.hand_screw_max_distance": (
         "手框与丝杆框的关联距离上限；还要求两者交叠才认作「握着」"
@@ -1605,12 +1739,44 @@ CONFIG_COMMENTS: dict[str, str] = {
     "demo.loop": "播放结束后是否从头循环",
     "demo.fps_limit": "投放帧率上限，实际取 min(视频原帧率, 该值)",
     "demo.speed": (
-        "播放速率倍数（0.1~4）。只改播放快慢，判定按视频媒体时间计时，"
-        "结果不受影响"
+        "播放速率倍数（0.1~4）。只改播放快慢，判定按视频媒体时间计时，" "结果不受影响"
     ),
     "demo.videos": "示例视频清单，监控页「画面源」下拉按这里的 name 生成",
     "demo.videos[].name": "下拉里显示的名字",
     "demo.videos[].path": "视频路径，相对仓库根或绝对路径",
+    # ---- plc：警示灯 ----
+    "plc": (
+        "PLC 警示灯（Modbus TCP）。默认关闭且只读：装上代码不会自动写 PLC。"
+        "协议见 docs/12-PLC警示灯通信与控制.md"
+    ),
+    "plc.enabled": "总开关。现场确认字节序与工步编号后再开",
+    "plc.dry_run": "只读联调：照常算帧、照常打日志，但不写 PLC",
+    "plc.host": "PLC 的 IP。本机需在 192.168.1.x 网段（见 docs/12 §1.2）",
+    "plc.port": "Modbus TCP 端口，现场协议表为 502",
+    "plc.unit_id": "从站 unit id。该 PLC 不校验（实测 0/1/2/255 都接受）",
+    "plc.register_base": "保持寄存器首地址。现场协议表从 0 开始（不是 40001）",
+    "plc.byte_order": (
+        "字节序：lsb = 寄存器低字节是编号较小的 VB（协议表四个例子自证的读法），"
+        "msb = 反过来。除非现场确认字节序相反，不要改"
+    ),
+    "plc.station_id": "取哪个工位的判定状态；留空 = 第一个启用的工位",
+    "plc.poll_interval_ms": (
+        "一拍周期。PLC 空闲 10~18s 会断连，且只允许一条 Modbus 会话，"
+        "这里同时起保活作用"
+    ),
+    "plc.refresh_interval_s": (
+        "期望值没变也按这个周期重写一次，用于 PLC 重启后自愈"
+        "（实测上电残留值 HR1=0x00FF）"
+    ),
+    "plc.connect_timeout_s": "建连超时",
+    "plc.request_timeout_s": "单次请求超时。超时一律当断链处理并重连",
+    "plc.reconnect_backoff_ms": (
+        "断链重连退避（毫秒）。实测同一时刻连发第二条建连要等约 1s，" "不能 0ms 猛重试"
+    ),
+    "plc.hold_s": "涂油完成/异常在 PLC 上保持多久再回工步 1，给 PLC 读结论的时间",
+    "plc.steps": "工步编号：取料记在第几步、涂油结论记在第几步",
+    "plc.steps.pick": "取料记在第几工步（1~8），默认 1",
+    "plc.steps.oiling": "涂油结论（良品/不良）记在第几工步（1~8），默认 3",
     # ---- stations ----
     "stations": "工位列表，每个工位一台相机",
     "stations[].station_id": "工位 ID，事件与日志里用它区分",
@@ -1618,8 +1784,9 @@ CONFIG_COMMENTS: dict[str, str] = {
     "stations[].camera_id": "对应 cameras.json 里的相机 ID",
     "stations[].enabled": "是否启用该工位",
     "stations[].tray_roi": (
-        "涂油盘区的手工底区，用于判断「手进盘/离盘」。必须把盘体连同"
-        "下方手臂活动范围一起框进去：模型只框得出盘体本身，运行时两者取并集"
+        "涂油盘区，用于判断「手进盘/离盘」。必须把盘体连同下方手臂活动范围"
+        "一起框进去：模型只框得出盘体本身，手取料时在盘体下方 100~280px。"
+        "盘区只由这个手工区决定，模型检出的 oil_station 框不参与判定"
     ),
     "stations[].work_roi": (
         "工作追踪区，跟踪与判定的有效范围。只有中心落在该区（或涂油盘区）内"

@@ -1,8 +1,8 @@
 task: detect
 mode: train
-model: /home/zw/xanylabeling_data/trainer/ultralytics/weights/yolo11n.pt
+model: /home/zw/xanylabeling_data/trainer/ultralytics/weights/yolo11s.pt
 data: /home/zw/xanylabeling_data/trainer/ultralytics/datasets/oilcheck_4cls_20261106_v4/data.yaml
-epochs: 100
+epochs: 200
 time: 0.0
 patience: 100
 batch: 32

@@ -8,7 +8,7 @@ from qfluentwidgets import Theme, setTheme
 
 from app.camera_manager import CameraManager
 from app.config_service import ConfigService
-from app.logging_service import LogStore, setup_logging
+from app.logging_service import FILE_ONLY, LogStore, setup_logging
 from app.oilcheck.config import OilCheckConfigService
 from app.oilcheck.events import EventStore
 from app.oilcheck.service import OilCheckService
@@ -31,6 +31,14 @@ def main() -> int:
     log_store = LogStore()
     log_dir = (storage_root / app_cfg.log_dir).resolve()
     logger = setup_logging(log_dir=log_dir, store=log_store)
+
+    # 旧配置提醒放到日志就绪之后再打，并且**只进日志文件**：``ensure_defaults()``
+    # 在 setup_logging 之前跑，那时打出去只会被 Python 的 lastResort 甩到
+    # 控制台；日志就绪后也不该占启动输出——现场启动时想看的是 Modbus 连接
+    # 与模型加载。这条提示在日志页与日志文件里都能查到。
+    orphaned = cfg_service.orphaned_config_warning()
+    if orphaned:
+        logger.warning(orphaned, extra={FILE_ONLY: True})
 
     app = QApplication(sys.argv)
     setTheme(Theme.DARK)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime
 
@@ -24,6 +26,7 @@ from qfluentwidgets import (
     InfoBarPosition,
     LineEdit,
     PrimaryPushButton,
+    PushButton,
 )
 
 from app.camera_manager import CameraManager
@@ -31,6 +34,7 @@ from app.config_service import ConfigService
 from app.models import AppConfig
 from app.oilcheck.config import OilCheckConfig, OilCheckConfigService
 from app.oilcheck.roi import Roi
+from ui.utils import UiInvoker
 from ui.widgets.roi_calibration import RoiCalibrationDialog
 
 
@@ -88,11 +92,6 @@ class SettingsPage(QWidget):
         self._oiling_timeout = _double_spin(0.0, 3600.0, 1.0, 1)
         self._holding_lost_timeout = _double_spin(0.0, 30.0, 0.1, 2)
 
-        # 盘体跟踪参数
-        self._tray_distance = _double_spin(0.01, 0.5, 0.01, 3)
-        self._tray_missing = _double_spin(0.0, 10.0, 0.1, 2)
-        self._tray_confidence = _double_spin(0.0, 1.0, 0.05, 2)
-
         # 手与丝杆关联
         self._hand_screw_distance = _double_spin(0.005, 1.0, 0.005, 3)
         self._held_infer_distance = _double_spin(0.005, 1.0, 0.005, 3)
@@ -123,6 +122,31 @@ class SettingsPage(QWidget):
         self._segment_seconds = _double_spin(10.0, 86400.0, 30.0, 1)
         self._codec = LineEdit()
         self._auto_start = QCheckBox("程序启动后自动开始录制")
+
+        # PLC 警示灯（默认关闭 + 只读）
+        self._plc_enabled = QCheckBox("启用 PLC 警示灯输出")
+        self._plc_enabled.setToolTip(
+            "默认关闭。现场按 docs/12 §8 确认字节序后再开。\n"
+            "该 PLC 只允许一条 Modbus TCP 会话，不要同时开博途在线监控。"
+        )
+        self._plc_dry_run = QCheckBox("只读联调（算帧并打日志，不写 PLC）")
+        self._plc_dry_run.setToolTip(
+            "联调第一周建议保持勾选：日志里能看到每一拍应写的字节，"
+            "可与 PLC 在线监控逐位核对。"
+        )
+        self._plc_host = LineEdit()
+        self._plc_host.setPlaceholderText("192.168.1.88")
+        self._plc_port = QSpinBox()
+        self._plc_port.setRange(1, 65535)
+        self._plc_hold_s = _double_spin(0.0, 60.0, 0.5, 1)
+        self._plc_hold_s.setToolTip("涂油完成/异常在 PLC 上保持多久再回工步 1")
+        self._btn_plc_test = PushButton("测试连接")
+        self._btn_plc_test.clicked.connect(self._on_plc_test)
+        # 测试连接会阻塞在 socket 上，放到单线程执行器里跑，避免卡住 UI。
+        self._plc_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="oilcheck-plc-test"
+        )
+        self._ui = UiInvoker(self, logger=logging.getLogger("oilcheck.ui.settings"))
 
         self._btn_save = PrimaryPushButton("保存全部")
         self._btn_roi = PrimaryPushButton("打开 ROI 标定")
@@ -162,11 +186,6 @@ class SettingsPage(QWidget):
         advanced_form.addRow("手部跟踪后端", self._hand_backend)
         advanced_form.addRow("刷头跟踪后端", self._brush_backend)
 
-        tray_form = QFormLayout()
-        tray_form.addRow("盘体最大关联距离（归一化）", self._tray_distance)
-        tray_form.addRow("盘体短时漏检保留（秒）", self._tray_missing)
-        tray_form.addRow("盘体最低置信度", self._tray_confidence)
-
         tracking_form = QFormLayout()
         tracking_form.addRow("手部最大关联距离（归一化）", self._hand_track_distance)
         tracking_form.addRow("手部短时漏检保留（秒）", self._hand_track_missing)
@@ -184,6 +203,14 @@ class SettingsPage(QWidget):
         record_form.addRow("编码 FourCC", self._codec)
         record_form.addRow("", self._auto_start)
 
+        plc_form = QFormLayout()
+        plc_form.addRow("", self._plc_enabled)
+        plc_form.addRow("", self._plc_dry_run)
+        plc_form.addRow("PLC IP", self._plc_host)
+        plc_form.addRow("端口", self._plc_port)
+        plc_form.addRow("完成保持窗（秒）", self._plc_hold_s)
+        plc_form.addRow("", self._btn_plc_test)
+
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 12, 0)
@@ -196,9 +223,6 @@ class SettingsPage(QWidget):
         content_layout.addWidget(_section("取料事件与二次涂油判定"))
         content_layout.addLayout(pipeline_form)
         content_layout.addSpacing(12)
-        content_layout.addWidget(_section("涂油盘定位"))
-        content_layout.addLayout(tray_form)
-        content_layout.addSpacing(12)
         content_layout.addWidget(_section("手与丝杆关联"))
         content_layout.addLayout(assoc_form)
         content_layout.addSpacing(12)
@@ -210,6 +234,9 @@ class SettingsPage(QWidget):
         content_layout.addSpacing(12)
         content_layout.addWidget(_section("训练视频录制"))
         content_layout.addLayout(record_form)
+        content_layout.addSpacing(12)
+        content_layout.addWidget(_section("PLC 警示灯（Modbus TCP）"))
+        content_layout.addLayout(plc_form)
         content_layout.addStretch(1)
 
         scroll = QScrollArea()
@@ -254,9 +281,6 @@ class SettingsPage(QWidget):
         self._oiling_timeout.setValue(float(pipeline.oiling_timeout_s))
         self._holding_lost_timeout.setValue(float(pipeline.holding_lost_timeout_s))
 
-        self._tray_distance.setValue(float(pipeline.tray_max_distance))
-        self._tray_missing.setValue(float(pipeline.tray_max_missing_s))
-        self._tray_confidence.setValue(float(pipeline.tray_min_confidence))
         self._hand_screw_distance.setValue(
             float(pipeline.hand_screw_max_distance)
         )
@@ -280,6 +304,13 @@ class SettingsPage(QWidget):
         self._segment_seconds.setValue(float(recording.segment_seconds))
         self._codec.setText(recording.codec)
         self._auto_start.setChecked(bool(recording.auto_start))
+
+        plc = cfg.plc
+        self._plc_enabled.setChecked(bool(plc.enabled))
+        self._plc_dry_run.setChecked(bool(plc.dry_run))
+        self._plc_host.setText(plc.host)
+        self._plc_port.setValue(int(plc.port))
+        self._plc_hold_s.setValue(float(plc.hold_s))
         self._update_roi_summary(cfg)
 
     def _update_roi_summary(self, cfg: OilCheckConfig) -> None:
@@ -335,6 +366,64 @@ class SettingsPage(QWidget):
     def set_oilcheck_config(self, cfg: OilCheckConfig) -> None:
         self._load_oilcheck(cfg)
 
+    def _on_plc_test(self) -> None:
+        """测试连接：只做一次 FC3 读，不写任何寄存器。
+
+        该 PLC 只允许一条 Modbus 会话，所以这里用完立刻断开——否则主程序
+        的 PLC 线程会一直连不上（表现为 1 秒级超时）。
+        """
+
+        host = self._plc_host.text().strip() or self._oil_cfg.plc.host
+        port = int(self._plc_port.value())
+        self._btn_plc_test.setEnabled(False)
+        self._btn_plc_test.setText("测试中...")
+
+        def _probe() -> tuple[bool, str]:
+            from app.oilcheck.plc_link import ModbusError, ModbusLinkError, PlcLink
+
+            link = PlcLink(host, port, connect_timeout_s=2.0, request_timeout_s=2.0)
+            try:
+                link.open()
+                registers = link.read_holding(self._oil_cfg.plc.register_base, 2)
+            except (ModbusLinkError, ModbusError) as exc:
+                return False, str(exc)
+            finally:
+                link.close()
+            return True, (
+                f"HR{self._oil_cfg.plc.register_base}=0x{registers[0]:04X}  "
+                f"HR{self._oil_cfg.plc.register_base + 1}=0x{registers[1]:04X}"
+            )
+
+        future = self._plc_executor.submit(_probe)
+        future.add_done_callback(
+            lambda f: self._ui.invoke(lambda: self._on_plc_tested(f))
+        )
+
+    def _on_plc_tested(self, future: object) -> None:
+        self._btn_plc_test.setEnabled(True)
+        self._btn_plc_test.setText("测试连接")
+        try:
+            ok, detail = future.result()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        if ok:
+            InfoBar.success(
+                "PLC 连接正常",
+                detail,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=3000,
+                parent=self,
+            )
+        else:
+            InfoBar.error(
+                "PLC 连接失败",
+                f"{detail}\n该 PLC 只允许一条 Modbus 会话，"
+                f"请确认没有博途在线监控/组态软件占用。",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=5000,
+                parent=self,
+            )
+
     def save(self) -> None:
         app_cfg = AppConfig.from_dict(
             {
@@ -356,9 +445,6 @@ class SettingsPage(QWidget):
             brush_hold_s=float(self._brush_hold.value()),
             oiling_timeout_s=float(self._oiling_timeout.value()),
             holding_lost_timeout_s=float(self._holding_lost_timeout.value()),
-            tray_max_distance=float(self._tray_distance.value()),
-            tray_max_missing_s=float(self._tray_missing.value()),
-            tray_min_confidence=float(self._tray_confidence.value()),
             hand_screw_max_distance=float(self._hand_screw_distance.value()),
             held_infer_distance=float(self._held_infer_distance.value()),
             held_predict_hold_s=float(self._held_predict_hold.value()),
@@ -382,7 +468,17 @@ class SettingsPage(QWidget):
             codec=self._codec.text().strip() or "mp4v",
             auto_start=self._auto_start.isChecked(),
         )
-        oil_cfg = replace(self._oil_cfg, pipeline=pipeline, recording=recording)
+        plc = replace(
+            self._oil_cfg.plc,
+            enabled=self._plc_enabled.isChecked(),
+            dry_run=self._plc_dry_run.isChecked(),
+            host=self._plc_host.text().strip() or self._oil_cfg.plc.host,
+            port=int(self._plc_port.value()),
+            hold_s=float(self._plc_hold_s.value()),
+        )
+        oil_cfg = replace(
+            self._oil_cfg, pipeline=pipeline, recording=recording, plc=plc
+        )
 
         try:
             self._cfg_service.save_app_config(app_cfg)

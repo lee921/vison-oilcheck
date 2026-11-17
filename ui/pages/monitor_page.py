@@ -314,6 +314,7 @@ class MonitorPage(QWidget):
         self._status_chip = self._make_chip("服务未启动", "#4b5563")
         self._mode_chip = self._make_chip("模式：-", "#374151")
         self._rate_chip = self._make_chip("检测：-", "#374151")
+        self._plc_chip = self._make_chip("PLC：未启用", "#374151")
         self._record_chip = self._make_chip("录制：关闭", "#374151")
 
         self._source_combo = ComboBox()
@@ -359,6 +360,7 @@ class MonitorPage(QWidget):
         top.addWidget(self._status_chip)
         top.addWidget(self._mode_chip)
         top.addWidget(self._rate_chip)
+        top.addWidget(self._plc_chip)
         top.addWidget(self._record_chip)
         top.addStretch(1)
         top.addWidget(self._chk_track_ids)
@@ -580,8 +582,8 @@ class MonitorPage(QWidget):
                 self._frame_pos_text = ""
                 self._video_info.setText(f"画面 {frame.width}×{frame.height}")
 
-        # 涂油盘区的实际位置由模型检出的 oil_station 框体现，画面上叠加
-        # 工作追踪区（判定范围）与涂油区（标定/显示用，虚线）。
+        # 判定用的涂油盘区只来自手工 tray_roi，监控页不回显（见 docs/08）；
+        # 画面上叠加工作追踪区（判定范围）与涂油区（标定/显示用，虚线）。
         rois: list[RoiOverlay] = [
             RoiOverlay("工作追踪区", station.work_roi, "#64d2ff"),
             RoiOverlay("涂油区", station.oiling_roi, "#32d74b", dashed=True),
@@ -722,6 +724,8 @@ class MonitorPage(QWidget):
             rate_text = "检测：" + " · ".join(parts)
         self._set_chip(self._rate_chip, rate_text, "#374151")
 
+        self._update_plc_chip()
+
         status = self._service.recording_status(station.camera_id)
         if status.active:
             elapsed = 0.0
@@ -739,6 +743,36 @@ class MonitorPage(QWidget):
             self._set_chip(
                 self._record_chip, f"录制错误：{status.last_error}", "#b91c1c"
             )
+
+    def _update_plc_chip(self) -> None:
+        """PLC 芯片：未启用 / 启动检测失败 / 只读 / 在线·工步N / 离线。"""
+
+        status = self._service.plc_status()
+        if not status.get("enabled"):
+            self._set_chip(self._plc_chip, "PLC：未启用", "#374151")
+            return
+        # 启动检测失败要优先说出来：现场最关心的是「开机时 PLC 通不通」，
+        # 这比当前工步号重要。悬停能看到失败原因。
+        startup_ok = status.get("startup_ok")
+        startup_message = str(status.get("startup_message") or "")
+        if startup_ok is False:
+            self._set_chip(self._plc_chip, "PLC：启动检测失败", "#b91c1c")
+            self._plc_chip.setToolTip(startup_message or "PLC 连接失败")
+            return
+        self._plc_chip.setToolTip(startup_message)
+        label = str(status.get("step_label") or "")
+        number = int(status.get("step_number") or 0)
+        if status.get("dry_run"):
+            text = f"PLC只读：{label}" if label else "PLC只读"
+            if number:
+                text = f"PLC只读 · 工步{number} {label}"
+            self._set_chip(self._plc_chip, text, "#2563eb")
+            return
+        if not status.get("connected"):
+            self._set_chip(self._plc_chip, "PLC：离线", "#b91c1c")
+            return
+        text = f"PLC：在线 · 工步{number} {label}" if number else f"PLC：在线 · {label}"
+        self._set_chip(self._plc_chip, text, "#15803d")
 
     def _update_events(self, station_id: str) -> None:
         version = self._service.event_store.version

@@ -41,7 +41,32 @@ class InMemoryLogHandler(logging.Handler):
             pass
 
 
-def setup_logging(log_dir: Path, store: LogStore) -> logging.Logger:
+# 打日志时带上 ``extra={FILE_ONLY: True}``，这条记录只进日志文件，不上控制台。
+# 用于「现场知道就行、不该占启动输出」的提示（例如配置目录迁移提醒）。
+FILE_ONLY = "oilcheck_file_only"
+
+
+class _ConsoleFilter:
+    """控制台过滤器：放过一切，唯独跳过标了 :data:`FILE_ONLY` 的记录。
+
+    不继承 :class:`logging.Filter`：父类的 ``name`` 前缀匹配对这里没有意义，
+    而且它默认 ``name=""`` 时会把所有记录都放行，容易掩盖配置错误。
+    只要 ``filter(record)`` 这个方法即可（logging 只按鸭子类型调用）。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, FILE_ONLY, False)
+
+
+def setup_logging(
+    log_dir: Path, store: LogStore, *, console_level: str = "INFO"
+) -> logging.Logger:
+    """装配日志：文件（DEBUG）+ 控制台（``console_level`` 及以上）+ 内存。
+
+    控制台只放 INFO 及以上：现场是命令行/双击启动，控制台是唯一不打开日志页
+    就能看到启动结果的地方——PLC 连接、模型加载这些必须出现；DEBUG 太吵。
+    """
+
     log_dir.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("oilcheck")
@@ -52,6 +77,20 @@ def setup_logging(log_dir: Path, store: LogStore) -> logging.Logger:
         fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # ---------- 控制台 ----------
+    if not any(
+        isinstance(h, logging.StreamHandler)
+        and not isinstance(h, TimedRotatingFileHandler)
+        for h in logger.handlers
+    ):
+        console = logging.StreamHandler()
+        console.setLevel(getattr(logging, str(console_level).upper(), logging.INFO))
+        console.setFormatter(
+            logging.Formatter(fmt="%(levelname)s %(name)s: %(message)s")
+        )
+        console.addFilter(_ConsoleFilter())
+        logger.addHandler(console)
 
     # ---------- 文件日志（按日期一个文件） ----------
     if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):

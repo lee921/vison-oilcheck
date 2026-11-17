@@ -195,20 +195,6 @@ class FrameDetections:
 
 
 @dataclass(frozen=True)
-class TraySnapshot:
-    """涂油盘定位结果（只作为取料参考区域，不识别槽位）。"""
-
-    track_id: int | None
-    box: BBox | None
-    confidence: float | None
-    motion: str
-    reliable: bool
-    visible: bool
-    missing_s: float = 0.0
-    last_seen_ts: float | None = None
-
-
-@dataclass(frozen=True)
 class TrackSnapshot:
     """丝杆/手部/刷头的跟踪快照。"""
 
@@ -297,7 +283,6 @@ class StationSnapshot:
     mode: str
     online: bool
     tasks: tuple[TaskSnapshot, ...]
-    tray: TraySnapshot | None = None
     tracks: tuple[TrackSnapshot, ...] = ()
     detections: tuple[Detection, ...] = ()
     frame_size: tuple[int, int] = (0, 0)

@@ -2,8 +2,8 @@
 
 只做两条判定：
 
-1. **取料完成**：跟踪到一只手在**未持有丝杆**的状态下进入涂油盘（``oil_station``
-   检测框），随后同一只手**带着丝杆离开**涂油盘；
+1. **取料完成**：跟踪到一只手在**未持有丝杆**的状态下进入涂油盘（手工标定的
+   ``tray_roi`` 区域），随后同一只手**带着丝杆离开**涂油盘；
 2. **人工二次涂油完成**：取料之后手持丝杆，刷头工作端持续在丝杆接触邻域内累计
    达到 ``brush_hold_s``。
 
@@ -12,8 +12,8 @@
 
 区域：
 
-- **涂油盘区**：手工标定的 ``tray_roi``（覆盖盘体下方的手臂活动范围）与模型检出
-  的 ``oil_station`` 框（平滑跟踪、短时漏检保持）的并集，随盘体移动；
+- **涂油盘区**：只用手工标定的 ``tray_roi``（必须覆盖盘体连同下方的手臂活动
+  范围）。模型检出的 ``oil_station`` 框不参与判定，只供显示与排查；
 - **工作追踪区**：``work_roi``，跟踪与判定的有效范围；
 - **涂油区**：``oiling_roi``，标定与显示用，预留给后续涂油范围约束。
 
@@ -39,7 +39,7 @@ from .review import (
     build_oiling_summary,
     build_pick_summary,
 )
-from .tracker import ObjectTracker, Track, TrayTrack, TrayTracker
+from .tracker import ObjectTracker, Track
 from .types import (
     BBox,
     Detection,
@@ -52,7 +52,6 @@ from .types import (
     TaskSnapshot,
     TaskStage,
     TrackSnapshot,
-    TraySnapshot,
 )
 
 EventCallback = Any  # Callable[[EventRecord], None]，避免循环导入
@@ -67,9 +66,6 @@ _FRAME_GAP_WINDOW = 15
 
 # 区外延续跟踪的硬上限（归一化），不随 frame_scale 放大。
 _ROI_TRACK_LIMIT_ABS = 0.10
-
-# 盘体漏检超过该时长，涂油盘区退回手工标定区（不再用外推框）。
-_TRAY_PREDICT_TRUST_S = 0.30
 
 # 「盘里的静置杆」判定窗口与门限。
 #
@@ -371,12 +367,6 @@ class StationPipeline:
             ),
             backend=pipeline_cfg.brush_tracker_backend,
         )
-        self._tray_tracker = TrayTracker(
-            max_distance=pipeline_cfg.tray_max_distance,
-            max_missing_s=pipeline_cfg.tray_max_missing_s,
-            min_confidence=pipeline_cfg.tray_min_confidence,
-        )
-        self._tray = TrayTrack()
 
         # 每只手的进盘过程；一只手下同一时间只会有一段。
         self._visits: dict[int, _HandVisit] = {}
@@ -439,8 +429,6 @@ class StationPipeline:
         self._task_seq = 0
         self._hand_tracker.reset()
         self._brush_tracker.reset()
-        self._tray_tracker.reset()
-        self._tray = TrayTrack()
         self._last_frame_ts = None
         self._frame_size = (0, 0)
         self._last_detections = ()
@@ -506,15 +494,9 @@ class StationPipeline:
         cfg = self.station.detector
         frame_size = (int(width), int(height))
 
-        # 盘体先更新：本帧的 oil_station 框直接参与区域过滤，避免目标因盘体
-        # 上下移动在一个帧周期内被误判为“区外”。
-        self._tray = self._tray_tracker.update(
-            ts=ts,
-            detections=detections.by_label(cfg.tray_label),
-            frame_size=frame_size,
-            distance_scale=self._frame_scale,
-        )
-        tray_box = self._tray_region_box(ts, frame_size)
+        # 涂油盘区完全来自手工 tray_roi，与模型检出的盘体框无关：盘体检测不再
+        # 参与任何判定，判定结果因此可复现（同一段视频重跑结论一致）。
+        tray_box = self._tray_region_box(frame_size)
         hands = self._valid_detections(
             detections.by_label(cfg.hand_label), frame_size, tray_box
         )
@@ -596,7 +578,6 @@ class StationPipeline:
         self._frames_processed += 1
         self._hand_tracks = ()
         self._brush_tracks = ()
-        self._tray = TrayTrack()
         return self.snapshot()
 
     def snapshot(self) -> StationSnapshot:
@@ -614,7 +595,6 @@ class StationPipeline:
             mode=self.detector_name,
             online=False,
             tasks=self.tasks,
-            tray=self._tray_snapshot(),
             tracks=self._track_snapshots(),
             detections=self._display_detections(),
             frame_size=self._frame_size,
@@ -624,7 +604,6 @@ class StationPipeline:
                 "events_emitted": self._events_emitted,
                 "tasks": len(self._cycles),
                 "active_task_id": active.task_id if active else "",
-                "tray_reliable": self._tray_region_reliable(),
                 "frame_gap_events": self._frame_gap_events,
                 "last_frame_gap_s": round(self._last_frame_gap_s, 3),
                 "timing_reliable": self._timing_reliable,
@@ -652,9 +631,7 @@ class StationPipeline:
         width, height = self._frame_size
         if width <= 0 or height <= 0:
             return ()
-        tray_box = self._tray_region_box(
-            self._last_frame_ts or 0.0, self._frame_size
-        )
+        tray_box = self._tray_region_box(self._frame_size)
         kept = list(
             self._valid_detections(self._last_detections, self._frame_size, tray_box)
         )
@@ -792,80 +769,25 @@ class StationPipeline:
             kept.append(det if near else _demote_for_continuation(det, self.cfg))
         return tuple(kept)
 
-    def _tray_region_box(self, ts: float, frame_size: tuple[int, int]) -> BBox | None:
-        """涂油盘区：手工 ``tray_roi`` 与模型检出 ``oil_station`` 框的并集。
+    def _tray_region_box(self, frame_size: tuple[int, int]) -> BBox | None:
+        """涂油盘区：**只用**手工标定的 ``tray_roi``。
 
-        两个来源各管一件事，缺一不可：
+        盘区必须覆盖盘体**连同下方的手臂活动范围**。模型检出的 ``oil_station``
+        框只框得住盘体本身（示例①里框底 y≈372），而工人取料时手在盘体下方
+        100~280px（y≈422~654）——按检测框判「进盘」会把取料全部漏掉。
 
-        - **手工 ``tray_roi``**：覆盖盘体**下方的手臂活动范围**。模型只框得出
-          盘体本身（示例①里框底 y≈372），而工人取料时手在盘体下方
-          100~280px（y≈422~654）——只用检测框，取料会被全部漏掉。
-        - **``oil_station`` 检测框**：随盘体上下移动（示例里跨度约 250px），
-          手工区是固定的，不跟随就会在盘体升起时把盘内目标判成“已离盘”。
+        以前这里还与 ``oil_station`` 框取并集、跟随盘体上下移动；那样做的问题
+        是盘区随模型输出浮动：盘体漏检时预测框外推、框抖动都直接改变「在不在
+        盘内」的判定，同一段动作在盘体移动的帧上会被判成「已离盘」。现在盘区
+        完全由标定决定，判定结果只取决于手的位置，可复现、可回放对比；盘体
+        上下移动靠 ``tray_roi`` 本身框够余量来吸收。
 
-        检测框由 :class:`TrayTracker` 平滑并做短时保持：平滑避免框抖动让
-        “是否在盘内”在边界反复跳变，保持避免一帧漏检就把手判成离盘。
-        盘体检测不可用时退回手工区，取料判定照常进行。
         """
 
         width, height = frame_size
         if width <= 0 or height <= 0:
             return None
-        fixed = self.station.tray_roi.pixel_bbox(width, height)
-        if not self._tray_prediction_trustworthy(ts):
-            return fixed
-        predicted = self._tray.predicted_box(ts)
-        if predicted is None:
-            return fixed
-        return BBox(
-            min(fixed.x1, predicted.x1),
-            min(fixed.y1, predicted.y1),
-            max(fixed.x2, predicted.x2),
-            max(fixed.y2, predicted.y2),
-        )
-
-    def _tray_prediction_trustworthy(self, ts: float) -> bool:
-        """盘体预测框还能不能参与盘区判定。
-
-        漏检时间一长，纯速度外推会把框送到画面外；取并集后整个画面都成了
-        「盘内」，取料/离盘判定随即失效（实测 0.9s 漏检即出画面）。外部
-        条件：本帧有观测，或漏检在 ``_TRAY_PREDICT_TRUST_S`` 内且预测框没
-        明显越界/膨胀。
-        """
-
-        if self._tray.box is None:
-            return False
-        if self._tray.matched:
-            return True
-        if self._tray.missing_s > _TRAY_PREDICT_TRUST_S:
-            return False
-        predicted = self._tray.predicted_box(ts)
-        if predicted is None:
-            return False
-        width, height = self._frame_size
-        if width <= 0 or height <= 0:
-            return False
-        if (
-            predicted.x1 < -width
-            or predicted.y1 < -height
-            or predicted.x2 > 2 * width
-            or predicted.y2 > 2 * height
-        ):
-            return False
-        area = predicted.width * predicted.height
-        base = self._tray.box.width * self._tray.box.height
-        return not (base > 0 and area > 2.0 * base)
-
-    def _tray_region_reliable(self) -> bool:
-        """盘体定位是否可用（供 UI 状态条）。
-
-        只报告真实情况：漏检超过可信窗口即 ``False``，不再恒为 ``True``。
-        """
-
-        return self._tray.box is not None and (
-            self._tray.matched
-            or self._tray.missing_s <= _TRAY_PREDICT_TRUST_S
-        )
+        return self.station.tray_roi.pixel_bbox(width, height)
 
     # ------------------------------------------------------------------
     # 取料判定
@@ -1149,7 +1071,7 @@ class StationPipeline:
         盘区外的手在这一点上不做宽松推断）。
         """
 
-        tray_box = self._tray_region_box(self._last_frame_ts or 0.0, self._frame_size)
+        tray_box = self._tray_region_box(self._frame_size)
         if tray_box is None or not _box_center_in(screw.box, tray_box):
             return False
         if len(self._screw_history) < _SCREW_STATIC_BACK:
@@ -1264,7 +1186,7 @@ class StationPipeline:
         label = self.station.detector.screw_label
         hx, hy = hand_box.center
         # 盘外限定：手在涂油盘区里时，盘内的杆是静置杆，不能当握持证据。
-        tray_box = self._tray_region_box(self._last_frame_ts or 0.0, (width, height))
+        tray_box = self._tray_region_box((width, height))
         hand_outside = tray_box is None or not _box_center_in(hand_box, tray_box)
         best: tuple[float, Detection] | None = None
         for det in self._last_detections:
@@ -2091,26 +2013,6 @@ class StationPipeline:
             completed_at=task.completed_at,
             last_seen_ts=task.last_seen_ts,
             timeline=tuple(task.timeline),
-        )
-
-    def _tray_snapshot(self) -> TraySnapshot:
-        diag = max(1.0, math.hypot(*self._frame_size))
-        speed = math.hypot(*self._tray.velocity) / diag
-        if not self._tray.matched:
-            motion = "UNKNOWN"
-        elif speed >= 0.05:
-            motion = "MOVING"
-        else:
-            motion = "STILL"
-        return TraySnapshot(
-            track_id=self._tray.track_id,
-            box=self._tray.predicted_box(self._last_frame_ts or self._tray.last_ts),
-            confidence=self._tray.confidence or None,
-            motion=motion,
-            reliable=self._tray.reliable,
-            visible=self._tray.matched,
-            missing_s=self._tray.missing_s,
-            last_seen_ts=self._tray.last_seen_ts or None,
         )
 
     def _track_snapshots(self) -> tuple[TrackSnapshot, ...]:

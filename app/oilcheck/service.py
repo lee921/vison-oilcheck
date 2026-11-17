@@ -33,12 +33,15 @@ from .config import (
 from .detector import Detector, create_detector
 from .events import EventStore
 from .pipeline import StationPipeline
+from .plc_io import PlcEvidence, PlcIoThread
 from .recorder import TrainingRecorder, delete_segments, list_segments
 from .types import (
     EventRecord,
     FrameDetections,
     RecordingStatus,
     StationSnapshot,
+    TaskResult,
+    TaskSnapshot,
 )
 from .video_source import VideoFileSource
 
@@ -100,8 +103,11 @@ class OilCheckService:
         # 配置文件的 mtime 快照：文件被外部改过（手工编辑 / 另一个进程保存）
         # 时自动重载，避免「改了文件但程序还在用旧 ROI」。
         self._config_mtime = self._stat_config_mtime()
+        # PLC 警示灯（默认关闭 + 只读）。线程起在 start()，停于 shutdown()。
+        self._plc: PlcIoThread | None = None
 
         self._rebuild_runtimes_locked()
+        self._rebuild_plc_locked()
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -133,6 +139,10 @@ class OilCheckService:
             )
             thread = self._thread
         thread.start()
+        with self._lock:
+            plc = self._plc
+        if plc is not None:
+            plc.start()
         self._logger.info(
             "取料检测服务已启动（工位=%d，周期=%s）",
             len(self._runtimes),
@@ -155,12 +165,19 @@ class OilCheckService:
             thread.join(timeout=2.0)
 
         with self._lock:
+            plc = self._plc
+            self._plc = None
             recorders = list(self._recorders.values())
             self._recorders.clear()
             runtimes = list(self._runtimes.values())
             self._runtimes.clear()
             self._active_video.clear()
 
+        if plc is not None:
+            try:
+                plc.stop()
+            except Exception:
+                self._logger.exception("停止 PLC 线程失败")
         for recorder in recorders:
             try:
                 recorder.stop()
@@ -177,9 +194,120 @@ class OilCheckService:
         with self._lock:
             self._config = config
             self._rebuild_runtimes_locked()
+            old_plc = self._plc
+            self._plc = None
+            self._rebuild_plc_locked()
+            new_plc = self._plc
         for runtime in old:
             self._shutdown_runtime(runtime)
+        # PLC 参数（host/端口/保持窗/工步）可能变了：整个线程重建，
+        # 不能只改配置对象——PLC 线程里持有 socket 与映射状态。
+        if old_plc is not None:
+            try:
+                old_plc.stop()
+            except Exception:
+                self._logger.exception("重载时停止 PLC 线程失败")
+        if new_plc is not None:
+            new_plc.start()
         self._logger.info("检测配置已重新加载（工位=%d）", len(self._runtimes))
+
+    # ------------------------------------------------------------------
+    # PLC 警示灯
+    # ------------------------------------------------------------------
+    def plc_status(self) -> dict[str, Any]:
+        """PLC 线程的运行状态，供 UI 显示。未启用时返回 enabled=False。"""
+
+        with self._lock:
+            plc = self._plc
+        if plc is None:
+            return {
+                "enabled": False,
+                "dry_run": True,
+                "connected": False,
+                "step": "OFFLINE",
+                "step_number": 0,
+                "step_label": "未启用",
+                "frame": None,
+                "last_write_at": None,
+                "last_error": "",
+                "write_failures": 0,
+                "reconnects": 0,
+            }
+        return plc.status()
+
+    def _plc_station_id(self) -> str | None:
+        """PLC 取哪个工位的状态：配置指定，留空取第一个启用工位。"""
+
+        wanted = self._config.plc.station_id.strip()
+        if wanted:
+            station = self._config.station(wanted)
+            return (
+                None if station is None or not station.enabled else station.station_id
+            )
+        enabled = self._config.enabled_stations()
+        return enabled[0].station_id if enabled else None
+
+    def _plc_evidence(self) -> PlcEvidence:
+        """PLC 一拍证据：相机在线状态 + 最近一条作业周期的最小投影。
+
+        只在 PLC 线程里被调用（200ms 一次）。``station_snapshot`` 只读
+        ``runtime.last_snapshot`` 与相机状态，不碰 pipeline 的判定状态。
+        """
+
+        station_id = self._plc_station_id()
+        if station_id is None:
+            return PlcEvidence.offline()
+        snapshot = self.station_snapshot(station_id)
+        if snapshot is None or not snapshot.online:
+            return PlcEvidence.offline()
+        if snapshot.stats.get("last_error"):
+            # 判定线程报错时不能假装还在正常检测：按未检测处理，PLC 走降级。
+            return PlcEvidence.offline()
+        task, superseded = _pick_plc_task(snapshot.tasks)
+        if task is None:
+            return PlcEvidence(online=True)
+        return PlcEvidence(
+            online=True,
+            task_id=task.task_id,
+            stage=task.stage,
+            final_result=task.final_result,
+            brush_hold_s=task.brush_hold_s,
+            superseded_task_id=None if superseded is None else superseded.task_id,
+            superseded_result=None if superseded is None else superseded.final_result,
+            superseded_brush_hold_s=(
+                0.0 if superseded is None else superseded.brush_hold_s
+            ),
+        )
+
+    def _rebuild_plc_locked(self) -> None:
+        """按当前配置重建 PLC 线程对象（不启动）。未启用则不建。"""
+
+        self._plc = None
+        cfg = self._config.plc
+        if not cfg.enabled:
+            # 未启用也要把目标打印出来：现场启动时想知道「配置里连的是谁」，
+            # 不该只能翻配置文件。一行 INFO，控制台能看到。
+            self._logger.info(
+                "PLC 警示灯未启用：Modbus %s:%s unit=%d 基址=%d"
+                "（把 config/oilcheck.json 的 plc.enabled 设为 true 后重启即生效）",
+                cfg.host,
+                cfg.port,
+                cfg.unit_id,
+                cfg.register_base,
+            )
+            return
+        if cfg.byte_order != "lsb":
+            # 协议表的四个例子只在 lsb 下成立。选了 msb 说明现场确认过相反，
+            # 但这是高风险配置，日志里明确留痕。
+            self._logger.warning(
+                "PLC 字节序配置为 %s（非默认 lsb），请确认已与 PLC 侧逐位核对",
+                cfg.byte_order,
+            )
+        self._plc = PlcIoThread(
+            cfg=cfg,
+            evidence_source=self._plc_evidence,
+            logger_=self._logger,
+        )
 
     # ------------------------------------------------------------------
     # 查询接口
@@ -787,6 +915,38 @@ class OilCheckService:
         except Exception:
             pass
         return None
+
+
+def _pick_plc_task(
+    tasks: tuple[TaskSnapshot, ...],
+) -> tuple[TaskSnapshot | None, TaskSnapshot | None]:
+    """PLC 该看哪一条周期：返回 ``(当前任务, 紧邻的已终态任务)``。
+
+    ``tasks`` 已按创建时间升序。当前任务优先取进行中的那条；没有进行中的
+    就取最后一条（刚结束的那件），它还要在 PLC 上保持一段时间。
+
+    第二个返回值是「排在当前任务之前、且已判终态」的那一条。漏涂的主要
+    路径是被下一次取料顶掉（``_supersede_unfinished``），那一帧终态很容易
+    被 200ms 的轮询跨过去；PLC 侧靠它把上一件的结论补报出来。
+    """
+
+    active = next(
+        (task for task in tasks if task.final_result == TaskResult.PROCESSING),
+        None,
+    )
+    if active is not None:
+        current: TaskSnapshot | None = active
+    else:
+        current = tasks[-1] if tasks else None
+    superseded: TaskSnapshot | None = None
+    if current is not None:
+        for task in reversed(tasks):
+            if task.task_id == current.task_id:
+                break
+            if task.final_result != TaskResult.PROCESSING:
+                superseded = task
+                break
+    return current, superseded
 
 
 def _station_meta(station: StationConfig | None) -> dict[str, Any]:

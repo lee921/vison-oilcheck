@@ -22,8 +22,8 @@ def test_repo_oilcheck_template_is_valid():
     data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
-    assert cfg.version == "2.7"
-    assert data["version"] == "2.7"
+    assert cfg.version == "2.9"
+    assert data["version"] == "2.9"
     assert cfg.stations
     station = cfg.stations[0]
     assert station.station_id == "ST01"
@@ -200,7 +200,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.7"
+    assert cfg.version == "2.9"
     assert station.detector.kind == "yolo"
     assert station.detector.model_path.endswith("best.pt")
     assert station.detector.brush_label == "brush"
@@ -269,7 +269,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.7"
+    assert cfg.version == "2.9"
     # 用户调过的 ROI 与判定参数保留
     assert station.tray_roi.points == ((0.5, 0.1), (0.72, 0.44))
     assert station.work_roi.points == ((0.35, 0.0), (0.99, 0.95))
@@ -451,7 +451,7 @@ def test_tracking_threshold_migrates_only_from_old_default(tmp_path):
 
     path = _write_config(tmp_path, _old_default)
     cfg = OilCheckConfigService(path.parent).load()
-    assert cfg.version == "2.7"
+    assert cfg.version == "2.9"
     assert cfg.pipeline.bytetrack_high_thresh == 0.45
     # 新键补默认值（关闭），不会因为迁移被打开
     assert cfg.pipeline.brush_spawn_max_distance == 0.0
@@ -575,8 +575,12 @@ def test_legacy_rod_label_field_is_migrated(tmp_path):
     assert cfg.stations[0].detector.screw_label == "screw"
 
 
-def test_orphaned_data_config_is_reported(tmp_path, caplog):
-    """数据目录里遗留旧配置时要在日志里点名，别让现场以为配置还在生效。"""
+def test_orphaned_data_config_is_reported(tmp_path):
+    """数据目录里遗留旧配置时要点名，别让现场以为配置还在生效。
+
+    只返回文本、不直接打日志：``ensure_defaults`` 跑在 ``setup_logging``
+    之前，那时打出去只会被 lastResort 甩到控制台、进不了日志文件。
+    """
 
     from app.config_service import ConfigService
 
@@ -589,11 +593,44 @@ def test_orphaned_data_config_is_reported(tmp_path, caplog):
     service = ConfigService(repo_root=tmp_path / "repo")
     service._data_root = data_dir  # 运行数据根指向带旧配置的目录
 
-    with caplog.at_level("WARNING"):
-        service.ensure_defaults()
+    service.ensure_defaults()
+    message = service.orphaned_config_warning()
+    assert "已不再生效" in message
+    assert "cameras.json" in message
 
-    messages = [record.getMessage() for record in caplog.records]
-    assert any("已不再生效" in msg and "cameras.json" in msg for msg in messages)
+
+def test_orphaned_config_warning_is_silent_when_absent(tmp_path):
+    """没有遗留旧配置时不产生任何文案，调用方也就不会打日志。"""
+
+    from app.config_service import ConfigService
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    service = ConfigService(repo_root=tmp_path / "repo")
+    service._data_root = data_dir
+    service.ensure_defaults()
+    assert service.orphaned_config_warning() == ""
+
+
+def test_orphaned_warning_does_not_hit_console_before_logging(tmp_path, capsys):
+    """启动早期（日志未就绪）不许往 stderr 甩旧配置告警。
+
+    现场看到的启动输出必须是 Modbus 连接信息，不是这句配置迁移提示。
+    """
+
+    from app.config_service import ConfigService
+
+    data_dir = tmp_path / "data"
+    (data_dir / "config").mkdir(parents=True)
+    (data_dir / "config" / "app.json").write_text("{}", encoding="utf-8")
+    service = ConfigService(repo_root=tmp_path / "repo")
+    service._data_root = data_dir
+
+    service.ensure_defaults()
+
+    captured = capsys.readouterr()
+    assert "已不再生效" not in captured.out
+    assert "已不再生效" not in captured.err
 
 
 def test_config_dir_is_the_repo_config_by_default(monkeypatch, tmp_path):
@@ -687,7 +724,7 @@ def test_repo_template_is_commented():
     text = path.read_text(encoding="utf-8")
     assert "//" in text, "模板应带注释"
     # 注释不破坏可解析性
-    assert json.loads(strip_json_comments(text))["version"] == "2.7"
+    assert json.loads(strip_json_comments(text))["version"] == "2.9"
 
 
 def test_save_preserves_comments(tmp_path):
@@ -972,3 +1009,120 @@ def test_source_info_reports_missing_file(tmp_path):
     info = OilCheckConfigService(tmp_path / "config").source_info()
     assert info["exists"] is False
     assert info["mtime"] is None
+
+
+# ----------------------------------------------------------------------
+# PLC 警示灯配置
+# ----------------------------------------------------------------------
+def test_plc_config_defaults_are_off_and_read_only():
+    """装满代码不等于会写 PLC：默认关闭且只读。"""
+
+    from app.oilcheck.config import PlcConfig
+
+    cfg = PlcConfig()
+    assert cfg.enabled is False
+    assert cfg.dry_run is True
+    assert cfg.host == "192.168.1.88"
+    assert cfg.port == 502
+    assert cfg.register_base == 0
+    assert cfg.byte_order == "lsb"
+    assert cfg.steps == {"pick": 1, "oiling": 3}
+
+
+def test_plc_config_roundtrips():
+    from app.oilcheck.config import PlcConfig
+
+    cfg = PlcConfig.from_dict(
+        {
+            "enabled": True,
+            "dry_run": False,
+            "host": "10.0.0.5",
+            "hold_s": 2.5,
+            "steps": {"pick": 2, "oiling": 5},
+        }
+    )
+    assert cfg.enabled is True
+    assert cfg.dry_run is False
+    assert cfg.host == "10.0.0.5"
+    assert cfg.hold_s == 2.5
+    assert cfg.steps == {"pick": 2, "oiling": 5}
+    assert PlcConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
+
+
+def test_plc_config_rejects_bad_values():
+    from app.oilcheck.config import PlcConfig
+
+    cfg = PlcConfig.from_dict(
+        {
+            "byte_order": "middle",
+            "hold_s": "x",
+            "reconnect_backoff_ms": "nope",
+            "steps": {"pick": 99, "oiling": 0},
+        }
+    )
+    assert cfg.byte_order == "lsb"
+    assert cfg.hold_s == 1.0
+    assert cfg.reconnect_backoff_ms == (200, 500, 1000, 2000, 5000)
+    # 越界工步号回退默认，不写进配置
+    assert cfg.steps == {"pick": 1, "oiling": 3}
+
+
+def test_legacy_config_gets_plc_section(tmp_path):
+    """2.7 的旧配置升级后要出现 plc 段，且默认关闭只读。"""
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "oilcheck.json").write_text(
+        json.dumps({"version": "2.7", "demo": {"videos": []}, "stations": []}),
+        encoding="utf-8",
+    )
+    from app.oilcheck.config import OilCheckConfigService
+
+    service = OilCheckConfigService(tmp_path / "config")
+    cfg = service.load()
+    data = json.loads(
+        strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    )
+
+    assert data["version"] == cfg.version
+    assert "plc" in data
+    assert data["plc"]["enabled"] is False
+    assert data["plc"]["dry_run"] is True
+    assert data["plc"]["host"] == "192.168.1.88"
+
+
+def test_console_filter_drops_file_only_records(tmp_path):
+    """标了 FILE_ONLY 的记录只进日志文件，不上控制台。"""
+
+    import logging
+
+    from app.logging_service import FILE_ONLY, LogStore, setup_logging
+
+    store = LogStore()
+    logger = setup_logging(log_dir=tmp_path / "logs", store=store)
+    try:
+        logger.warning("只该进文件的提示", extra={FILE_ONLY: True})
+        logger.warning("该上控制台的提示")
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    snapshot = "\n".join(store.snapshot())
+    # 内存日志（日志页）两条都在
+    assert "只该进文件的提示" in snapshot
+    assert "该上控制台的提示" in snapshot
+
+    # 控制台 handler 的过滤器挡住 FILE_ONLY
+    console = logging.StreamHandler()
+    from app.logging_service import _ConsoleFilter
+
+    console.addFilter(_ConsoleFilter())
+    record = logging.LogRecord(
+        "oilcheck", logging.WARNING, __file__, 1, "x", None, None
+    )
+    record.__dict__[FILE_ONLY] = True
+    # Handler.filter 放行时返回 LogRecord 本身（不是 True），拦截时返回 False
+    assert not console.filter(record)
+    del record.__dict__[FILE_ONLY]
+    assert console.filter(record)

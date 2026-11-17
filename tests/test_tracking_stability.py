@@ -186,14 +186,23 @@ def test_anchor_rebinds_when_cycle_hand_track_is_retired():
 
 
 # ----------------------------------------------------------------------
-# A5：盘体漏检时盘区退回手工标定区
+# A5：涂油盘区只用手工 tray_roi，盘体检测漏检也不改变判定区域
 # ----------------------------------------------------------------------
-def test_tray_region_falls_back_when_tray_missing():
+def test_tray_region_is_manual_roi_only():
     pipeline, _ = make_pipeline()
     ts_iter = timestamps(step=1 / 15)
     base = TRAY_BOX
+    expected = pipeline.station.tray_roi.pixel_bbox(WIDTH, HEIGHT)
+
+    # 盘体检测框在手工区之外（下方），且逐帧上移——以前被并进盘区，
+    # 手落在检测框内就算「进盘」；现在盘区只认 tray_roi。
     for index in range(4):
-        box = BBox(base.x1, base.y1 + index * 40, base.x2, base.y2 + index * 40)
+        box = BBox(
+            base.x1,
+            base.y1 + 400 + index * 40,
+            base.x2,
+            base.y2 + 400 + index * 40,
+        )
         pipeline.process(
             detections=FrameDetections(
                 ts=next(ts_iter),
@@ -201,7 +210,9 @@ def test_tray_region_falls_back_when_tray_missing():
                 detections=(Detection(label="oil_station", confidence=0.95, box=box),),
             )
         )
+        assert pipeline._tray_region_box((WIDTH, HEIGHT)) == expected
 
+    # 盘体完全漏检：盘区仍是手工区，不会退回/外推。
     for _ in range(14):
         pipeline.process(
             detections=FrameDetections(
@@ -209,11 +220,7 @@ def test_tray_region_falls_back_when_tray_missing():
             )
         )
 
-    expected = pipeline.station.tray_roi.pixel_bbox(WIDTH, HEIGHT)
-    region = pipeline._tray_region_box(pipeline._last_frame_ts, (WIDTH, HEIGHT))
-    assert region is not None
-    assert region == expected
-    assert pipeline.snapshot().stats["tray_reliable"] is False
+    assert pipeline._tray_region_box((WIDTH, HEIGHT)) == expected
 
 
 # ----------------------------------------------------------------------
