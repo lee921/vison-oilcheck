@@ -1590,3 +1590,188 @@ def test_pick_not_rejected_when_only_one_outside_frame_is_sparse():
 
     picks = [e for e in events if e.event_type == EventType.PICK]
     assert len(picks) == 1, "盘外见过空手，就不该判成带料进盘"
+
+
+def test_screw_clearing_tray_late_does_not_vote_empty_hand():
+    """手已出盘、手里的杆晚几帧才出盘：那几帧不能投成「空手」。
+
+    示例④ 第 3 次取料手在 f348 出盘、杆心到 f352 才出盘。按「杆必须出盘
+    才算握持」这几帧都是「手里没杆」，采样窗口 [F,F,T] 多数票判空手，整件
+    取料丢掉。窗口里应当只包含杆真正出盘之后的读数。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    tray_screw = screw_at(*TRAY_SCREW)
+    for step in range(5):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(HAND_TARGET[0] - step * 10, HAND_TARGET[1] + step * 10),
+        )
+    enter_tray_empty(pipeline, ts_iter, screw=tray_screw)
+
+    # 手已经退到盘外（x < TRAY_BOX.x1），手里那根杆的中心还压在盘区内，
+    # 且一直在动（不是静置杆）——杆比手晚出盘。
+    late_clear = [
+        ((375.0, 420.0), (450.0, 390.0)),
+        ((372.0, 440.0), (450.0, 410.0)),
+        ((370.0, 460.0), (448.0, 432.0)),
+        ((368.0, 480.0), (446.0, 452.0)),
+        ((366.0, 500.0), (444.0, 474.0)),
+        ((364.0, 520.0), (442.0, 496.0)),
+        ((362.0, 540.0), (440.0, 518.0)),
+    ]
+    for hand, screw in late_clear:
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*hand),
+            held_screw_at(*screw),
+            tray_screw,
+        )
+
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert picks == [], "杆心还在盘区内就判了取料——出盘硬条件被绕过了"
+
+    # 杆终于出盘（y > TRAY_BOX.y2）：这时才该判取料。
+    for hand, screw in [
+        ((360.0, 560.0), (438.0, 540.0)),
+        ((358.0, 580.0), (436.0, 562.0)),
+        ((356.0, 600.0), (434.0, 584.0)),
+        ((354.0, 620.0), (432.0, 606.0)),
+    ]:
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*hand),
+            held_screw_at(*screw),
+            tray_screw,
+        )
+
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert len(picks) == 1, "杆出盘之后的采样本该判出这一次取料"
+
+
+def _stale_hand_track(track_id: int, box: BBox, ts: float):
+    """跟踪器保留下来、这一帧没匹配上的旧轨迹（位置停在最后一次观测）。"""
+
+    from app.oilcheck.tracker import Track
+
+    return Track(
+        track_id=track_id,
+        box=box,
+        last_ts=ts,
+        last_seen_ts=ts,
+        hits=20,
+        matched=False,
+    )
+
+
+def _live_hand_track(track_id: int, box: BBox, ts: float):
+    """这一帧正常匹配上的手部轨迹。"""
+
+    from app.oilcheck.tracker import Track
+
+    return Track(
+        track_id=track_id,
+        box=box,
+        last_ts=ts,
+        last_seen_ts=ts,
+        hits=5,
+        matched=True,
+    )
+
+
+def _confirmed_visit(
+    pipeline: StationPipeline, *, track_id: int, last_box: BBox, ts: float
+):
+    """摆出「已确认进盘、还没离盘」的进行中过程（接管逻辑的直接输入）。"""
+
+    from app.oilcheck.pipeline import _HandVisit
+
+    visit = _HandVisit(
+        hand_track_id=track_id,
+        entered_tray_ts=ts - 2.0,
+        holding_on_entry=False,
+        inside_tray=True,
+        last_seen_ts=ts,
+        last_hand_box=last_box,
+        entered_confirmed=True,
+    )
+    pipeline._visits[track_id] = visit
+    return visit
+
+
+def test_hand_id_split_inside_tray_hands_over_the_visit():
+    """同一只手在盘内换了视觉 ID：进盘过程要跟着转交，否则取料判丢。
+
+    掉帧后跟踪器保留旧轨迹（失配、位置停在最后一次观测），给回来的手新建
+    一条轨迹在盘里接着干。若两只轨迹各管自己，进盘记在新 ID、出盘又落回
+    旧 ID，两边永远凑不齐——示例④ 第 3 次取料就是这么丢的。
+    """
+
+    pipeline, _events = make_pipeline()
+    # 先喂一帧，让管线拿到画幅尺寸（接管用归一化距离门限）。
+    feed(pipeline, 1.0, hand_at(*HAND_TARGET))
+    inside = pipeline._tray_region_box((WIDTH, HEIGHT))
+    assert inside is not None
+
+    # 旧轨迹停在盘内最后一次观测的位置（手在盘里被挡住一会儿）。
+    stale_box = BBox(455.0, 425.0, 545.0, 515.0)
+    visit = _confirmed_visit(pipeline, track_id=100001, last_box=stale_box, ts=5.0)
+    new_hand = hand_at(*ENTRY_HAND)
+    pipeline._hand_tracks = (
+        _stale_hand_track(100001, stale_box, 5.0),
+        _live_hand_track(900001, new_hand.box, 5.2),
+    )
+
+    pipeline._hand_over_split_visits(inside, 5.2)
+
+    assert 100001 not in pipeline._visits, "旧 ID 身上不该还留着这段进盘过程"
+    assert len(pipeline._visits) == 1, "进盘过程应当转到新手那条轨迹上"
+    (new_id, moved), = pipeline._visits.items()
+    assert new_id == 900001
+    assert moved.hand_track_id == new_id
+    assert moved.entered_confirmed is True
+    assert moved.exited_at_ts is None
+    assert moved.rebinds == 1
+    assert visit is moved
+
+
+def test_hand_id_split_does_not_steal_a_visit_from_a_live_hand():
+    """主人这一帧还在跟踪里时，过程不能转走（避免两只手互相抢）。"""
+
+    pipeline, _events = make_pipeline()
+    feed(pipeline, 1.0, hand_at(*HAND_TARGET))
+    inside = pipeline._tray_region_box((WIDTH, HEIGHT))
+    assert inside is not None
+
+    live_box = BBox(455.0, 425.0, 545.0, 515.0)
+    pipeline._hand_tracks = (_live_hand_track(100001, live_box, 5.0),)
+    _confirmed_visit(pipeline, track_id=100001, last_box=live_box, ts=5.0)
+
+    pipeline._hand_over_split_visits(inside, 5.2)
+
+    assert list(pipeline._visits) == [100001], "主人还在，过程不该被转走"
+    assert pipeline._visits[100001].rebinds == 0
+
+
+def test_pick_update_runs_the_split_handover(monkeypatch):
+    """接线检查：``_update_pick`` 每帧都要先做 ID 分裂接管。"""
+
+    pipeline, _events = make_pipeline()
+    seen: list[tuple[BBox | None, float]] = []
+    original = StationPipeline._hand_over_split_visits
+
+    def spy(self, tray_box, ts):
+        seen.append((tray_box, ts))
+        return original(self, tray_box, ts)
+
+    monkeypatch.setattr(StationPipeline, "_hand_over_split_visits", spy)
+
+    feed(pipeline, 1.0, hand_at(*HAND_TARGET))
+    feed(pipeline, 1.2, hand_at(*HAND_TARGET))
+
+    assert len(seen) == 2, "每帧都应当先跑一次 ID 分裂接管"

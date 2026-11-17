@@ -376,7 +376,9 @@ class OilCheckService:
     def latest_frame(self, camera_id: str) -> Any | None:
         video = self._video_for_camera(camera_id)
         if video is not None:
-            return video.get()
+            # 预览只读最新帧、不消费判定队列：否则 UI 和判定线程各自取走一半
+            # 帧，判定那边照样漏帧（这正是示例回放「每轮少判一件」的成因）。
+            return video.latest()
         session = self._manager.get_session(camera_id)
         # 只在预览状态下返回相机帧；停止后 frame_buffer 可能已被清空，
         # 这里再做一次状态保护，避免 UI 把残留帧当作实时画面。

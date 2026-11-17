@@ -118,6 +118,66 @@ def _make_video(path: Path, fps: int = 10, frames: int = 20) -> bool:
     return True
 
 
+def test_video_source_get_does_not_skip_frames(tmp_path):
+    """``get()`` 逐帧取走，不能像旧的「只留最新一帧」那样漏掉中间帧。
+
+    旧实现里解码线程按 1/fps 覆盖同一个快照，服务层也按 1/max_fps 轮询，
+    两边同频不同相，轮询偶尔落在两帧之间，那帧就永远没人取到——实测
+    60 帧漏 4 帧。现场日志里那些「视频时间戳异常：0.133s」（正常 0.067s）
+    就是它。这里按同样节拍轮询，要求媒体时间严格逐帧递增、没有跳号。
+    """
+
+    path = tmp_path / "clip.mp4"
+    if not _make_video(path, fps=15, frames=60):
+        pytest.skip("当前环境无法写出测试视频")
+
+    source = VideoFileSource(path, loop=False, fps_limit=15, speed=1.0)
+    source.start()
+    try:
+        stamps: list[float] = []
+        deadline = time.time() + 6.0
+        while time.time() < deadline and len(stamps) < 55:
+            frame = source.get()
+            if frame is not None and frame.media_ts is not None:
+                stamps.append(frame.media_ts)
+            time.sleep(1 / 15.0)
+    finally:
+        source.stop()
+
+    assert len(stamps) >= 40, f"6 秒只取到 {len(stamps)} 帧"
+    gaps = [round((b - a) * 15.0, 3) for a, b in zip(stamps, stamps[1:])]
+    # 每帧间隔必须是 1/15s；出现 2.0 就是漏了一帧。
+    assert all(gap == pytest.approx(1.0, abs=1e-6) for gap in gaps), (
+        f"取帧出现跳号: {sorted(set(gaps))}"
+    )
+
+
+def test_video_source_latest_is_read_only(tmp_path):
+    """``latest()`` 只读快照：UI 反复预览不能把判定要用的帧取走。"""
+
+    path = tmp_path / "clip.mp4"
+    if not _make_video(path, fps=15, frames=40):
+        pytest.skip("当前环境无法写出测试视频")
+
+    source = VideoFileSource(path, loop=False, fps_limit=15, speed=1.0)
+    source.start()
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline and source.latest() is None:
+            time.sleep(0.02)
+        # UI 每秒看几十次画面。
+        for _ in range(30):
+            assert source.latest() is not None
+            time.sleep(0.01)
+        # 判定侧仍然能逐帧取走，不被 UI 消耗掉。
+        first = source.get()
+        second = source.get()
+        assert first is not None and second is not None
+        assert second.ts > first.ts
+    finally:
+        source.stop()
+
+
 def test_video_source_streams_frames_and_loops(tmp_path):
     path = tmp_path / "clip.mp4"
     if not _make_video(path):
@@ -127,15 +187,16 @@ def test_video_source_streams_frames_and_loops(tmp_path):
     source.start()
     try:
         deadline = time.time() + 5.0
-        while time.time() < deadline and source.get() is None:
+        while time.time() < deadline and source.latest() is None:
             time.sleep(0.02)
-        first = source.get()
+        # 预览/状态读取走 latest()：只读快照，不消费判定队列。
+        first = source.latest()
         assert first is not None
         assert (first.width, first.height) == (64, 48)
 
         # 循环播放：超过视频总时长后仍能拿到新帧。
         time.sleep(1.2)
-        later = source.get()
+        later = source.latest()
         assert later is not None
         assert later.ts > first.ts
 
@@ -146,7 +207,7 @@ def test_video_source_streams_frames_and_loops(tmp_path):
         source.stop()
 
     assert source.playing is False
-    assert source.get() is None
+    assert source.latest() is None
 
 
 def test_video_source_reports_frame_position(tmp_path):
@@ -214,8 +275,8 @@ def test_video_source_speed_controls_media_timeline(tmp_path):
     fast.start()
     try:
         time.sleep(1.2)
-        slow_frame = slow.get()
-        fast_frame = fast.get()
+        slow_frame = slow.latest()
+        fast_frame = fast.latest()
         assert slow_frame is not None and fast_frame is not None
         assert slow_frame.media_ts is not None
         assert fast_frame.media_ts is not None

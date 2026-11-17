@@ -146,6 +146,8 @@ class _HandVisit:
     exited_at_ts: float | None = None
     # 是否已确认「进过盘」。一旦置真，这一段进盘过程就成立，直到离盘判定。
     entered_confirmed: bool = False
+    # 这一段进盘过程中途接过几次手部轨迹（视觉 ID 重建）。只用于排查与日志。
+    rebinds: int = 0
 
     def tick(self, *, every_frames: int) -> bool:
         """推进一步并返回本帧是否到采样点（每 k 帧一个）。"""
@@ -828,6 +830,8 @@ class StationPipeline:
             * self._frame_scale
         )
         live_hands: set[int] = set()
+        # 先把「手部 ID 在进盘途中被重建」的过程转交给真正接手的那只手。
+        self._hand_over_split_visits(tray_box, ts)
         for hand in self._hand_tracks:
             if not hand.matched or hand.hits < max(
                 1, self._hand_tracker.min_hits
@@ -886,7 +890,18 @@ class StationPipeline:
                 if holding_now:
                     visit.holding_seen = True
                 if due:
-                    visit.push_holding(holding_now, keep)
+                    # 手已出盘、手里的杆还没出盘的那几帧**不采样**。
+                    #
+                    # 杆心比手晚出盘是常态：示例④ 第 3 次取料手在 f348 出盘、
+                    # 杆在 f352 才出盘，中间 4 帧按「杆必须出盘」都是「手里没杆」。
+                    # 把这几帧记成 False，窗口 [F,F,T] 多数票就是「空手」，
+                    # 整件取料丢掉；掉一帧窗口错位，结论更随机。跳过这几帧后，
+                    # 采样窗口只包含杆真正出盘之后的读数。
+                    #
+                    # 判据是「手边有随手动、但杆心仍在盘区内的杆」——那是这一件
+                    # 正在出门，不是空手离开；盘里不动的料不算（_screw_static）。
+                    if not self._carrying_out_of_tray(hand_box):
+                        visit.push_holding(holding_now, keep)
                 # 攒满窗口才定论（和之前一致）。提前定论会改变后面几段的
                 # 「进盘时手上有没有杆」：实测 105708 在 7.5fps 下从 4 取
                 # 掉到 3 取。点数不足的情形由 holding_verdict 和「手消失」
@@ -1075,6 +1090,112 @@ class StationPipeline:
             return False
         past = self._screw_history[-_SCREW_STATIC_BACK]
         return any(box.iou(past_box) >= _SCREW_STATIC_IOU for past_box in past)
+
+    def _hand_over_split_visits(self, tray_box: BBox | None, ts: float) -> None:
+        """手部 ID 在进盘途中被重建时，把没走完的进盘过程交给真正在盘里的那只手。
+
+        跟踪器在掉帧/遮挡后会保留旧轨迹（``matched=False``，位置停在最后一次
+        观测），同时给回来的手**新建**一条轨迹。于是出现这一幕：旧 ID 停在
+        盘外不动、新 ID 在盘里干活，随后出盘又回落到旧 ID——进盘记在新 ID
+        名下、离盘发生在旧 ID 名下，两边永远凑不齐，整件取料丢掉。示例④
+        第 3 次取料即如此（f339 盘内是 100004，f347 出盘时已是 100003）。
+
+        做法：找出「已确认进盘、但主人轨迹这一帧已失配」的过程，把它转给
+        这一帧**确实在盘内**、且离它最后一次位置最近的那只手。宁可漏接也
+        不要张冠李戴，所以三个条件都要满足：
+
+        - 过程是进行中的（``entered_confirmed`` 且未离盘）；
+        - 主人这一帧没有匹配上（``matched=False``）；
+        - 接手的这只手这一帧在盘内，且距离在 ``hand_track_max_distance`` 内。
+        """
+
+        if not self._visits:
+            return
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        matched = {
+            track.track_id: track
+            for track in self._hand_tracks
+            if track.matched and track.hits >= max(1, self._hand_tracker.min_hits)
+        }
+        limit = self.cfg.hand_track_max_distance * self._frame_scale
+        for owner_id, visit in list(self._visits.items()):
+            if not visit.entered_confirmed or visit.exited_at_ts is not None:
+                continue
+            if owner_id in matched or visit.last_hand_box is None:
+                continue
+            ox, oy = visit.last_hand_box.center
+            best: tuple[float, int] | None = None
+            for track_id, track in matched.items():
+                if track_id == owner_id:
+                    continue
+                # 候选轨迹自己也在走一段**已确认进盘**的过程时不动它，否则
+                # 会把两只同时干活的手搅在一起。只是挂着个还没进盘的空壳
+                # visit 的（掉帧期间新建、还没确认）可以直接顶掉：那几帧盘外
+                # 握持历史本来就属于同一只手。
+                other = self._visits.get(track_id)
+                if other is not None and other.entered_confirmed:
+                    continue
+                hb = track.observation_box()
+                hx, hy = hb.center
+                if tray_box is not None and not (
+                    tray_box.x1 <= hx <= tray_box.x2
+                    and tray_box.y1 <= hy <= tray_box.y2
+                ):
+                    continue
+                distance = math.hypot(ox - hx, oy - hy) / diag
+                if distance > limit:
+                    continue
+                if best is None or distance < best[0]:
+                    best = (distance, track_id)
+            if best is None:
+                continue
+            _, new_id = best
+            self._visits.pop(owner_id, None)
+            self._visits.pop(new_id, None)
+            visit.hand_track_id = new_id
+            visit.last_seen_ts = ts
+            visit.rebinds += 1
+            visit.restart_holding()
+            visit.holding_seen = False
+            self._visits[new_id] = visit
+            self._logger.debug(
+                "手部轨迹 %s → %s 接管进盘过程（已进盘 %.2fs，接管 %d 次）",
+                owner_id,
+                new_id,
+                ts - visit.entered_tray_ts,
+                visit.rebinds,
+            )
+
+    def _carrying_out_of_tray(self, hand_box: BBox) -> bool:
+        """手已在盘外、但手边那根正随着动的杆还没出盘。
+
+        这种帧不能当成「手里没杆」的采样点：杆心晚几帧出盘是常态（示例④
+        第 3 次取料手 f348 出盘、杆 f352 才出盘），把它记成 False 会让
+        采样窗口多数票投出「空手」。它是这一件正在出门的证据，只是还没
+        跨过盘区边线。
+
+        盘里位置没动过的杆不算——那是料架上的存货，与本件无关。
+        """
+
+        tray_box = self._tray_region_box(self._frame_size)
+        if tray_box is None:
+            return False
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        hx, hy = hand_box.center
+        for det in self._last_detections:
+            if det.label != self.station.detector.screw_label:
+                continue
+            cx, cy = det.box.center
+            if math.hypot(cx - hx, cy - hy) / diag > self.cfg.hand_screw_max_distance:
+                continue
+            if not _box_center_in(det.box, tray_box):
+                continue
+            if self._screw_static(det.box):
+                continue
+            return True
+        return False
 
     def _screw_parked_in_tray(self, screw: Detection) -> bool:
         """这根杆是不是盘里那根**没被动过**的静置杆。

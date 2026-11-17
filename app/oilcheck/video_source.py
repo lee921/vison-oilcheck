@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,10 @@ logger = logging.getLogger("oilcheck.video_source")
 # 允许的播放速率：0.5× 用于现场逐帧核对，2× 用于快速过完整段录像。
 _SPEED_MIN = 0.1
 _SPEED_MAX = 4.0
+
+# 待判定帧队列容量。正常节拍下队列里只有 1 帧；留 2 帧给偶发慢一拍，
+# 再多就是处理真跟不上了——那时丢最旧的比越积越旧好。
+_FRAME_QUEUE_MAX = 2
 
 
 def _clamp_speed(value: float) -> float:
@@ -70,7 +75,9 @@ class VideoFileSource:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._frame: Frame | None = None
+        # 待判定帧队列。容量取「约两帧」：正常节拍下始终只有 1 帧在排队，
+        # 处理偶发慢一拍时能补上；连续跟不上则丢最旧的，画面不至于越来越滞后。
+        self._frames: deque[Frame] = deque(maxlen=_FRAME_QUEUE_MAX)
         self._paused = False
         self._progress = 0.0
         self._error = ""
@@ -170,7 +177,7 @@ class VideoFileSource:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         with self._lock:
-            self._frame = None
+            self._frames.clear()
             self._progress = 0.0
             self._frame_index = 0
             self._seek_to = None
@@ -193,11 +200,47 @@ class VideoFileSource:
             self._seek_to = int(ratio * max(0, count - 1))
 
     def get(self) -> Frame | None:
+        """取走队列里最旧的一帧（每帧只能被消费一次）。
+
+        以前这里是「只保留最新一帧」的快照：解码线程按 1/fps 产出，服务层
+        按 1/max_fps 轮询，两个节拍相同但相位不同，轮询偶尔会落在两帧之间，
+        于是中间那帧从没被任何人取到——实测 60 帧漏 4 帧，现场日志里对应
+        那些「视频时间戳异常：0.133s」（正常 0.067s）。检测只要 7ms、预算
+        67ms，**丢帧与推理速度无关，纯粹是取帧方式造成的**。
+
+        改成小容量队列后每帧只被取走一次，不再漏帧；队列满时丢最旧的
+        （保留最新），避免处理真跟不上时越积越旧、画面滞后。
+
+        只有**判定**该调用这个方法。UI 预览要的是"当前画面"，用
+        :meth:`latest`——否则两处各自取走一半队列，判定又会漏帧。
+        """
+
         with self._lock:
-            return self._frame
+            if self._frames:
+                frame = self._frames.popleft()
+            else:
+                frame = None
+        return frame
+
+    def latest(self) -> Frame | None:
+        """最新一帧的只读快照，不消费队列（UI 预览用）。"""
+
+        with self._lock:
+            if self._frames:
+                return self._frames[-1]
+            return None
+
+    @property
+    def backlog(self) -> int:
+        """队列里还没被取走的帧数（UI 状态条排查用）。"""
+
+        with self._lock:
+            return len(self._frames)
 
     def last_ts(self) -> float | None:
-        frame = self.get()
+        """最新一帧的时间戳（只读，不消费队列）。"""
+
+        frame = self.latest()
         return None if frame is None else frame.ts
 
     def status(self) -> dict[str, Any]:
@@ -296,7 +339,7 @@ class VideoFileSource:
                 pos = int(capture.get(cv2.CAP_PROP_POS_FRAMES) or 0)
                 index = max(0, pos - 1)
                 with self._lock:
-                    self._frame = frame
+                    self._frames.append(frame)
                     self._width, self._height = int(w), int(h)
                     self._frame_index = index
                     if total > 0:
