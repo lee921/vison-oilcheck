@@ -299,6 +299,43 @@ def _build_impl(
                 track.mark_lost()
                 lost.append(track)
 
+        def _unconfirmed_association(
+            self,
+            unconfirmed: list[Any],
+            u_detection: list[int],
+            detections: list[Any],
+            activated: list[Any],
+            removed: list[Any],
+        ) -> tuple[list[int], list[Any]]:
+            """出生阶段（未确认轨迹）的关联。
+
+            上游这里硬编码 ``thresh=0.7``，而代价矩阵已被本适配器换成
+            「IoU 与中心距的加权和」（``_cost_matrix``）。两者不是一个量纲：
+            新目标首帧 IoU 代价为 1.0，代价 = alpha + (1-alpha)·(中心距/
+            max_center)，要 ≤0.7 需中心距 ≤ 0.5·max_center。按
+            max_distance=0.15 折算约 106px/帧，4fps 抽帧或 1920 宽画面时
+            手快速伸入会整段不被跟踪。
+
+            与其余两个阶段保持一致：沿用同一代价矩阵，阈值用
+            ``match_thresh``。
+            """
+
+            detections = [detections[i] for i in u_detection]
+            if not unconfirmed or not detections:
+                return list(range(len(detections))), detections
+            dists = self._cost_matrix(unconfirmed, detections)
+            matches, u_unconfirmed, u_detection = matching.linear_assignment(
+                dists, thresh=self.args.match_thresh
+            )
+            for itracked, idet in matches:
+                unconfirmed[itracked].update(detections[idet], self.frame_id)
+                activated.append(unconfirmed[itracked])
+            for it in u_unconfirmed:
+                track = unconfirmed[it]
+                track.mark_removed()
+                removed.append(track)
+            return u_detection, detections
+
     from ultralytics.utils import IterableSimpleNamespace
 
     return _CostByteTracker(IterableSimpleNamespace(**args))
@@ -521,16 +558,24 @@ class ByteTrackObjectTracker:
             )
 
     def _make_room_for_new_track(self) -> bool:
-        """名额满时先淘汰最久未匹配的轨迹，再考虑拒绝新目标。"""
+        """名额满时先淘汰最久未匹配的轨迹，再考虑拒绝新目标。
+
+        只在存在**未匹配**轨迹时淘汰，挑选依据是 ``last_seen_ts``（确定性）。
+        原实现用 ``max(key=(not matched, missing_s))``：全部轨迹都 matched 时
+        键全是 ``(False, 0.0)``，``max`` 返回第一个元素——那是业务正在用的
+        在场轨迹，被逐出后 ``_retire`` 永不复活，ID 每帧轮换、``_visits``
+        与 ``hand_track_id`` 的关联随之断裂。满员且全部在场时应直接拒绝
+        新目标，让新轨迹等下一帧。
+        """
 
         if len(self._tracks) < self._max_active:
             return True
         if not self._tracks:
             return False
-        victim = max(
-            self._tracks.values(),
-            key=lambda item: (not item.matched, item.missing_s),
-        )
+        stale = [track for track in self._tracks.values() if not track.matched]
+        if not stale:
+            return False
+        victim = min(stale, key=lambda item: (item.last_seen_ts, item.track_id))
         self._tracks.pop(victim.track_id, None)
         self._retire(victim.track_id)
         return True

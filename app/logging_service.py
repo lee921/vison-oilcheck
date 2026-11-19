@@ -106,10 +106,17 @@ def setup_logging(
         )
 
         file_handler.suffix = "%Y-%m-%d"
-        file_handler.namer = lambda name: (
-            str(log_dir / f"app-{name.split('.')[-1]}.log")
-        )
-
+        # 不要用 namer 改写轮转目标。
+        #
+        # baseFilename 本身已经是 app-<启动日>.log，而 doRollover 取
+        # rolloverAt - interval 的日期做后缀；启动当天的第一次午夜轮转，
+        # 两者日期相同，经 namer 后目标名与 baseFilename 完全相同，于是
+        # doRollover 命中 ``if os.path.exists(dfn): return`` 直接返回——
+        # 既不关流也不推进 rolloverAt，此后每次都卡在同一处：日志全堆在
+        # 启动日那个文件里无限增长，backupCount=30 的清理永不生效。
+        #
+        # 保留默认命名（app-<启动日>.log.<日期>）即可；getFilesToDelete
+        # 不再依赖自定义 namer（它找不到匹配文件时结果为空，不会误删）。
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
@@ -121,4 +128,45 @@ def setup_logging(
         memory_handler.setFormatter(formatter)
         logger.addHandler(memory_handler)
 
+    return logger
+
+
+def reconfigure_log_dir(
+    logger: logging.Logger, log_dir: Path, store: LogStore
+) -> logging.Logger:
+    """把文件日志迁到 ``log_dir``（启动时 app.json 里的目录与默认值不同）。
+
+    复用同一个 :class:`LogStore`，控制台与内存 handler 不动，只替换文件
+    handler；否则一次启动会装出两套文件 handler，日志写两份。
+    """
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger.debug("日志目录切换为 %s", log_dir)
+    for handler in list(logger.handlers):
+        if isinstance(handler, TimedRotatingFileHandler):
+            handler.close()
+            logger.removeHandler(handler)
+
+    today = time.strftime("%Y-%m-%d")
+    file_handler = TimedRotatingFileHandler(
+        filename=str(log_dir / f"app-{today}.log"),
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+        utc=False,
+    )
+    file_handler.suffix = "%Y-%m-%d"
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(file_handler)
+    if not any(isinstance(h, InMemoryLogHandler) for h in logger.handlers):
+        memory_handler = InMemoryLogHandler(store)
+        memory_handler.setLevel(logging.INFO)
+        logger.addHandler(memory_handler)
     return logger

@@ -64,7 +64,12 @@ class _FakeSlave(socketserver.BaseRequestHandler):
                 while len(server.registers) < start + count:
                     server.registers.append(0)
                 server.registers[start : start + count] = values
-                self._send(tid, unit, struct.pack(">BHH", 16, start, count))
+                if behaviour == "echo_mismatch":
+                    # 回显错误地址：客户端必须据此报错。原先的 >= 6 判断让
+                    # 这条安全网从未执行，这个用例也就无从覆盖。
+                    self._send(tid, unit, struct.pack(">BHH", 16, start + 1, count))
+                else:
+                    self._send(tid, unit, struct.pack(">BHH", 16, start, count))
             else:
                 self._send(tid, unit, bytes([fc | 0x80, 0x01]))
 
@@ -144,6 +149,20 @@ def test_write_registers_echoes_address_and_count(slave):
     pdu = slave.requests[-1]
     assert pdu[0] == 16
     assert struct.unpack(">HHB", pdu[1:6]) == (0, 2, 4)
+
+
+def test_write_registers_rejects_echo_mismatch(slave):
+    """回显的地址/数量与请求不一致 ⇒ 抛链路错误。
+
+    正常 FC16 响应 PDU 只有 5 字节（fc+start+count），原实现用 ``>= 6``
+    判断长度，条件恒假，这段校验从未执行。
+    """
+
+    slave.behaviour = "echo_mismatch"
+    with _link(slave) as link:
+        with pytest.raises(ModbusLinkError) as info:
+            link.write_registers(0, [0x0001, 0x0000])
+    assert "回显不符" in str(info.value)
 
 
 def test_write_registers_rejects_bad_values(slave):

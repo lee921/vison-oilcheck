@@ -118,13 +118,25 @@ class _HandVisit:
     """
 
     hand_track_id: int
+    # 第一次见到这只手的时刻。只用于日志与排查，**不是**「盘内停留」的起点：
+    # 手可能在盘外被连续跟踪很久才蹭过盘边。
     entered_tray_ts: float
+    # 逐帧累计的「盘内时长」：只在 ``inside_raw`` 为真的帧上加上该帧的 dt。
+    # 之前用 ``ts - entered_tray_ts`` 当停留时长，而起点是首次见到手的时刻，
+    # 盘外跟踪得越久 dwell 越大，「盘边划过不判取料」的守卫被撑得越松
+    # （实测盘外跟踪 3s 后只蹭过 1 帧也判成取料）。
     # 进盘时手里是否已经拿着丝杆。取料只认“空手进、带料出”。
     #
     # 不能在进盘当帧判：手一伸进盘，手框就与盘内静置的丝杆交叠，当帧判定
     # 永远是“持有”，取料会被全部吞掉（现场视频 140911 即如此）。因此按
     # **盘外观测历史**投票判定。
     holding_on_entry: bool
+    # 本趟**第一次**观测到「手在盘区内」的时刻，即「盘内停留」的起点。
+    # 用「首次进盘 → 结算」的区间，而不是逐帧累加 inside 帧的 dt：
+    # 手在盘内时可能整段漏检（示例①第 3 次取料只有 4 帧中心落在盘区，
+    # 逐帧累加只有 0.27s < pick_confirm_s，真实取料被误杀）。区间度量
+    # 同时满足「盘外跟踪再久也不算进盘停留」——起点是进盘那一帧。
+    first_inside_ts: float | None = None
     # 已确认「在盘内」。
     inside_tray: bool = True
     last_seen_ts: float = 0.0
@@ -146,6 +158,9 @@ class _HandVisit:
     exited_at_ts: float | None = None
     # 是否已确认「进过盘」。一旦置真，这一段进盘过程就成立，直到离盘判定。
     entered_confirmed: bool = False
+    # 逐帧累计的盘内停留时长（秒）。保留用于排查；判定用的是
+    # ``first_inside_ts`` 到结算时刻的区间（见字段注释）。
+    dwell_in_tray_s: float = 0.0
     # 这一段进盘过程中途接过几次手部轨迹（视觉 ID 重建）。只用于排查与日志。
     rebinds: int = 0
 
@@ -382,6 +397,8 @@ class StationPipeline:
         # 帧占比，而不是「最近一帧」——单帧既可能是手刚伸到盘边与静置杆
         # 交叠，也可能是手正把杆递进来，都不能定性。
         self._outside_holding: dict[int, deque[tuple[bool, float]]] = {}
+        # 每只手最近一次记录盘外观测的时间戳，用于同帧去重。
+        self._outside_holding_last_ts: dict[int, float] = {}
         self._cycles: dict[str, _Cycle] = {}
         self._task_seq = 0
 
@@ -432,8 +449,12 @@ class StationPipeline:
     def reset(self) -> None:
         self._visits.clear()
         self._outside_holding.clear()
+        self._outside_holding_last_ts.clear()
         self._cycles.clear()
-        self._task_seq = 0
+        # 任务序号**不归零**：重置后下一件若又叫 TASK-000001，PLC 侧的
+        # hold_done_task_id 会把它当成「这一件结论已报完」，整件在 PLC 上
+        # 没有记录；事件按 (cycle_id, task_id) 追溯也会撞车。序号只在
+        # 进程启动时从 1 开始。
         self._hand_tracker.reset()
         self._brush_tracker.reset()
         self._last_frame_ts = None
@@ -550,7 +571,7 @@ class StationPipeline:
         self._hand_tracks = hand_out.active
         self._brush_tracks = brush_out.active
 
-        self._update_pick(ts=ts, tray_box=tray_box)
+        self._update_pick(ts=ts, dt=dt, tray_box=tray_box)
         # 本帧的丝杆框在**判定之后**入库：``_screw_history`` 表示「此前若干
         # 帧」的位置，静置杆判据拿 [-BACK] 与之比较，多入一帧会整体错位。
         self._screw_history.append(
@@ -799,7 +820,7 @@ class StationPipeline:
     # ------------------------------------------------------------------
     # 取料判定
     # ------------------------------------------------------------------
-    def _update_pick(self, *, ts: float, tray_box: BBox | None) -> None:
+    def _update_pick(self, *, ts: float, dt: float, tray_box: BBox | None) -> None:
         """空手进盘 → 带料离盘 ⇒ 取料完成。
 
         所有子判定都用最近 n 个采样点投票（``pick_sample_every_frames`` /
@@ -870,6 +891,13 @@ class StationPipeline:
             visit.last_seen_ts = ts
             visit.last_hand_box = hand_box
             visit.last_outside_holding = None if inside_raw else holding_now
+            # 记录「本趟第一次进盘」。起点不取首次见到手的时刻（那会把盘外
+            # 跟踪时长算进去），也不逐帧累加盘内帧（手在盘内整段漏检时
+            # 会严重低估，示例①第 3 次取料只有 4 帧命中盘区）。
+            if inside_raw:
+                if visit.first_inside_ts is None:
+                    visit.first_inside_ts = ts
+                visit.dwell_in_tray_s += max(0.0, dt)
             due = visit.tick(every_frames=every)
             if due:
                 visit.push_inside(inside_raw, keep)
@@ -995,6 +1023,7 @@ class StationPipeline:
         for hand_id in list(self._outside_holding):
             if hand_id not in live_hands and hand_id not in self._visits:
                 self._outside_holding.pop(hand_id, None)
+                self._outside_holding_last_ts.pop(hand_id, None)
 
     @staticmethod
     def _vanished_outside(visit: _HandVisit) -> bool:
@@ -1014,7 +1043,16 @@ class StationPipeline:
     ) -> None:
         """攒够采样（或不得不定论）时给这一件下定论。"""
 
-        dwell = ts - visit.entered_tray_ts
+        # 盘内停留 = 首次进盘 → 结算时刻的区间。
+        # 原实现的起点是「首次见到这只手」：手在盘外被跟踪 3 秒再蹭一下
+        # 盘区，dwell 就有 3 秒多，「盘边划过不判取料」的守卫形同虚设。
+        # 起点改锚到真正进盘的那一帧，终点仍用结算时刻——离盘后攒采样
+        # 的这段时间本来就计入阈值（现场标定的 pick_confirm_s 是在这套
+        # 口径下调出来的），只换起点才不改变既有的取料行为。
+        if visit.first_inside_ts is not None:
+            dwell = max(0.0, ts - visit.first_inside_ts)
+        else:
+            dwell = visit.dwell_in_tray_s
         if visit.holding_on_entry:
             self._logger.debug(
                 "手 %s 带着丝杆进盘又离开，不判取料", hand_track_id
@@ -1068,6 +1106,13 @@ class StationPipeline:
 
         if holding is not None and self._screw_parked_in_tray(holding):
             holding = None
+        # 同一帧只记一次。三处调用点（新建轨迹、采样点、未确认进盘）
+        # 看似互斥，实测同一 ``ts`` 会被调用 2~3 次：``pick_history_samples``
+        # 默认 3，一帧就能把投票窗口灌满，多数票退化成「单帧随机数」。
+        last = self._outside_holding_last_ts.get(hand_id)
+        if last is not None and last == ts:
+            return
+        self._outside_holding_last_ts[hand_id] = ts
         window = max(0.0, self._entry_grace_s())
         history = self._outside_holding.setdefault(hand_id, deque())
         history.append((holding is None, ts))
@@ -1088,8 +1133,24 @@ class StationPipeline:
 
         if len(self._screw_history) < _SCREW_STATIC_BACK:
             return False
-        past = self._screw_history[-_SCREW_STATIC_BACK]
-        return any(box.iou(past_box) >= _SCREW_STATIC_IOU for past_box in past)
+        # 参考帧取窗口内**最早的连续两帧**（8 帧前与 7 帧前），而不是只比
+        # ``[-BACK]`` 这一帧。
+        #
+        # 单帧比对时，只要那一帧恰好漏检了这根杆，位置从未变动的杆就会被
+        # 判成「在动」；一旦锚点借此捕获了静置杆，`_static_anchor_ok` 的
+        # 「锚点 ±0.02 同根」例外会让它一直合法，之后刷真杆的接触时长不再
+        # 累计 → 漏涂 NG。
+        #
+        # 也不能拿窗口里**所有**帧来比：移动中的杆总能与最近一两帧的同位
+        # 匹配上（实测这样静置判定直接失效，涂油全部判不出来）。只有保持
+        # 时间差、又多一个参考帧，才能既跳过漏检帧、又区分静与动。
+        window = list(self._screw_history)[-_SCREW_STATIC_BACK:]
+        reference = window[:2]
+        return any(
+            box.iou(past_box) >= _SCREW_STATIC_IOU
+            for frame in reference
+            for past_box in frame
+        )
 
     def _hand_over_split_visits(self, tray_box: BBox | None, ts: float) -> None:
         """手部 ID 在进盘途中被重建时，把没走完的进盘过程交给真正在盘里的那只手。
@@ -1160,10 +1221,10 @@ class StationPipeline:
             visit.holding_seen = False
             self._visits[new_id] = visit
             self._logger.debug(
-                "手部轨迹 %s → %s 接管进盘过程（已进盘 %.2fs，接管 %d 次）",
+                "手部轨迹 %s → %s 接管进盘过程（盘内已停留 %.2fs，接管 %d 次）",
                 owner_id,
                 new_id,
-                ts - visit.entered_tray_ts,
+                visit.dwell_in_tray_s,
                 visit.rebinds,
             )
 

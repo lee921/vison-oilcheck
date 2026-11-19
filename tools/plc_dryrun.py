@@ -195,6 +195,11 @@ def main() -> int:
             print(f"跳过不存在的视频: {path}")
             continue
         mapper.reset()
+        # pipeline 也必须重置：run_video 每段都从 media_ts=0.0 起算，
+        # 第 2 段第一帧就小于第 1 段末尾的 _last_frame_ts，pipeline.process
+        # 在时间戳倒退分支直接 return，此后每帧都倒退——第 2 段起处理 0 帧，
+        # 工具却照常打印标题，docs/12 §8 的验收会假通过。
+        pipeline.reset()
         all_frames.extend(run_video(path, pipeline, mapper, limit=args.limit))
 
     detector.close()

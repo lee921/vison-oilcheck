@@ -34,6 +34,7 @@ from app.config_service import ConfigService
 from app.models import AppConfig
 from app.oilcheck.config import OilCheckConfig, OilCheckConfigService
 from app.oilcheck.roi import Roi
+from app.oilcheck.service import OilCheckService
 from ui.utils import UiInvoker
 from ui.widgets.roi_calibration import RoiCalibrationDialog
 
@@ -47,6 +48,7 @@ class SettingsPage(QWidget):
         manager: CameraManager,
         oilcheck_cfg_service: OilCheckConfigService,
         oilcheck_cfg: OilCheckConfig,
+        oilcheck_service: OilCheckService | None = None,
         on_saved: Callable[[AppConfig], None],
         on_oilcheck_saved: Callable[[OilCheckConfig], None],
         parent: QWidget | None = None,
@@ -67,6 +69,7 @@ class SettingsPage(QWidget):
         self._manager = manager
         self._oil_cfg_service = oilcheck_cfg_service
         self._oil_cfg = oilcheck_cfg
+        self._oilcheck_service = oilcheck_service
         self._on_saved = on_saved
         self._on_oilcheck_saved = on_oilcheck_saved
 
@@ -358,7 +361,18 @@ class SettingsPage(QWidget):
         )
         dialog.exec()
         # 无论保存还是取消，都从磁盘重新读取一次，避免界面与服务配置不一致。
-        self.set_oilcheck_config(self._oil_cfg_service.load())
+        # 读不出来（文件被误保存成 GBK/坏 JSON）时保留当前界面配置，不要
+        # 用 `load()` 的返回值把它覆盖掉。
+        try:
+            self.set_oilcheck_config(self._oil_cfg_service.load())
+        except Exception as exc:  # noqa: BLE001
+            InfoBar.error(
+                "检测配置无法读取",
+                f"{exc}\n界面保留当前配置，修复文件后重试。",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=6000,
+                parent=self,
+            )
 
     def set_app_config(self, app_cfg: AppConfig) -> None:
         self._load_app(app_cfg)
@@ -379,6 +393,14 @@ class SettingsPage(QWidget):
         self._btn_plc_test.setText("测试中...")
 
         def _probe() -> tuple[bool, str]:
+            # 走 service：由 PlcIoThread 先关掉自己的连接再探测。自建
+            # PlcLink 会与写入线程抢唯一会话，生产模式下必然超时。
+            service = self._oilcheck_service
+            if service is not None:
+                try:
+                    return service.check_plc_connection()
+                except Exception as exc:  # noqa: BLE001
+                    return False, f"{type(exc).__name__}: {exc}"
             from app.oilcheck.plc_link import ModbusError, ModbusLinkError, PlcLink
 
             link = PlcLink(host, port, connect_timeout_s=2.0, request_timeout_s=2.0)

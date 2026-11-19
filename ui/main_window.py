@@ -66,6 +66,7 @@ class MainWindow(FluentWindow):
             manager=self._manager,
             oilcheck_cfg_service=self._oilcheck_cfg_service,
             oilcheck_cfg=self._oilcheck_cfg,
+            oilcheck_service=self._oilcheck_service,
             on_saved=self._on_settings_saved,
             on_oilcheck_saved=self._on_oilcheck_saved,
         )

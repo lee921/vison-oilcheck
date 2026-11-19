@@ -425,13 +425,40 @@ class HikSdkContext:
             "PlayM4_Stop": (bool_type, [playm4_port_type]),
             "PlayM4_CloseStream": (bool_type, [playm4_port_type]),
             "PlayM4_GetLastError": (ctypes.c_uint, [playm4_port_type]),
+            # PlayM4_GetJPEG/GetBMP 的**实际** ABI 是 4 个参数：
+            #   (int nPort, unsigned char *pBuf, unsigned int nSize,
+            #    unsigned int *pSize)
+            # nSize 是调用方给出的缓冲容量，*pSize 回写产生的图像长度。
+            # 这两个函数只写内存、不写文件，因此项目里没有调用方（截图走
+            # FrameBuffer + cv2.imwrite）。声明必须按真实 ABI 写全：只声明
+            # 两个参数时 edx/rcx 取 libffi 残值，arg4 的 ``mov %edx,(%rax)``
+            # 就是对野指针的写（实测段错误）。
             "PlayM4_GetJPEG": (
                 bool_type,
-                [playm4_port_type, ctypes.c_char_p],
+                [
+                    playm4_port_type,
+                    ctypes.POINTER(ctypes.c_ubyte),
+                    ctypes.c_uint,
+                    ctypes.POINTER(ctypes.c_uint),
+                ],
             ),
             "PlayM4_GetBMP": (
                 bool_type,
-                [playm4_port_type, ctypes.c_char_p],
+                [
+                    playm4_port_type,
+                    ctypes.POINTER(ctypes.c_ubyte),
+                    ctypes.c_uint,
+                    ctypes.POINTER(ctypes.c_uint),
+                ],
+            ),
+            # 取当前帧尺寸（宽、高）。两个参数都是 out 指针。
+            "PlayM4_GetPictureSize": (
+                bool_type,
+                [
+                    playm4_port_type,
+                    ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint),
+                ],
             ),
         }
 

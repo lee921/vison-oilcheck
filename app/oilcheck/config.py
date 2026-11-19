@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -37,6 +38,94 @@ from app.paths import config_root, runtime_root
 from .roi import Roi
 
 logger = logging.getLogger("oilcheck.config")
+
+# ---------------------------------------------------------------------------
+# 配置标量的严格解析
+#
+# 现场编辑 JSON 时最常见的三类错误都要「退回默认值并记日志」，而不是让它们
+# 悄悄改变判定参数或让加载崩溃：
+#
+# - 类型不对（``"abc"``、``[1,2]``）→ ValueError / TypeError；
+# - 越界数值 ``1e400`` → json 解析成 inf，``int(inf)`` 抛 OverflowError；
+# - ``NaN`` → ``min(hi, nan)`` 在 Python 里返回 ``hi``，会把阈值静默夹到边界
+#   （实测 pick_confirm_s 等全部变成 0.0，判定失去约束）。
+#
+# 这些函数是模块级的：DetectorConfig / PipelineConfig / RecordingConfig /
+# PlcConfig 各自维护一份内部解析器正是 R3/R9 的成因，新增字段时极易漏掉。
+# ---------------------------------------------------------------------------
+
+_TRUE_STRINGS = {"1", "true", "yes", "on"}
+_FALSE_STRINGS = {"0", "false", "no", "off", ""}
+
+
+def _warn_bad_value(section: str, key: str, value: Any, default: Any) -> None:
+    logger.warning(
+        "配置项 %s.%s 非法（%r），已回退默认值 %r", section, key, value, default
+    )
+
+
+def _scalar_float(
+    section: str, key: str, value: Any, default: float,
+    lo: float | None = None, hi: float | None = None,
+) -> float:
+    """把配置值解析成有限浮点数，非法值退回默认值并记日志。
+
+    注意 NaN 必须显式判断：``min(hi, nan)`` 返回 ``hi``、``max(lo, nan)``
+    返回 ``lo``，不会报错，会静默落到某个边界值上。
+    """
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        _warn_bad_value(section, key, value, default)
+        return default
+    if not math.isfinite(number):
+        _warn_bad_value(section, key, value, default)
+        return default
+    if lo is not None and number < lo:
+        number = lo
+    if hi is not None and number > hi:
+        number = hi
+    return number
+
+
+def _scalar_int(
+    section: str, key: str, value: Any, default: int,
+    lo: int | None = None, hi: int | None = None,
+) -> int:
+    """把配置值解析成整数，非法值退回默认值并记日志。"""
+
+    # ``int(inf)`` 抛 OverflowError（不是 ValueError），``int(nan)`` 抛
+    # ValueError，两者都要接住。
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        _warn_bad_value(section, key, value, default)
+        return default
+    if lo is not None and number < lo:
+        number = lo
+    if hi is not None and number > hi:
+        number = hi
+    return number
+
+
+def _scalar_bool(section: str, key: str, value: Any, default: bool) -> bool:
+    """解析布尔值。字符串走白名单，不能直接 ``bool("false")``（恒为 True）。"""
+
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        _warn_bad_value(section, key, value, default)
+        return default
+    if isinstance(value, (bool, int)):
+        return bool(value)
+    if value is None:
+        return default
+    _warn_bad_value(section, key, value, default)
+    return default
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
 _CONFIG_VERSION = "2.9"
@@ -193,22 +282,17 @@ class DetectorConfig:
             kind = "null"
 
         def _f(key: str, default: float, lo: float, hi: float) -> float:
-            try:
-                return max(lo, min(hi, float(data.get(key, default))))
-            except (TypeError, ValueError):
-                return default
+            return _scalar_float(
+                "detector", key, data.get(key, default), default, lo, hi
+            )
 
         def _i(key: str, default: int, lo: int, hi: int) -> int:
-            try:
-                return max(lo, min(hi, int(data.get(key, default))))
-            except (TypeError, ValueError):
-                return default
+            return _scalar_int(
+                "detector", key, data.get(key, default), default, lo, hi
+            )
 
         def _b(key: str, default: bool) -> bool:
-            value = data.get(key, default)
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "on"}
-            return bool(value)
+            return _scalar_bool("detector", key, data.get(key, default), default)
 
         return cls(
             kind=kind,
@@ -415,24 +499,17 @@ class PipelineConfig:
         d = cls()
 
         def _f(key: str, default: float, lo: float = 0.0) -> float:
-            try:
-                value = float(data.get(key, default))
-            except (TypeError, ValueError):
-                value = default
-            return max(lo, value)
+            return _scalar_float(
+                "pipeline", key, data.get(key, default), default, lo, None
+            )
 
         def _b(key: str, default: bool) -> bool:
-            value = data.get(key, default)
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "on"}
-            return bool(value)
+            return _scalar_bool("pipeline", key, data.get(key, default), default)
 
         def _i(key: str, default: int, lo: int, hi: int) -> int:
-            try:
-                value = int(data.get(key, default))
-            except (TypeError, ValueError):
-                value = default
-            return max(lo, min(hi, value))
+            return _scalar_int(
+                "pipeline", key, data.get(key, default), default, lo, hi
+            )
 
         def _backend(key: str, default: str) -> str:
             value = str(data.get(key, default)).strip().lower()
@@ -457,6 +534,16 @@ class PipelineConfig:
                 default=d.pick_hand_distance,
             ),
             pick_confirm_s=_f("pick_confirm_s", d.pick_confirm_s, 0.0),
+            # 这两个是取料判定的核心参数（采样间隔与投票窗口）。字段声明、
+            # to_dict、from_dict 是三份各自维护的列表，漏一处就「文件里改了
+            # 不生效、设置页保存一次又写回默认值」。tests/test_config.py 里
+            # 有按 to_dict 全量校验的参数化用例守着。
+            pick_sample_every_frames=_i(
+                "pick_sample_every_frames", d.pick_sample_every_frames, 1, 30
+            ),
+            pick_history_samples=_i(
+                "pick_history_samples", d.pick_history_samples, 1, 30
+            ),
             hand_track_max_distance=_f(
                 "hand_track_max_distance", d.hand_track_max_distance, 0.005
             ),
@@ -642,22 +729,15 @@ class RecordingConfig:
         d = cls()
 
         def _f(key: str, default: float) -> float:
-            try:
-                return float(data.get(key, default))
-            except (TypeError, ValueError):
-                return default
+            return _scalar_float(
+                "recording", key, data.get(key, default), default
+            )
 
         def _i(key: str, default: int) -> int:
-            try:
-                return int(data.get(key, default))
-            except (TypeError, ValueError):
-                return default
+            return _scalar_int("recording", key, data.get(key, default), default)
 
         def _b(key: str, default: bool) -> bool:
-            value = data.get(key, default)
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "yes", "on"}
-            return bool(value)
+            return _scalar_bool("recording", key, data.get(key, default), default)
 
         return cls(
             training_dir=str(data.get("training_dir") or d.training_dir),
@@ -809,18 +889,17 @@ class PlcConfig:
         d = cls()
 
         def _float(key: str, default: float, lo: float, hi: float) -> float:
-            try:
-                value = float(data.get(key, default))
-            except (TypeError, ValueError):
-                return default
-            return max(lo, min(hi, value))
+            return _scalar_float(
+                "plc", key, data.get(key, default), default, lo, hi
+            )
 
         def _int(key: str, default: int, lo: int, hi: int) -> int:
-            try:
-                value = int(data.get(key, default))
-            except (TypeError, ValueError):
-                return default
-            return max(lo, min(hi, value))
+            return _scalar_int(
+                "plc", key, data.get(key, default), default, lo, hi
+            )
+
+        def _bool(key: str, default: bool) -> bool:
+            return _scalar_bool("plc", key, data.get(key, default), default)
 
         backoff_raw = data.get("reconnect_backoff_ms", d.reconnect_backoff_ms)
         backoff: list[int] = []
@@ -840,17 +919,26 @@ class PlcConfig:
         if isinstance(steps_raw, dict):
             for key in ("pick", "oiling"):
                 if key in steps_raw:
-                    try:
-                        value = int(steps_raw[key])
-                    except (TypeError, ValueError):
-                        continue
-                    if 1 <= value <= 8:
-                        steps[key] = value
+                    value = _scalar_int(
+                        "plc", f"steps.{key}", steps_raw[key], steps[key], 1, 8
+                    )
+                    steps[key] = value
+        # 位语义是「VB1 = 已通过的工步累计位、VB2 = 失败的那一步」，
+        # 只有 pick < oiling 时成立；且 _state_step(PICKED) 要占 pick+1 位，
+        # 所以 oiling 最多到 7（pick=8 时 VB0=1<<8 会被 hr0 的 &0xFF 抹掉）。
+        if not (1 <= steps["pick"] < steps["oiling"] <= 7):
+            _warn_bad_value(
+                "plc",
+                "steps",
+                steps_raw,
+                {"pick": d.steps["pick"], "oiling": d.steps["oiling"]},
+            )
+            steps = dict(d.steps)
 
         order = str(data.get("byte_order", d.byte_order)).strip().lower()
         return cls(
-            enabled=bool(data.get("enabled", d.enabled)),
-            dry_run=bool(data.get("dry_run", d.dry_run)),
+            enabled=_bool("enabled", d.enabled),
+            dry_run=_bool("dry_run", d.dry_run),
             host=str(data.get("host", d.host)).strip() or d.host,
             port=_int("port", d.port, 1, 65535),
             unit_id=_int("unit_id", d.unit_id, 0, 255),
@@ -959,7 +1047,9 @@ class StationConfig:
             station_id=station_id,
             name=str(data.get("name") or station_id),
             camera_id=camera_id,
-            enabled=bool(data.get("enabled", True)),
+            enabled=_scalar_bool(
+                "stations", "enabled", data.get("enabled", True), True
+            ),
             tray_roi=tray_roi,
             work_roi=work_roi,
             oiling_roi=oiling_roi,
@@ -1301,6 +1391,15 @@ class OilCheckConfigService:
                     if work is not None:
                         station["work_roi"] = work
                         changed.append("stations.work_roi")
+                # ``pick_roi`` 是 ``tray_roi`` 的旧别名（from_dict 里两者
+                # 互为回退）。直接 pop 会让「只写了 pick_roi」的 2.0 工位
+                # 在迁移后因缺少 tray_roi 被整个丢弃——先转成 tray_roi。
+                pick_roi = station.get("pick_roi")
+                if isinstance(pick_roi, dict) and not isinstance(
+                    station.get("tray_roi"), dict
+                ):
+                    station["tray_roi"] = pick_roi
+                    changed.append("stations.tray_roi")
                 for legacy_key in (
                     "hand_roi",
                     "oiling_roi",
@@ -1570,9 +1669,12 @@ class OilCheckConfigService:
             return OilCheckConfig()
         try:
             data = load_json_with_comments(self.config_path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
+            # 不能静默退回「全默认配置」：那会把 stations 清空、界面无提示，
+            # 用户随后在设置页保存一次就把整份现场配置覆盖成默认值。
+            # 保留旧配置继续运行（服务层 reload 路径也会这么做）。
             logger.error("加载检测配置失败 (%s): %s", self.config_path, exc)
-            return OilCheckConfig()
+            raise
         if not isinstance(data, dict):
             return OilCheckConfig()
         cfg = OilCheckConfig.from_dict(data)
@@ -1749,7 +1851,10 @@ CONFIG_COMMENTS: dict[str, str] = {
         "PLC 警示灯（Modbus TCP）。默认关闭且只读：装上代码不会自动写 PLC。"
         "协议见 docs/12-PLC警示灯通信与控制.md"
     ),
-    "plc.enabled": "总开关。现场确认字节序与工步编号后再开",
+    "plc.enabled": (
+        "总开关。默认关闭：装上代码不会自动连/写 PLC；现场确认字节序与"
+        "工步编号后再打开（见 docs/12 §1.2）"
+    ),
     "plc.dry_run": "只读联调：照常算帧、照常打日志，但不写 PLC",
     "plc.host": "PLC 的 IP。本机需在 192.168.1.x 网段（见 docs/12 §1.2）",
     "plc.port": "Modbus TCP 端口，现场协议表为 502",
@@ -1949,9 +2054,22 @@ def add_json_comments(payload: object, comments: dict[str, str]) -> str:
 
 
 def load_json_with_comments(path: Path) -> Any:
-    """读取带注释的 JSON 文件。"""
+    """读取带注释的 JSON 文件。
 
-    text = path.read_text(encoding="utf-8")
+    编码按 UTF-8（含 BOM）→ GB18030 依次尝试：中文 Windows 记事本
+    「另存为 ANSI」产出 GBK、带 BOM 的 UTF-8 也很常见。原先只写
+    ``utf-8``，BOM 会让 json.loads 抛 JSONDecodeError，调用方随即退回
+    「全默认配置」（stations=[]），界面没有任何提示。
+    """
+
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        text = raw[3:].decode("utf-8")
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gb18030")
     return json.loads(strip_json_comments(text))
 
 

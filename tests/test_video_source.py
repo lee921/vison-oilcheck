@@ -145,7 +145,10 @@ def test_video_source_get_does_not_skip_frames(tmp_path):
         source.stop()
 
     assert len(stamps) >= 40, f"6 秒只取到 {len(stamps)} 帧"
-    gaps = [round((b - a) * 15.0, 3) for a, b in zip(stamps, stamps[1:])]
+    gaps = [
+        round((b - a) * 15.0, 3)
+        for a, b in zip(stamps, stamps[1:], strict=False)
+    ]
     # 每帧间隔必须是 1/15s；出现 2.0 就是漏了一帧。
     assert all(gap == pytest.approx(1.0, abs=1e-6) for gap in gaps), (
         f"取帧出现跳号: {sorted(set(gaps))}"

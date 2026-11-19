@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from app.oilcheck.config import (
     OilCheckConfig,
@@ -1126,3 +1129,248 @@ def test_console_filter_drops_file_only_records(tmp_path):
     assert not console.filter(record)
     del record.__dict__[FILE_ONLY]
     assert console.filter(record)
+
+
+def test_log_file_rotates_across_midnight(tmp_path):
+    """跨午夜必须真的切出新文件，且 rolloverAt 前进。
+
+    原实现用 ``namer`` 把轮转目标改写成 app-<日期>.log，启动当天第一次
+    午夜轮转的目标名与 baseFilename 完全相同，doRollover 命中「目标已存在」
+    直接 return：既不关流也不推进 rolloverAt，此后日志全堆在启动日文件里。
+    """
+
+    from logging.handlers import TimedRotatingFileHandler
+
+    from app.logging_service import LogStore, setup_logging
+
+    store = LogStore()
+    logger = setup_logging(log_dir=tmp_path / "logs", store=store)
+    try:
+        handler = next(
+            h for h in logger.handlers if isinstance(h, TimedRotatingFileHandler)
+        )
+        logger.info("午夜前的一条")
+        # 强制轮转：白天调用时 computeRollover 算出的下一个午夜不变，所以
+        # 这里只断言「文件真的切走了」，不断言 rolloverAt 数值。
+        handler.doRollover()
+        logger.info("午夜后的一条")
+        handler.flush()
+    finally:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    files = sorted(p.name for p in (tmp_path / "logs").glob("app-*.log*"))
+    # 轮转产出一个「baseFilename.日期」的备份文件，且备份里是午夜前的内容。
+    # 原实现（namer 改写目标名）下目标与 baseFilename 相同，doRollover
+    # 直接 return，根本不会产生这个备份文件。
+    backups = [name for name in files if ".log." in name]
+    assert backups, files
+    base = tmp_path / "logs" / f"app-{time.strftime('%Y-%m-%d')}.log"
+    rotated = tmp_path / "logs" / backups[0]
+    assert "午夜前的一条" in rotated.read_text(encoding="utf-8")
+    # 新写的内容留在 baseFilename 里
+    assert "午夜后的一条" in base.read_text(encoding="utf-8")
+
+
+def test_config_text_accepts_bom_and_gbk(tmp_path):
+    """带 BOM 的 UTF-8 与 GBK 编码的配置都要能读。"""
+
+    import json
+
+    from app.config_service import ConfigService, read_config_text
+
+    bom = tmp_path / "bom.json"
+    bom.write_bytes(b"\xef\xbb\xbf" + json.dumps({"name": "工位"}).encode("utf-8"))
+    assert json.loads(read_config_text(bom)) == {"name": "工位"}
+
+    gbk = tmp_path / "gbk.json"
+    gbk.write_bytes(json.dumps({"name": "一号工位"}, ensure_ascii=False).encode("gbk"))
+    assert json.loads(read_config_text(gbk)) == {"name": "一号工位"}
+
+    # 端到端：app.json 为 GBK 时不再抛 UnicodeDecodeError
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "app.json").write_bytes(
+        json.dumps({"ui_fps": 20, "log_dir": "日志"}, ensure_ascii=False).encode("gbk")
+    )
+    service = ConfigService(repo_root=tmp_path)
+    cfg = service.load_app_config()
+    assert cfg.ui_fps == 20
+    assert cfg.log_dir == "日志"
+
+
+def test_app_config_bad_field_types_fall_back_to_defaults(tmp_path):
+    """字段类型非法时退回默认值，不能抛异常（那会崩在日志就绪之前）。"""
+
+    from app.config_service import ConfigService
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "app.json").write_text(
+        '{"ui_fps": "abc", "layout": 1e400, "decode_max_fps": null}',
+        encoding="utf-8",
+    )
+    cfg = ConfigService(repo_root=tmp_path).load_app_config()
+    assert cfg.ui_fps == 15
+    assert cfg.layout == 4
+    assert cfg.decode_max_fps == 15
+
+
+def test_cameras_parse_failure_raises_instead_of_empty_list(tmp_path):
+    """cameras.json 读不出来必须抛错，不能返回 []。
+
+    返回 [] 会被设备页当成「相机被删光了」，下一次增删改把 [] 写回磁盘，
+    两台相机的 IP/账号/口令全部丢失。
+    """
+
+    from app.config_service import CamerasConfigError, ConfigService
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "cameras.json").write_text('[{"id": "cam1",}]', encoding="utf-8")
+    service = ConfigService(repo_root=tmp_path)
+    with pytest.raises(CamerasConfigError):
+        service.load_cameras()
+
+
+def test_pipeline_from_dict_round_trips_every_writable_field():
+    """每个 to_dict 导出的键，写入非默认值后都必须生效。
+
+    字段声明、to_dict、from_dict 是三份各自维护的列表，漏一处就「改了
+    配置不生效」。这里按 to_dict 全量校验，新增字段漏写会直接失败。
+    """
+
+    from app.oilcheck.config import PipelineConfig
+
+    default = PipelineConfig()
+    base = default.to_dict()
+    # 白名单字段：合法取值不是「原值加后缀」，单独给一个合法替代值。
+    enum_probes = {
+        "hand_tracker_backend": "object",
+        "brush_tracker_backend": "bytetrack",
+    }
+    mismatches: list[tuple[str, object, object]] = []
+    for key, value in base.items():
+        if key in enum_probes:
+            probe: object = enum_probes[key]
+        elif isinstance(value, bool):
+            probe = not value
+        elif isinstance(value, int):
+            probe = value + 1
+        elif isinstance(value, float):
+            probe = value + 0.01
+        elif isinstance(value, str):
+            probe = value + "x"
+        else:
+            continue
+        got = PipelineConfig.from_dict({key: probe}).to_dict()[key]
+        if got != probe:
+            mismatches.append((key, probe, got))
+    assert mismatches == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"pick_confirm_s": float("nan")},
+        {"brush_hold_s": float("nan")},
+        {"brush_contact_distance": float("nan")},
+        {"oiling_timeout_s": float("nan")},
+    ],
+)
+def test_pipeline_nan_thresholds_fall_back_to_defaults(payload):
+    """NaN 不能静默夹成 0.0（那会让一组阈值同时失效）。"""
+
+    from app.oilcheck.config import PipelineConfig
+
+    (key,), = [tuple(payload)]
+    cfg = PipelineConfig.from_dict(payload)
+    assert getattr(cfg, key) == getattr(PipelineConfig(), key)
+
+
+def test_pipeline_overflow_number_falls_back():
+    """1e400 会被 json 解析成 inf，int(inf) 抛 OverflowError。"""
+
+    from app.oilcheck.config import PipelineConfig
+
+    assert PipelineConfig.from_dict({"max_fps": 1e400}).max_fps == 15
+
+
+def test_plc_string_booleans_are_parsed():
+    """``"false"`` 必须解析成 False，否则 PLC 线程会被意外启用。"""
+
+    from app.oilcheck.config import PlcConfig, StationConfig
+
+    plc = PlcConfig.from_dict({"enabled": "false", "dry_run": "false"})
+    assert plc.enabled is False
+    assert plc.dry_run is False
+    station = StationConfig.from_dict(
+        {
+            "station_id": "s",
+            "camera_id": "c",
+            "tray_roi": {"kind": "rect", "points": [[0, 0], [1, 1]]},
+            "enabled": "false",
+        }
+    )
+    assert station is not None and station.enabled is False
+
+
+def test_plc_step_order_is_validated():
+    """pick >= oiling 时位语义不成立，必须回退默认并记 warning。"""
+
+    from app.oilcheck.config import PlcConfig
+
+    for steps in ({"pick": 3, "oiling": 3}, {"pick": 5, "oiling": 2}):
+        assert PlcConfig.from_dict({"steps": steps}).steps == {"pick": 1, "oiling": 3}
+    # 合法组合原样保留
+    assert PlcConfig.from_dict({"steps": {"pick": 2, "oiling": 5}}).steps == {
+        "pick": 2,
+        "oiling": 5,
+    }
+
+
+def test_migration_keeps_station_with_only_pick_roi(tmp_path):
+    """只写 pick_roi 的 2.0 工位，迁移后必须转成 tray_roi 而不是被丢弃。"""
+
+    import json
+
+    from app.oilcheck.config import OilCheckConfigService
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "oilcheck.json").write_text(
+        json.dumps(
+            {
+                "version": "2.0",
+                "stations": [
+                    {
+                        "station_id": "s1",
+                        "camera_id": "cam1",
+                        "pick_roi": {"kind": "rect", "points": [[0.1, 0.1], [0.5, 0.5]]},
+                        "hand_roi": {"kind": "rect", "points": [[0, 0], [1, 1]]},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = OilCheckConfigService(config_dir=cfg_dir).load()
+    assert [s.station_id for s in cfg.stations] == ["s1"]
+    assert cfg.stations[0].tray_roi.to_dict()["points"] == [[0.1, 0.1], [0.5, 0.5]]
+
+
+def test_env_password_missing_raises(monkeypatch):
+    """``env:`` 引用的变量缺失时必须报错，不能静默用空口令登录。"""
+
+    from app.config_service import ConfigService
+
+    monkeypatch.delenv("OILCHECK_TEST_PASSWORD", raising=False)
+    with pytest.raises(ValueError, match="OILCHECK_TEST_PASSWORD"):
+        ConfigService.resolve_password("env:OILCHECK_TEST_PASSWORD")
+    with pytest.raises(ValueError, match="变量名"):
+        ConfigService.resolve_password("env:")
+    monkeypatch.setenv("OILCHECK_TEST_PASSWORD", "s3cret")
+    assert ConfigService.resolve_password("env:OILCHECK_TEST_PASSWORD") == "s3cret"
+    # 明文口令不受影响
+    assert ConfigService.resolve_password("plain") == "plain"

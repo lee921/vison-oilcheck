@@ -151,3 +151,39 @@ def test_known_event_types_roundtrip():
         )
         assert record.event_type.value == kind
         assert record.event_label == label
+
+
+def test_clear_while_add_is_appending_leaves_no_disk_residue(tmp_path):
+    """``clear()`` 与追加必须互斥，否则清空后磁盘仍残留一条。
+
+    原先追加在锁外：add 已经把事件写进内存、正在写盘时 clear 删掉了文件，
+    追加随后又把这一行写回去——内存 0 条、磁盘 1 行。这里在
+    ``_append_jsonl`` 里插 0.15s 延迟放大窗口，确定性地复现。
+    """
+
+    import threading
+    import time
+
+    store = EventStore(tmp_path, capacity=10_000)
+    original = store._append_jsonl
+
+    def slow_append(path, payload) -> None:
+        time.sleep(0.15)
+        original(path, payload)
+
+    store._append_jsonl = slow_append  # type: ignore[method-assign]
+
+    writer = threading.Thread(target=store.add, args=(_event(),), daemon=True)
+    writer.start()
+    time.sleep(0.05)  # 让 add 进入临界区/开始追加
+    store.clear()
+    writer.join(timeout=5)
+
+    assert len(store.recent(10_000)) == 0
+    lines = [
+        line
+        for path in tmp_path.glob("events-*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert lines == []

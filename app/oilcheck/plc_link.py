@@ -205,9 +205,11 @@ class PlcLink:
         payload += b"".join(struct.pack(">H", int(v)) for v in values)
         with self._lock:
             body = self._request_locked(bytes([16]) + payload)
-        # FC16 正常响应回显地址与数量（6 字节）。核对一下，确认写的确实是
-        # 我们以为的那一段——写错地址在 PLC 上可能表现为「灯不对」而不是报错。
-        if len(body) >= 6:
+        # FC16 正常响应的 PDU 是 5 字节：fc(1) + 起始地址(2) + 数量(2)。
+        # 原先写 ``>= 6``，条件恒假，这段回显校验从未执行过（假从站发的
+        # 也正是 5 字节）。核对一下，确认写的确实是这一段——写错地址在
+        # PLC 上可能表现为「灯不对」而不是报错。
+        if len(body) >= 5:
             echoed_start, echoed_count = struct.unpack(">HH", body[1:5])
             if echoed_start != start or echoed_count != len(values):
                 raise ModbusLinkError(

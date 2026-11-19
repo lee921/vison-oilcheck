@@ -1,10 +1,89 @@
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 StreamType = Literal["main", "sub"]
 PreferredMode = Literal["direct", "decode"]
+
+logger = logging.getLogger("oilcheck.config")
+
+# 现场手写 JSON 的常见错误：`enabled: "false"`、`port: "abc"`、`ui_fps: 1e400`。
+# 这些配置在 main.py 里早于 setup_logging 读取，一旦抛异常就是「窗口闪一下
+# 就没了」且没有任何日志。解析器逐项退回默认值并记 warning——日志就绪后
+# 能看到，程序也能带着可用配置起来。
+_TRUE_STRINGS = {"1", "true", "yes", "on"}
+_FALSE_STRINGS = {"0", "false", "no", "off", ""}
+
+
+def _bad(section: str, key: str, value: Any, default: Any) -> None:
+    logger.warning(
+        "配置项 %s.%s 非法（%r），已回退默认值 %r", section, key, value, default
+    )
+
+
+def _as_bool(section: str, key: str, value: Any, default: bool) -> bool:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+        _bad(section, key, value, default)
+        return default
+    if isinstance(value, (bool, int)):
+        return bool(value)
+    if value is None:
+        return default
+    _bad(section, key, value, default)
+    return default
+
+
+def _as_int(
+    section: str, key: str, value: Any, default: int,
+    lo: int | None = None, hi: int | None = None,
+) -> int:
+    # int(inf) 抛 OverflowError，int(nan) 抛 ValueError，两者都要接住。
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        _bad(section, key, value, default)
+        return default
+    if lo is not None and number < lo:
+        number = lo
+    if hi is not None and number > hi:
+        number = hi
+    return number
+
+
+def _as_float(
+    section: str, key: str, value: Any, default: float,
+    lo: float | None = None, hi: float | None = None,
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        _bad(section, key, value, default)
+        return default
+    if not math.isfinite(number):
+        _bad(section, key, value, default)
+        return default
+    if lo is not None and number < lo:
+        number = lo
+    if hi is not None and number > hi:
+        number = hi
+    return number
+
+
+def _as_dict(section: str, key: str, value: Any) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if value is None:
+        return {}
+    _bad(section, key, value, {})
+    return {}
 
 
 @dataclass(frozen=True)
@@ -15,10 +94,18 @@ class ReconnectConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
+        data = dict(data or {})
+        d = cls()
         return cls(
-            enable=bool(data.get("enable", True)),
-            max_backoff_s=int(data.get("max_backoff_s", 30)),
-            offline_timeout_s=int(data.get("offline_timeout_s", 10)),
+            enable=_as_bool("reconnect", "enable", data.get("enable", d.enable), d.enable),
+            max_backoff_s=_as_int(
+                "reconnect", "max_backoff_s", data.get("max_backoff_s", d.max_backoff_s),
+                1, 3600,
+            ),
+            offline_timeout_s=_as_int(
+                "reconnect", "offline_timeout_s",
+                data.get("offline_timeout_s", d.offline_timeout_s), 1, 3600,
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -46,25 +133,26 @@ class CameraConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
-        try:
-            total_detections = int(data.get("total_detections", 0))
-        except Exception:
-            total_detections = 0
+        data = dict(data or {})
         return cls(
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
-            enabled=bool(data.get("enabled", True)),
+            enabled=_as_bool("cameras", "enabled", data.get("enabled", True), True),
             ip=str(data.get("ip", "")),
-            port=int(data.get("port", 8000)),
+            port=_as_int("cameras", "port", data.get("port", 8000), 8000, 1, 65535),
             username=str(data.get("username", "admin")),
             password=str(data.get("password", "")),
-            total_detections=total_detections,
-            channel=int(data.get("channel", 1)),
+            total_detections=_as_int(
+                "cameras", "total_detections", data.get("total_detections", 0), 0, 0
+            ),
+            channel=_as_int("cameras", "channel", data.get("channel", 1), 1, 1, 64),
             stream_type="main" if data.get("stream_type") == "main" else "sub",
             preferred_mode=(
                 "direct" if data.get("preferred_mode") == "direct" else "decode"
             ),
-            reconnect=ReconnectConfig.from_dict(dict(data.get("reconnect", {}))),
+            reconnect=ReconnectConfig.from_dict(
+                _as_dict("cameras", "reconnect", data.get("reconnect"))
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -93,10 +181,15 @@ class RelayConfig:
     @classmethod
     def from_dict(cls, data: dict) -> Self:
         # host 是历史字段；目标设备由现场固定接线映射决定。
+        data = dict(data or {})
+        d = cls()
         return cls(
-            enabled=bool(data.get("enabled", False)),
-            port=int(data.get("port", 10000)),
-            timeout_s=float(data.get("timeout_s", 1.0)),
+            enabled=_as_bool("relay", "enabled", data.get("enabled", d.enabled), d.enabled),
+            port=_as_int("relay", "port", data.get("port", d.port), d.port, 1, 65535),
+            timeout_s=_as_float(
+                "relay", "timeout_s", data.get("timeout_s", d.timeout_s),
+                d.timeout_s, 0.05, 60.0,
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -119,14 +212,23 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
+        data = dict(data or {})
+        d = cls()
         return cls(
-            layout=int(data.get("layout", 4)),
-            ui_fps=int(data.get("ui_fps", 15)),
-            decode_max_fps=int(data.get("decode_max_fps", 15)),
-            offline_timeout_s=int(data.get("offline_timeout_s", 10)),
-            snapshot_dir=str(data.get("snapshot_dir", "snapshots")),
-            log_dir=str(data.get("log_dir", "logs")),
-            relay=RelayConfig.from_dict(dict(data.get("relay", {}))),
+            layout=_as_int("app", "layout", data.get("layout", d.layout), d.layout, 1, 4),
+            ui_fps=_as_int("app", "ui_fps", data.get("ui_fps", d.ui_fps), d.ui_fps, 1, 60),
+            decode_max_fps=_as_int(
+                "app", "decode_max_fps", data.get("decode_max_fps", d.decode_max_fps),
+                d.decode_max_fps, 1, 60,
+            ),
+            offline_timeout_s=_as_int(
+                "app", "offline_timeout_s",
+                data.get("offline_timeout_s", d.offline_timeout_s),
+                d.offline_timeout_s, 1, 3600,
+            ),
+            snapshot_dir=str(data.get("snapshot_dir") or d.snapshot_dir),
+            log_dir=str(data.get("log_dir") or d.log_dir),
+            relay=RelayConfig.from_dict(_as_dict("app", "relay", data.get("relay"))),
         )
 
     def to_dict(self) -> dict:

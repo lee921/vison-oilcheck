@@ -80,7 +80,10 @@ def _describe(words: list[int], order: str) -> list[str]:
         steps = [str(step + 1) for step in range(8) if (value >> step) & 1]
         hint = ""
         if vb == 0 and value:
-            known = [VB0_STEP_HINT[bit] for bit in range(4) if (value >> bit) & 1]
+            known = [
+                VB0_STEP_HINT[bit] for bit in range(4) if (value >> bit) & 1
+                and bit in VB0_STEP_HINT
+            ]
             if known:
                 hint = f"  → {', '.join(known)}"
         lines.append(

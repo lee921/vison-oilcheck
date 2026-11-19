@@ -141,6 +141,16 @@ class ReconnectPolicy:
         return max(1, backoff)
 
 
+def _healthy(state: SessionState, last_activity_ts: float | None) -> bool:
+    """会话确认健康：正在预览且最近有画面。只有这种状态才清零退避。"""
+
+    if state != SessionState.PREVIEWING:
+        return False
+    if last_activity_ts is None:
+        return False
+    return (time.time() - last_activity_ts) <= 5.0
+
+
 @dataclass
 class ReconnectState:
     """记录重连尝试的状态。"""
@@ -223,7 +233,12 @@ class ReconnectSupervisor:
             st = self._state.setdefault(cam_id, ReconnectState())
 
             if decision.action == PolicyAction.NONE:
-                if st.attempt != 0:
+                # 只有「确认健康」才清零退避。重连过程中会话必然经过
+                # DISCONNECTED / CONNECTING（登录阻塞可达数秒），这期间
+                # should_reconnect 返回 NONE；原先无条件 reset 让 attempt
+                # 永远回到 0，指数退避卡在 1.0s 长不起来——一台断网相机
+                # 每几秒就被重新登录一次并打一条 ERROR 日志。
+                if _healthy(state, last_activity_ts) and st.attempt != 0:
                     st.reset()
                 return None
 

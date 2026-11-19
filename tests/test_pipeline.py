@@ -543,6 +543,50 @@ def test_too_short_dwell_in_tray_does_not_pick():
     assert [e for e in events if e.event_type == EventType.PICK] == []
 
 
+def test_long_track_outside_tray_then_graze_does_not_pick():
+    """手在盘外被持续跟踪很久后只蹭过盘区 1 帧：不判取料。
+
+    ``pick_confirm_s`` 必须衡量「盘内停留」。原实现用「结算时刻 - 首次
+    见到这只手」，盘外跟踪 3.5 秒后蹭过 1 帧，dwell 就有 3.5 秒，即使把
+    门槛调到 1 秒也照样判取料。
+    """
+
+    pipeline, events = make_pipeline(pick_confirm_s=1.0)
+    ts_iter = timestamps(start=1.0, step=1 / 15)
+
+    # 盘外连续跟踪 3 秒（缓慢移动，保持同一轨迹 ID）
+    for i in range(45):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(340 + (i % 10) * 4, 640.0),
+            screw_at(*TRAY_SCREW),
+        )
+    # 只把盘区蹭过 1 帧
+    feed(pipeline, next(ts_iter), hand_at(*ENTRY_HAND), screw_at(*TRAY_SCREW))
+    # 离盘并带着杆走开，攒够盘外采样
+    for step in range(1, 9):
+        x = ENTRY_HAND[0] - step * 20
+        y = ENTRY_HAND[1] + step * 20
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(x, y),
+            held_screw_at(x, y),
+            screw_at(*TRAY_SCREW),
+        )
+    for _ in range(6):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*HAND_TARGET),
+            held_screw_at(*HAND_TARGET),
+            screw_at(*TRAY_SCREW),
+        )
+
+    assert [e for e in events if e.event_type == EventType.PICK] == []
+
+
 def test_raw_mode_passes_all_detections_without_events():
     """raw_mode：全量交出检测结果，不建轨迹、不产生事件。"""
 

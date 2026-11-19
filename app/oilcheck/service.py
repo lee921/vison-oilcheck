@@ -235,6 +235,43 @@ class OilCheckService:
             }
         return plc.status()
 
+    def check_plc_connection(self) -> tuple[bool, str]:
+        """测一次 PLC 连通性（不写寄存器），并让出写入线程自己的会话。
+
+        设置页原先自建 ``PlcLink`` 连同一台 PLC：生产模式下写入线程一直
+        占着 socket，第二条连接按现场实测 SYN 超时，「测试连接」必然失败，
+        提示还会把现场引向「检查博途在线监控」。走这里由 PlcIoThread 先关
+        自己的连接再探测。
+        """
+
+        with self._lock:
+            plc = self._plc
+        if plc is not None:
+            return plc.check_connection()
+        cfg = self._config.plc
+        from .plc_link import ModbusError, ModbusLinkError, PlcLink
+
+        link = PlcLink(
+            cfg.host,
+            cfg.port,
+            connect_timeout_s=cfg.connect_timeout_s,
+            request_timeout_s=cfg.request_timeout_s,
+        )
+        base = cfg.register_base
+        try:
+            link.open()
+            registers = link.read_holding(base, 2)
+        except (ModbusLinkError, ModbusError) as exc:
+            return False, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+        finally:
+            link.close()
+        return True, (
+            f"{cfg.host}:{cfg.port} 可读，"
+            f"HR{base}=0x{registers[0]:04X} HR{base + 1}=0x{registers[1]:04X}"
+        )
+
     def _plc_station_id(self) -> str | None:
         """PLC 取哪个工位的状态：配置指定，留空取第一个启用工位。"""
 
@@ -612,7 +649,16 @@ class OilCheckService:
                     logger_=self._logger,
                 )
                 self._recorders[camera_id] = recorder
-        recorder.start()
+        if not recorder.start():
+            # start() 返回 False 有两种原因：已经在录，或上一次 stop 的
+            # join 超时（写盘卡在慢盘/满盘/不可中断 IO，线程还活着）。
+            # 原先丢弃返回值，UI 会先弹「已开始录制」、紧接着状态又显示
+            # 「未开始」，操作员要自己察觉这次没录上。
+            reason = recorder.status().last_error or "录制线程尚未退出"
+            self._logger.warning(
+                "开始录制被拒绝 (相机=%s)：%s", camera_id, reason
+            )
+            return recorder.status()
         session = self._manager.get_session(camera_id)
         if session is None or session.state.value != "previewing":
             self._logger.warning(
@@ -734,6 +780,9 @@ class OilCheckService:
         if frame is None:
             return
         if frame.ts <= runtime.last_frame_ts:
+            # 示例回放有自己的回绕检测；这里只处理实时相机的墙钟倒退。
+            if frame.ts < runtime.last_frame_ts and not synthetic:
+                self._on_wallclock_rewind(runtime, frame.ts)
             return
         runtime.last_frame_ts = frame.ts
         if video is not None:
@@ -781,6 +830,32 @@ class OilCheckService:
             "示例回放回绕（帧 %s → %s），将重置判定状态 (工位=%s)",
             previous,
             index,
+            runtime.station.station_id,
+        )
+
+    def _on_wallclock_rewind(
+        self, runtime: _StationRuntime, frame_ts: float
+    ) -> None:
+        """实时相机的墙钟时间戳倒退时，重排判定状态。
+
+        帧时间戳来自 ``time.time()``（``hik/decode.py``）。工控机 NTP 校时、
+        手工改时间、断电重启后对时都会让它倒退：此后每帧都小于
+        ``last_frame_ts``，这里原先是静默 ``return``，检测永久停摆，而相机
+        状态仍是 previewing、``time.time() - last_ts`` 因差值为负恒判在线，
+        界面显示「在线、有画面」，日志里一条记录都没有。
+
+        处理方式：记一条 warning，清掉 ``last_frame_ts`` 让新时间轴接管，
+        并重置判定状态——倒退前后不是连续过程，接着算会把停留时长算成负数。
+        重置只置标记，真正执行排在 ``pipeline`` 所属的执行器线程。
+        """
+
+        previous = runtime.last_frame_ts
+        runtime.last_frame_ts = 0.0
+        runtime.pending_pipeline_reset = True
+        self._logger.warning(
+            "相机时间戳倒退（%.3fs → %.3fs），重置判定状态并重新计时 (工位=%s)",
+            previous,
+            frame_ts,
             runtime.station.station_id,
         )
 
@@ -942,12 +1017,22 @@ def _pick_plc_task(
         current = tasks[-1] if tasks else None
     superseded: TaskSnapshot | None = None
     if current is not None:
-        for task in reversed(tasks):
-            if task.task_id == current.task_id:
-                break
-            if task.final_result != TaskResult.PROCESSING:
-                superseded = task
-                break
+        # 只在 current **之前**的条目里找。
+        #
+        # 原实现从最后一条往前扫、遇到 current 就 break，而 current 通常
+        # 正是最后一条（进行中的那件必然是最新创建的），第一轮就跳出，
+        # superseded 恒为 None——「上一件的漏涂结论补不出去」，docs/12 的
+        # 补报机制实际是死代码。这里按 (created_at, task_id) 取严格排在
+        # current 之前、且已判终态的最近一条。
+        current_key = (current.created_at, current.task_id)
+        older = [
+            task
+            for task in tasks
+            if (task.created_at, task.task_id) < current_key
+            and task.final_result != TaskResult.PROCESSING
+        ]
+        if older:
+            superseded = older[-1]
     return current, superseded
 
 

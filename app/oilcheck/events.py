@@ -101,17 +101,19 @@ class EventStore:
         return len(loaded)
 
     def add(self, event: EventRecord) -> None:
+        path = self._events_dir() / f"events-{_date_of(event.timestamp_end)}.jsonl"
+        # 内存写入与磁盘追加放在同一把锁里：``clear()`` 也在锁内删文件，
+        # 三者同临界区才能保证「清空」之后不会有并发追加把事件写回磁盘
+        # （原先追加在锁外，实测清空后 events-*.jsonl 仍残留一条）。
         with self._lock:
             self._events[event.event_id] = event
             while len(self._events) > self._capacity:
                 self._events.popitem(last=False)
             self._version += 1
-
-        path = self._events_dir() / f"events-{_date_of(event.timestamp_end)}.jsonl"
-        try:
-            self._append_jsonl(path, event.to_dict())
-        except OSError:
-            self._logger.exception("写入事件文件失败: %s", path)
+            try:
+                self._append_jsonl(path, event.to_dict())
+            except OSError:
+                self._logger.exception("写入事件文件失败: %s", path)
 
     def submit_review(
         self,
@@ -121,14 +123,6 @@ class EventStore:
         note: str = "",
         reviewer: str = "operator",
     ) -> EventRecord | None:
-        with self._lock:
-            event = self._events.get(event_id)
-            if event is None:
-                return None
-            reviewed = event.with_review(review_result, note=note)
-            self._events[event_id] = reviewed
-            self._version += 1
-
         path = self._events_dir() / f"reviews-{_date_of(time.time())}.jsonl"
         payload = {
             "event_id": event_id,
@@ -137,10 +131,17 @@ class EventStore:
             "reviewer": str(reviewer),
             "reviewed_at": time.time(),
         }
-        try:
-            self._append_jsonl(path, payload)
-        except OSError:
-            self._logger.exception("写入复核文件失败: %s", path)
+        with self._lock:
+            event = self._events.get(event_id)
+            if event is None:
+                return None
+            reviewed = event.with_review(review_result, note=note)
+            self._events[event_id] = reviewed
+            self._version += 1
+            try:
+                self._append_jsonl(path, payload)
+            except OSError:
+                self._logger.exception("写入复核文件失败: %s", path)
         return reviewed
 
     def clear(self) -> int:

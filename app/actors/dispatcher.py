@@ -141,12 +141,32 @@ class ActorDispatcher:
                 break
 
         self._stopped.set()
+        # 队列里尚未处理的命令：线程已退出，它们的 Future 永远不会完成。
+        # 调用方在线程池 worker 里阻塞在 ``reply.result()``（无超时）上，
+        # 随后 camera_manager 的 ``executor.shutdown(wait=True)`` 会把进程
+        # 钉在退出阶段。逐个置异常，让等待方立即返回。
+        self._fail_pending()
         self._logger.info("Actor 已停止: %s", self._name)
         if self._on_stop is not None:
             try:
                 self._on_stop()
             except Exception:
                 self._logger.exception("执行 on_stop 回调失败: %s", self._name)
+
+    def _fail_pending(self) -> None:
+        """把队列中残留命令的 reply 置成异常（线程退出后没人会再处理它们）。"""
+
+        while True:
+            try:
+                message = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            reply = getattr(message, "reply", None)
+            if reply is None or reply.done():
+                continue
+            reply.set_exception(
+                RuntimeError(f"Actor 已停止，命令未执行: {self._name}")
+            )
 
     @property
     def is_running(self) -> bool:

@@ -25,7 +25,7 @@ from qfluentwidgets import (
 )
 
 from app.camera_manager import CameraManager
-from app.config_service import ConfigService
+from app.config_service import CamerasConfigError, ConfigService
 from app.models import CameraConfig
 
 from ..utils import UiInvoker
@@ -97,7 +97,20 @@ class DevicePage(QWidget):
         self.reload()
 
     def reload(self) -> None:
-        self._cameras = self._cfg_service.load_cameras()
+        try:
+            self._cameras = self._cfg_service.load_cameras()
+        except CamerasConfigError as exc:
+            # 文件读不出来时不能当作「没有相机」——之后任何一次增删改都会把
+            # 空列表写回磁盘，现场相机的 IP/账号/口令全部丢失。保持原列表并
+            # 明确提示用户先修文件。
+            InfoBar.error(
+                "摄像头配置无法读取",
+                f"{exc}\n已保留当前列表，修复文件后点「重新加载」。",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=8000,
+                parent=self,
+            )
+            return
         self._render()
 
     def _render(self) -> None:

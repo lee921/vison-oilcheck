@@ -417,14 +417,25 @@ class RecordingPage(QWidget):
         self._refresh_status()
 
     def _start_recording(self, camera_id: str) -> None:
-        self._service.start_training_recording(camera_id)
-        InfoBar.info(
-            "录制",
-            "已开始录制，等待相机画面",
-            position=InfoBarPosition.TOP_RIGHT,
-            duration=2000,
-            parent=self,
-        )
+        status = self._service.start_training_recording(camera_id)
+        if status.active:
+            InfoBar.info(
+                "录制",
+                "已开始录制，等待相机画面",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=2000,
+                parent=self,
+            )
+        else:
+            # 没真正开起来时不能报「已开始」——紧接着的状态刷新会显示
+            # 「未开始」，操作员只能自己猜是哪一次没录上。
+            InfoBar.warning(
+                "未开始录制",
+                status.last_error or "录制线程尚未退出，请稍后重试",
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=4000,
+                parent=self,
+            )
         self._refresh_status()
         self._refresh_segments()
 

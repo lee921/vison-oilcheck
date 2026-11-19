@@ -77,6 +77,8 @@ class _SegmentState:
     frame_count: int = 0
     dropped_at_start: int = 0
     writer: Any = None
+    # 最近一次真正写进文件的帧时间戳，用于按 recording.fps 限流。
+    last_written_ts: float | None = None
 
 
 class TrainingRecorder:
@@ -247,6 +249,17 @@ class TrainingRecorder:
         writer = segment.writer
         if writer is None:
             return False
+        # 按配置帧率限流：``fps`` 原先只写进 VideoWriter 构造与元数据，
+        # submit 是每来一帧就写。服务侧提交率取 max(pipeline.max_fps,
+        # recording.fps)，两者不等时成片时间轴就失真（15fps 源、25fps
+        # 管线、15fps 录制 ⇒ 1.67 倍速），训练素材的动作速度不再等于真实
+        # 速度。以首帧为基准按「下一个应写时刻」判定，不累积浮点误差。
+        if segment.last_written_ts is not None:
+            min_gap = 1.0 / max(1, self._fps)
+            if ts - segment.last_written_ts < min_gap * 0.9:
+                with self._lock:
+                    self._frames_dropped += 1
+                return True
         try:
             writer.write(frame)
         except Exception as exc:  # noqa: BLE001
@@ -256,6 +269,7 @@ class TrainingRecorder:
             return False
 
         segment.frame_count += 1
+        segment.last_written_ts = ts
         with self._lock:
             self._frames_written += 1
             self._segment = segment
@@ -427,6 +441,15 @@ def list_segments(root: Path, *, limit: int = 200) -> list[dict[str, Any]]:
             continue
         if not isinstance(data, dict) or data.get("type") != "training_video":
             continue
+        # path 字段以 sidecar 自身位置推导出的 MP4 为准：原样信任 sidecar
+        # 里的绝对路径会让「列出」也把目录外的文件带进 UI（随后被删除）。
+        # 现场正常录制的 sidecar 就在 mp4 旁边、同名，推导结果与写入时一致。
+        expected = str(path.with_suffix(".mp4"))
+        recorded = data.get("path")
+        if recorded and str(recorded) != expected:
+            data = {**data, "path": expected}
+        else:
+            data = {**data, "path": recorded or expected}
         items.append(data)
     items.sort(key=lambda d: float(d.get("started_at_epoch", 0.0) or 0.0), reverse=True)
     return items[: max(1, int(limit))]
@@ -475,6 +498,10 @@ def delete_segments(
     ``(成功删除数量, 错误信息列表)``。
     """
     root = Path(root)
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = root
     active = {str(Path(path)) for path in active_paths}
     deleted = 0
     errors: list[str] = []
@@ -485,6 +512,20 @@ def delete_segments(
         path_key = str(path)
         if path_key in active:
             errors.append(f"{path.name}: 正在录制，已跳过")
+            continue
+        # 录制目录之外的路径一律拒绝：list_segments 读的是目录下任意
+        # sidecar JSON 的 path 字段并原样信任，UI 又直接拿它当删除目标。
+        # 一个 {"type":"training_video","path":"/tmp/x"} 就能删掉任意文件。
+        # resolve() 同时覆盖符号链接逃逸。
+        try:
+            resolved = path.resolve()
+            inside = resolved == root_resolved or resolved.is_relative_to(
+                root_resolved
+            )
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            errors.append(f"{path.name}: 不在录制目录内，已拒绝删除")
             continue
 
         failed = False

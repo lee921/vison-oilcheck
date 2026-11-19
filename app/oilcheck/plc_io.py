@@ -240,7 +240,16 @@ class _MapperState:
     # 这一件的结论已经报过、保持窗也结束了：它继续留在快照里（保留策略是
     # 按条数，不是按时间），不能再报一次，否则工步会在 1 与 4 之间循环。
     hold_done_task_id: str | None = None
+    # 快照里第一次出现「没有任务」的墙钟时刻。用于超时回落：用户点
+    # 「重置状态」、示例回绕、切换检测器都会清空 _cycles，此前若停在
+    # 「涂油中」，工步会一直冻在那里（警示灯整夜显示涂油中）。
+    no_task_since: float | None = None
     last_frame: PlcFrame | None = None
+
+
+# 「快照里没有任务」持续超过这个时长就回落 IDLE。取得比完成保持窗长，
+# 避免清理把工步从 4 拉回 1；但又必须有限，否则重置后永久冻结。
+_NO_TASK_IDLE_TIMEOUT_S = 5.0
 
 
 def _resolve_step(ev: PlcEvidence) -> tuple[ProcessStep, str]:
@@ -355,13 +364,27 @@ class PlcStepMapper:
 
         if ev.task_id is None:
             # 快照里没有任务：可能是刚结束的件被 ``_cleanup`` 回收，也可能
-            # 是启动初期还没有周期。不回工步 1，保持当前工步让保持窗自己
-            # 到期——否则清理会让工步从 4 跳回 1，PLC 读到假的「下一件」。
-            candidate = st.current_step
-            reason = "快照暂无任务，保持当前工步"
+            # 是启动初期还没有周期、用户点了「重置状态」、示例回绕或切换
+            # 检测器。短暂保持当前工步让保持窗自己到期（否则清理会让工步
+            # 从 4 跳回 1，PLC 读到假的「下一件」）；但不能无限保持——
+            # 重置后没有下一件时工步会永久停在「涂油中」，警示灯整夜亮着。
+            if st.no_task_since is None:
+                st.no_task_since = now
+            if now - st.no_task_since < _NO_TASK_IDLE_TIMEOUT_S:
+                candidate = st.current_step
+                reason = "快照暂无任务，保持当前工步"
+            else:
+                candidate = ProcessStep.IDLE
+                st.current_step = ProcessStep.IDLE
+                st.finished_at = None
+                st.finished_result = None
+                st.hold_done_task_id = None
+                st.last_task_id = None
+                reason = "快照暂无任务且已超时，回到等待取料"
         elif ev.task_id != st.last_task_id:
             # 新的一件：工步从头开始，不受上一件的单调性约束。
             st.last_task_id = ev.task_id
+            st.no_task_since = None
             st.finished_at = None
             st.finished_result = None
             st.current_step = candidate
@@ -375,6 +398,8 @@ class PlcStepMapper:
             # 但「已经刷上了」这个事实不会撤销。
             candidate = st.current_step
             reason = "工步不后退（保持上一拍）"
+        else:
+            st.no_task_since = None
 
         if candidate == ProcessStep.FINISHED:
             st.current_step = ProcessStep.FINISHED
@@ -568,11 +593,19 @@ class PlcIoThread:
         返回 ``(是否成功, 说明)``。只读联调模式下也一样能测——读不需要
         什么权限，也不会改 PLC 状态。
 
-        该 PLC 只允许一条 Modbus TCP 会话，所以测完立刻断开，把会话让给
-        写入线程（或反过来）。
+        该 PLC 只允许一条 Modbus TCP 会话：生产模式下写入线程一直占着
+        socket（写完不关、靠 1s 重写保活），第二条连接按现场实测会 SYN
+        超时。所以这里先关掉写入线程自己的连接再探测，探测完让线程按
+        退避自行重连，否则「测试连接」在生产模式下必然失败，提示还会把
+        现场引向「检查博途在线监控」。
         """
 
         base = self._cfg.register_base
+        owns_link = self._thread is not None and self._thread.is_alive()
+        if owns_link:
+            # 与写入线程共用同一个 PlcLink 对象：close() 之后线程下一拍
+            # 会发现 not connected 并重新 open()。
+            self._link.close()
         try:
             self._link.open()
             registers = self._link.read_holding(base, 2)
@@ -582,6 +615,10 @@ class PlcIoThread:
             return False, f"{type(exc).__name__}: {exc}"
         finally:
             self._link.close()
+            if owns_link:
+                # 让写入线程立刻重写完整帧：上次写入的值已不可信。
+                self._io.last_written = None
+                self._io.next_attempt_mono = 0.0
         return True, (
             f"{self._cfg.host}:{self._cfg.port} 可读，"
             f"HR{base}=0x{registers[0]:04X} HR{base + 1}=0x{registers[1]:04X}"

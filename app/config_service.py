@@ -7,11 +7,42 @@ import tempfile
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from .models import AppConfig, CameraConfig
 from .paths import config_root, data_root
 
 logger = logging.getLogger("oilcheck.config")
+
+
+class CamerasConfigError(RuntimeError):
+    """``cameras.json`` 存在但读不出来（语法错误、编码不对、顶层不是数组）。
+
+    抛异常而不是返回空列表：设备页拿到 ``[]`` 会以为是「用户删光了所有
+    相机」，下一次增删改就把 ``[]`` 写回磁盘，现场两台相机的 IP、账号、
+    口令全丢。调用方要么让用户先修文件，要么明确提示读取失败。
+    """
+
+    def __init__(self, path: Path, error: BaseException) -> None:
+        super().__init__(f"摄像头配置无法读取（{path}）：{error}")
+        self.path = path
+        self.error = error
+
+
+def read_config_text(path: Path) -> str:
+    """按 UTF-8（含 BOM）读取配置文本，失败时回退 GB18030。
+
+    中文 Windows 记事本「另存为 ANSI」产出的是 GBK；带 BOM 的 UTF-8
+    也常见。两种都不能让程序崩在启动阶段（那时日志系统还没就绪）。
+    """
+
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("gb18030")
 
 
 class ConfigService:
@@ -137,15 +168,26 @@ class ConfigService:
             return AppConfig()
 
         try:
-            with self.app_config_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+            # utf-8-sig 兼容 Windows 记事本另存产生的 BOM；编码本身不是
+            # UTF-8（中文记事本「另存为 ANSI」= GBK）时依次回退 gb18030。
+            # 原先这里只写 encoding="utf-8"，UnicodeDecodeError（ValueError
+            # 子类）不在 except 里，会一路冒到 main.py 的 setup_logging 之前，
+            # 表现为「窗口闪一下就没」且日志里什么都没有。
+            text = read_config_text(self.app_config_path)
+            data = json.loads(text)
+        except (OSError, ValueError) as e:
             logger.error("加载应用配置失败 (%s): %s", self.app_config_path, e)
             return AppConfig()
 
         if not isinstance(data, dict):
             return AppConfig()
+        # from_dict 已对每个字段做严格解析（非法值退回默认并记 warning），
+        # 这里不再可能因字段类型抛异常。
         return AppConfig.from_dict(dict(data))
+
+    @staticmethod
+    def _read_json(path: Path) -> Any:
+        return json.loads(read_config_text(path))
 
     def save_app_config(self, cfg: AppConfig) -> None:
         self._write_json_atomic(self.app_config_path, cfg.to_dict())
@@ -158,14 +200,18 @@ class ConfigService:
             return []
 
         try:
-            with self.cameras_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+            data = self._read_json(self.cameras_path)
+        except (OSError, ValueError) as e:
             logger.error("加载摄像头配置失败 (%s): %s", self.cameras_path, e)
-            return []
+            # 解析失败必须让调用方知道：``[]`` 会被设备页当成「用户删光了
+            # 所有相机」，下一次增删改直接写回 ``[]``，两台相机的 IP、账号、
+            # 口令全部丢失（R6）。
+            raise CamerasConfigError(self.cameras_path, e) from e
 
         if not isinstance(data, list):
-            return []
+            raise CamerasConfigError(
+                self.cameras_path, ValueError("顶层不是数组")
+            )
 
         cameras: list[CameraConfig] = []
         for item in data:
@@ -210,7 +256,17 @@ class ConfigService:
         # 支持 env: 前缀从环境变量读取密码
         if value.lower().startswith("env:"):
             var_name = value[4:].strip()
-            return os.environ.get(var_name, "")
+            if not var_name:
+                raise ValueError("密码配置写成了 ``env:`` 但没给变量名")
+            resolved = os.environ.get(var_name)
+            if not resolved:
+                # 用空口令去登录会得到海康的「用户名或密码错误」，现场会去
+                # 查 IP 和账号，联想不到是环境变量没设（桌面启动器 / systemd
+                # 不继承 shell 的环境变量时很常见）。
+                raise ValueError(
+                    f"环境变量 {var_name} 未设置或为空（相机密码引用自 env:{var_name}）"
+                )
+            return resolved
         return value
 
     @staticmethod

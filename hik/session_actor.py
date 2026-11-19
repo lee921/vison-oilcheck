@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,10 @@ from .decode import FrameBuffer
 from .errors import SessionError
 from .sdk_context import HikSdkContext, SdkLease
 from .state_machine import SessionEvent, SessionState, SessionStateMachine
+
+# 单条 Actor 命令的等待上限。SDK 登录在网络不可达时可阻塞数秒；抓图与
+# 停止不应超过这个量级。超过就返回错误，不让调用方无限等。
+COMMAND_TIMEOUT_S = 20.0
 
 
 class SessionActor:
@@ -168,7 +173,17 @@ class SessionActor:
             command = replace(command, reply=Future())
         if not self._dispatcher.send(command, block=True):
             raise RuntimeError("Actor queue is full")
-        return command.reply.result()
+        # 带超时等待：线程若卡在阻塞型 SDK 调用（登录/登出/抓图）里，
+        # 无超时的 result() 会把调用方的线程池 worker 永久占住，退出时
+        # executor.shutdown(wait=True) 一起把进程钉死。超时后仍让 Actor
+        # 继续处理（不取消），只是调用方先拿到错误。
+        try:
+            return command.reply.result(timeout=COMMAND_TIMEOUT_S)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError(
+                f"Actor 命令超时（{COMMAND_TIMEOUT_S:.0f}s）: "
+                f"{type(command).__name__}"
+            ) from exc
 
     def _handle_message(self, message: Message) -> None:
         if isinstance(message, Command):
@@ -250,6 +265,25 @@ class SessionActor:
             return
 
         self._transition(SessionEvent.CONNECT_REQUEST)
+        # 进入 CONNECTING 之后的任何异常都必须把状态带回去。
+        #
+        # 原先 253-302 行的 initialize()/acquire_session()/登录若抛错，异常
+        # 只被 _handle_command 塞进 reply、会话却停在 CONNECTING：
+        # ReconnectPolicy 对非 PREVIEWING/ERROR 一律返回 NONE（永不重连），
+        # 运维再点「开始」时 _do_start_preview 放行 CONNECTING、随后
+        # (CONNECTING, START_PREVIEW) 在迁移表里查不到，界面永远报非法迁移。
+        try:
+            self._do_connect_inner()
+        except Exception as exc:  # noqa: BLE001
+            if self.state == SessionState.CONNECTING:
+                self._set_error(
+                    SessionEvent.ERROR,
+                    SessionError.sdk_error(-1, f"连接阶段异常: {exc}", fatal=False),
+                )
+                self._release_lease()
+            raise
+
+    def _do_connect_inner(self) -> None:
         self._sdk_ctx.initialize()
         self._ensure_lease()
 
@@ -327,9 +361,14 @@ class SessionActor:
         if self.state == SessionState.DISCONNECTED:
             self._do_connect()
 
+        if self.state == SessionState.ERROR:
+            # ERROR 是任何一次登录/开流失败后的状态，原先这里直接抛
+            # 「ERROR 状态下无法启动预览」，界面按「开始」只会再抛一次同样
+            # 的错，没有恢复入口。先复位到 DISCONNECTED 再走正常连接流程。
+            self._logger.info("从 ERROR 状态复位后重新开始预览")
+            self._reset_to_disconnected()
+
         if not self._can_start_preview() and self.state != SessionState.CONNECTING:
-            if self.state == SessionState.ERROR:
-                raise RuntimeError(f"ERROR 状态下无法启动预览: {self.last_error}")
             raise RuntimeError(f"无法从 {self.state.value} 状态启动预览")
 
         self._transition(SessionEvent.START_PREVIEW)
@@ -672,6 +711,25 @@ class SessionActor:
         self._frame_buffer.update_bgr(bgr, message.width, message.height)
         self._touch_activity()
 
+    def _reset_to_disconnected(self) -> None:
+        """把会话带回 DISCONNECTED，无论当前处于什么状态。
+
+        只用于「用户主动重试」路径：ERROR 的迁移表里没有 CONNECT_REQUEST，
+        必须先 RESET；ERROR + STOP_REQUEST 也可达，但那条路径会多走一遍
+        资源释放。这里优先走 RESET，失败再退回 stop。
+        """
+
+        try:
+            self._transition(SessionEvent.RESET)
+            self._release_lease()
+            return
+        except Exception:
+            pass
+        try:
+            self._do_stop()
+        except Exception:
+            self._logger.exception("复位会话失败")
+
     def _do_reset(self) -> None:
         if self.state != SessionState.DISCONNECTED:
             self._do_stop()
@@ -722,30 +780,25 @@ class SessionActor:
         self._release_lease()
 
     def _do_snapshot(self, output_path: Path) -> Path:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        errors: list[str] = []
+        """把当前画面写成本地图片。
 
-        if self._play_port.value > -1:
-            # 优先使用 PlayCtrl 直接导出 JPEG/BMP
-            path_bytes = str(output_path).encode("utf-8")
-            path_buf = ctypes.create_string_buffer(path_bytes)
-            func_name = (
-                "PlayM4_GetJPEG"
-                if output_path.suffix.lower() in (".jpg", ".jpeg")
-                else "PlayM4_GetBMP"
-            )
-            func = getattr(self._sdk_ctx.playctrl, func_name, None)
-            if func is None:
-                errors.append(f"{func_name} 不可用")
-            else:
-                ok = bool(func(self._play_port, path_buf))
-                if ok:
-                    return output_path
-                errors.append(f"{func_name} 失败")
+        只走 ``FrameBuffer`` 的 BGR 路径。原先还优先调用
+        ``PlayM4_GetJPEG/GetBMP``，但有两个独立缺陷：
+
+        - 这两个导出函数的实际 ABI 是 4 个参数
+          ``(port, *buf, size, *out_size)``，而 sdk_context 里只声明了
+          ``(port, *buf)``——后两个寄存器取 libffi 残值，``*out_size``
+          那一步是对野指针的写（实测段错误，与现场「点截图后程序消失」
+          一致）；
+        - 这套 API 从不写文件，即使签名改对，拿到 ``True`` 也只会返回
+          一个磁盘上不存在的路径，UI 却报「截图成功」。
+
+        ``FrameBuffer`` 每帧都有最新 BGR 画面，路径本身是对的，直接用它。
+        """
 
         frame = self._frame_buffer.get()
         if frame is None:
-            raise RuntimeError("; ".join(errors) or "暂无画面")
+            raise RuntimeError("暂无画面，无法截图")
 
         cv2 = self._cv2
         if cv2 is None:
@@ -755,8 +808,9 @@ class SessionActor:
                 raise RuntimeError("截图需要安装 `opencv-python`") from e
             self._cv2 = cv2
 
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         ok = bool(cv2.imwrite(str(output_path), frame.bgr))
-        if not ok:
+        if not ok or not output_path.exists():
             raise RuntimeError(f"写入截图失败: {output_path}")
         return output_path
 

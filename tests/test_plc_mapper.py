@@ -171,6 +171,34 @@ def test_missing_task_keeps_previous_step():
     assert frame.step == ProcessStep.OILING
 
 
+def test_missing_task_falls_back_to_idle_after_timeout():
+    """长时间没有任务（重置状态/示例回绕）必须回落工步 1。
+
+    否则点一次「重置状态」后工步永久冻结在「涂油中」，警示灯整夜亮着。
+    """
+
+    mapper = _mapper()
+    mapper.update(_ev(brush=0.42), 0.0)
+    # 短时间保持：清理可能让活动周期短暂不可见
+    assert mapper.update(_ev(task_id=None), 0.1).step == ProcessStep.OILING
+    # 超过超时：回落 IDLE，并清掉同件的结论记忆
+    frame = mapper.update(_ev(task_id=None), 100.0)
+    assert frame.step == ProcessStep.IDLE
+    assert frame.vb0 == 0x01  # 工步 1
+    assert frame.vb1 == 0x00 and frame.vb2 == 0x00
+    assert "超时" in frame.reason
+
+
+def test_new_task_after_missing_resets_timeout():
+    mapper = _mapper()
+    mapper.update(_ev(brush=0.42), 0.0)
+    mapper.update(_ev(task_id=None), 0.1)
+    mapper.update(_ev(task_id="TASK-000002", brush=0.0), 0.2)
+    # 新件到来后再短暂消失，不应沿用上一次的 no_task_since
+    frame = mapper.update(_ev(task_id=None), 0.3)
+    assert frame.step in (ProcessStep.IDLE, ProcessStep.PICKED)
+
+
 def test_offline_clears_vb0_but_keeps_records():
     mapper = _mapper()
     mapper.update(_ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.1), 0.0)

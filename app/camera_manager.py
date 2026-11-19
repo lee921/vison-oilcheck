@@ -15,7 +15,7 @@ from typing import Any
 from hik.sdk_context import HikSdkContext
 from hik.session import HikSession
 
-from .config_service import ConfigService
+from .config_service import CamerasConfigError, ConfigService
 from .models import AppConfig, CameraConfig
 from .reconnect_policy import PolicyAction, ReconnectSupervisor
 
@@ -48,7 +48,13 @@ class CameraManager:
         self.reload_from_disk()
 
     def reload_from_disk(self) -> None:
-        cameras = self._cfg_service.load_cameras()
+        try:
+            cameras = self._cfg_service.load_cameras()
+        except CamerasConfigError as exc:
+            # 文件读不出来时保持现有相机列表：把它当成空列表会让界面上
+            # 所有相机消失，且设备页下一次保存就把 [] 写回磁盘。
+            self._logger.error("读取摄像头配置失败，沿用当前列表: %s", exc)
+            return
         self.set_cameras(cameras)
 
     def update_app_config(self, app_cfg: AppConfig) -> None:
