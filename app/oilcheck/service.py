@@ -1005,6 +1005,10 @@ def _pick_plc_task(
     第二个返回值是「排在当前任务之前、且已判终态」的那一条。漏涂的主要
     路径是被下一次取料顶掉（``_supersede_unfinished``），那一帧终态很容易
     被 200ms 的轮询跨过去；PLC 侧靠它把上一件的结论补报出来。
+
+    只在当前件**尚未终态**时才返回上一件：当前件自己已经判完时，它的结论
+    就是这一拍要报的那条，再补报上一件会让 mapper 在工步 4 与 1 之间来回
+    跳（先报上一件的 4、保持窗结束回 1、下一拍又报上一件的 4）。
     """
 
     active = next(
@@ -1016,7 +1020,7 @@ def _pick_plc_task(
     else:
         current = tasks[-1] if tasks else None
     superseded: TaskSnapshot | None = None
-    if current is not None:
+    if current is not None and current.final_result == TaskResult.PROCESSING:
         # 只在 current **之前**的条目里找。
         #
         # 原实现从最后一条往前扫、遇到 current 就 break，而 current 通常

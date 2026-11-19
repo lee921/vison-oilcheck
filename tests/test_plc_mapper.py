@@ -330,3 +330,82 @@ def test_superseded_already_held_is_not_reported_twice():
     for tick in (1.7, 2.0, 5.0):
         frame = mapper.update(evidence, tick)
         assert frame.step != ProcessStep.FINISHED
+
+
+# ----------------------------------------------------------------------
+# 当前件本身已终态时不能再补报「上一件」
+# ----------------------------------------------------------------------
+def test_finished_current_task_does_not_replay_previous_task():
+    """当前件已判终态、快照里还留着上一件时，不能每轮都补报上一件。
+
+    原实现里 ``_pick_plc_task`` 无条件扫描当前件之前的已终态条目：当前件
+    自己也是终态（两件都已完成、都在快照里）时，每一拍的证据都是
+    「当前=T2（终态），superseded=T1（终态）」，mapper 的补报分支就把
+    T1 重新报一遍，保持窗结束后又回到 T2，工步在 4 与 1 之间来回跳。
+    """
+
+    from app.oilcheck.pipeline import TaskSnapshot
+    from app.oilcheck.service import _pick_plc_task
+
+    def snap(tid: str, created: float, result: TaskResult) -> TaskSnapshot:
+        return TaskSnapshot(
+            task_id=tid,
+            created_at=created,
+            stage=TaskStage.OILED,
+            stage_since=created,
+            final_result=result,
+        )
+
+    tasks = (
+        snap("TASK-1", 1.0, TaskResult.COMPLETED),
+        snap("TASK-2", 2.0, TaskResult.COMPLETED),
+    )
+    current, superseded = _pick_plc_task(tasks)
+    assert current is not None and current.task_id == "TASK-2"
+    assert superseded is None, "当前件已是终态，没有「没报出去的上一件」"
+
+    mapper = _mapper(hold_s=1.0)
+    steps = []
+    now = 0.0
+    for _ in range(20):
+        now += 0.2
+        cur, sup = _pick_plc_task(tasks)
+        ev = PlcEvidence(
+            online=True,
+            task_id=cur.task_id,
+            stage=cur.stage,
+            final_result=cur.final_result,
+            superseded_task_id=sup.task_id if sup else None,
+            superseded_result=sup.final_result if sup else None,
+        )
+        steps.append(mapper.update(ev, now).step)
+
+    # 前 1 秒保持工步 4，之后回工步 1 并**一直**停在那里
+    assert steps[0] == ProcessStep.FINISHED
+    assert steps[-1] == ProcessStep.IDLE
+    assert steps.count(ProcessStep.FINISHED) <= 6, steps
+
+
+def test_superseded_reported_when_new_task_is_processing():
+    """新件仍在进行中时，上一件的终态才需要补报。"""
+
+    from app.oilcheck.pipeline import TaskSnapshot
+    from app.oilcheck.service import _pick_plc_task
+
+    def snap(tid, created, result):
+        return TaskSnapshot(
+            task_id=tid,
+            created_at=created,
+            stage=TaskStage.PICKED,
+            stage_since=created,
+            final_result=result,
+        )
+
+    current, superseded = _pick_plc_task(
+        (
+            snap("TASK-1", 1.0, TaskResult.NG),
+            snap("TASK-2", 2.0, TaskResult.PROCESSING),
+        )
+    )
+    assert current is not None and current.task_id == "TASK-2"
+    assert superseded is not None and superseded.task_id == "TASK-1"
