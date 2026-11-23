@@ -762,16 +762,21 @@ class MonitorPage(QWidget):
         self._plc_chip.setToolTip(startup_message)
         label = str(status.get("step_label") or "")
         number = int(status.get("step_number") or 0)
+        lamps = _lamp_chip_text(status.get("frame"))
         if status.get("dry_run"):
-            text = f"PLC只读：{label}" if label else "PLC只读"
+            text = f"PLC只读：{label} {lamps}" if label else f"PLC只读 {lamps}"
             if number:
-                text = f"PLC只读 · 工步{number} {label}"
+                text = f"PLC只读 · 工步{number} {label} {lamps}"
             self._set_chip(self._plc_chip, text, "#2563eb")
             return
         if not status.get("connected"):
             self._set_chip(self._plc_chip, "PLC：离线", "#b91c1c")
             return
-        text = f"PLC：在线 · 工步{number} {label}" if number else f"PLC：在线 · {label}"
+        text = (
+            f"PLC：在线 · 工步{number} {label} {lamps}"
+            if number
+            else f"PLC：在线 · {label} {lamps}"
+        )
         self._set_chip(self._plc_chip, text, "#15803d")
 
     def _update_events(self, station_id: str) -> None:
@@ -1191,6 +1196,25 @@ def _frame_position(info: dict) -> str:
     if total > 0:
         return f"第 {index + 1}/{total} 帧"
     return f"第 {index + 1} 帧"
+
+
+_LAMP_TEXT = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+
+
+def _lamp_chip_text(frame) -> str:
+    """PLC 帧里的灯色，如 ``灭 🟡 灭 灭``。无帧时返回空串。
+
+    只显示前 4 盏：现场的工步映射在灯2~灯4，灯5~灯8 目前恒灭，全列出来
+    会把芯片挤满。
+    """
+
+    if not isinstance(frame, dict):
+        return ""
+    lamps = frame.get("lamps") or ()
+    if not lamps:
+        return ""
+    shown = lamps[:4]
+    return " ".join(_LAMP_TEXT.get(str(color), "灭") for color in shown)
 
 
 def _label_colors(detector) -> dict[str, str]:

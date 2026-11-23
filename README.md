@@ -61,6 +61,8 @@ tests/                 取料/涂油判定、关联、跟踪、事件、配置�
 tools/detect_video.py  离线跑示例视频，输出带框视频与逐帧检测 JSONL
 tools/tracker_ab.py    离线对比跟踪参数/策略下的手与刷头轨迹质量
 tools/plc_check.py     PLC（警示灯）Modbus TCP 只读体检：连通性、寄存器、字节序、时延
+tools/plc_lamp_probe.py 灯色现场探针：逐位点亮 HR0/HR1，由人核对实际灯色
+tools/plc_simulate.py  模拟 3 次完整工序，打印/写入每一拍字节，验收灯色用
 lib/                   海康 SDK 运行库与 Python 封装
 ```
 

@@ -6,6 +6,7 @@ import pytest
 
 from app.oilcheck.plc_io import (
     PlcEvidence,
+    PlcFrame,
     PlcStepMapper,
     ProcessStep,
 )
@@ -30,25 +31,34 @@ def _ev(
 
 
 def _mapper(hold_s: float = 1.0) -> PlcStepMapper:
-    return PlcStepMapper(hold_s=hold_s, steps={"pick": 1, "oiling": 3})
+    return PlcStepMapper(hold_s=hold_s, steps={"pick": 2, "oiling": 4})
 
 
 # ----------------------------------------------------------------------
-# 4 个工步的字节
+# 各工步的字节。编码由现场逐位实测得出（docs/12 §3.4）：
+#   VB0(HR0 低字节) bitN = 灯 N+1 绿
+#   VB1(HR0 高字节) bitN = 灯 N+1 黄
+#   同一位 VB0+VB1 同时置 = 灯 N+1 红
+#   HR1 与灯完全无关，恒 0
+# 灯1 只能红，所以工步从灯2 起用（pick=2, oiling=4）。
 # ----------------------------------------------------------------------
 def test_idle_writes_step1_and_clears_records():
     frame = _mapper().update(_ev(task_id=None, stage=None, result=None), 0.0)
     assert frame.step == ProcessStep.IDLE
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x01, 0x00, 0x00)
-    assert frame.registers == (0x0001, 0x0000)
+    # 等待取料：灯2 黄（进行中），其余灭
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x00, 0x02, 0x00)
+    assert frame.registers == (0x0200, 0x0000)
+    assert frame.lamps[:4] == (None, "yellow", None, None)
 
 
 def test_picked_writes_step2_and_pick_bit():
     frame = _mapper().update(_ev(), 0.0)
     assert frame.step == ProcessStep.PICKED
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x02, 0x01, 0x00)
+    # 取料完成：灯2、灯3 绿，灯1 不碰
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x06, 0x00, 0x00)
     # HR0 = VB0 | VB1<<8：低字节是 VB0
-    assert frame.hr0 == 0x0102
+    assert frame.hr0 == 0x0006
+    assert frame.lamps[:4] == (None, "green", "green", None)
 
 
 def test_oiling_starts_when_brush_hold_positive():
@@ -56,28 +66,84 @@ def test_oiling_starts_when_brush_hold_positive():
     mapper.update(_ev(brush=0.0), 0.0)
     frame = mapper.update(_ev(brush=0.42), 0.1)
     assert frame.step == ProcessStep.OILING
-    # 涂油中：VB0 指第 3 步；VB1 已通过前两步 = 0b0011
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x04, 0x03, 0x00)
+    # 涂油中：灯2、灯3 绿，灯4 黄
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x06, 0x08, 0x00)
+    assert frame.lamps[:4] == (None, "green", "green", "yellow")
 
 
-def test_completed_writes_step4_and_oiling_good_bit():
+def test_completed_writes_step3_and_oiling_good_bit():
     mapper = _mapper()
     frame = mapper.update(
         _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1), 0.0
     )
     assert frame.step == ProcessStep.FINISHED
-    # 做完的件不再是任何一步：VB0=0；VB1 累计三步全过 = 0b0111
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x00, 0x07, 0x00)
+    # 良品：灯2、灯3、灯4 全绿
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x0E, 0x00, 0x00)
+    assert frame.lamps[:4] == (None, "green", "green", "green")
 
 
-def test_ng_writes_step4_and_oiling_bad_bit():
+def test_ng_shows_red_by_setting_green_and_yellow_together():
+    """漏涂：灯4 **同时**给绿和黄 → PLC 显示红。
+
+    红不在 HR1，这是现场逐位实测的结论（写 VB2 任何位灯都不动）。
+    """
+
     mapper = _mapper()
     frame = mapper.update(
         _ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.2), 0.0
     )
     assert frame.step == ProcessStep.FINISHED
-    # 漏涂：VB1 只留取料位，VB2 记涂油位为不良
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x00, 0x03, 0b0100)
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x0E, 0x08, 0x00)
+    assert frame.registers == (0x080E, 0x0000)
+    assert frame.lamps[:4] == (None, "green", "green", "red")
+
+
+def test_hr1_is_always_zero():
+    """HR1（VB2/VB3）与灯无关：实测写任何位灯都不动，所以恒写 0。"""
+
+    mapper = _mapper()
+    frames = [
+        mapper.update(_ev(), 0.0),
+        mapper.update(_ev(brush=0.5), 0.1),
+        mapper.update(
+            _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1),
+            0.2,
+        ),
+        mapper.update(_ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.1), 0.3),
+    ]
+    for frame in frames:
+        assert frame.vb2 == 0
+        assert frame.vb3 == 0
+        assert frame.hr1 == 0
+
+
+def test_red_wins_when_one_lamp_gets_multiple_signals():
+    """同一位同时置 VB0 和 VB1 显示红；只置其一是绿或黄。"""
+
+    frame = PlcFrame(vb0=0b001, vb1=0b001, vb2=0, step=ProcessStep.IDLE)
+    assert frame.lamps[0] == "red"
+    frame = PlcFrame(vb0=0b010, vb1=0, vb2=0, step=ProcessStep.IDLE)
+    assert frame.lamps[1] == "green"
+    frame = PlcFrame(vb0=0, vb1=0b100, vb2=0, step=ProcessStep.IDLE)
+    assert frame.lamps[2] == "yellow"
+    # HR1 里的位不产生任何颜色
+    frame = PlcFrame(vb0=0, vb1=0, vb2=0xFF, step=ProcessStep.IDLE)
+    assert all(color is None for color in frame.lamps)
+
+
+def test_prime_idle_returns_idle_frame():
+    """启动压残留值用的帧：灯2 黄，其余全灭，并重置内部状态。"""
+
+    mapper = _mapper(hold_s=1.0)
+    # 先跑出一个 NG 保持窗内的状态，prime_idle 必须把它一起清掉
+    mapper.update(
+        _ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.2), 0.0
+    )
+    frame = mapper.prime_idle()
+    assert frame.step == ProcessStep.IDLE
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x00, 0x02, 0x00)
+    assert frame.registers == (0x0200, 0x0000)
+    assert frame.task_id is None
 
 
 def test_vb3_is_always_zero():
@@ -107,7 +173,9 @@ def test_hold_window_keeps_step4_then_returns_to_idle():
     assert mapper.update(done, 0.99).step == ProcessStep.FINISHED
     frame = mapper.update(done, 1.0)
     assert frame.step == ProcessStep.IDLE
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x01, 0x00, 0x00)
+    # 回工步 1：绿/红清零，只有灯1 黄（等取料）
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x00, 0x02, 0x00)
+    assert frame.lamps[:4] == (None, "yellow", None, None)
 
 
 def test_hold_expired_task_does_not_retrigger_step4():
@@ -139,14 +207,14 @@ def test_hold_window_is_absolute_even_if_next_task_arrives():
     )
     inside = mapper.update(_ev(task_id="T2", brush=0.0), 0.2)
     assert inside.step == ProcessStep.FINISHED
-    assert inside.vb1 == 0x07  # 上一件的涂油良品位还在
+    assert inside.vb0 == 0x0E  # 上一件的三盏绿还在
     # 保持窗结束后先清位（新件清零），再按证据进入工步 2
     cleared = mapper.update(_ev(task_id="T2", brush=0.0), 1.0)
     assert cleared.step == ProcessStep.IDLE
-    assert cleared.vb1 == 0x00
+    assert cleared.vb0 == 0x00
     picked = mapper.update(_ev(task_id="T2", brush=0.0), 1.2)
     assert picked.step == ProcessStep.PICKED
-    assert picked.vb1 == 0x01
+    assert picked.vb0 == 0x06
 
 
 # ----------------------------------------------------------------------
@@ -184,8 +252,8 @@ def test_missing_task_falls_back_to_idle_after_timeout():
     # 超过超时：回落 IDLE，并清掉同件的结论记忆
     frame = mapper.update(_ev(task_id=None), 100.0)
     assert frame.step == ProcessStep.IDLE
-    assert frame.vb0 == 0x01  # 工步 1
-    assert frame.vb1 == 0x00 and frame.vb2 == 0x00
+    assert frame.vb1 == 0x02  # 灯2 黄：等取料
+    assert frame.vb0 == 0x00 and frame.vb2 == 0x00
     assert "超时" in frame.reason
 
 
@@ -199,14 +267,30 @@ def test_new_task_after_missing_resets_timeout():
     assert frame.step in (ProcessStep.IDLE, ProcessStep.PICKED)
 
 
-def test_offline_clears_vb0_but_keeps_records():
+def test_offline_keeps_red_but_clears_pure_yellow():
+    """掉线只灭「纯黄」（进行中），红灯（绿+黄）必须保留。
+
+    红灯是绿+黄同时亮，所以不能把黄位一刀切清零——那会把 NG 显示成良品。
+    """
+
     mapper = _mapper()
     mapper.update(_ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.1), 0.0)
     frame = mapper.update(PlcEvidence.offline(), 0.1)
     assert frame.step == ProcessStep.OFFLINE
-    assert frame.vb0 == 0x00
-    # 已写出的良品/不良记录是这一件的历史，掉线不该抹掉
-    assert (frame.vb1, frame.vb2) == (0x03, 0b0100)
+    # NG 是 绿=0x0E 黄=0x08，掉线后原样保留（灯4 仍红）
+    assert (frame.vb0, frame.vb1) == (0x0E, 0x08)
+    assert frame.lamps[:4] == (None, "green", "green", "red")
+    assert frame.hr1 == 0
+
+
+def test_offline_clears_yellow_while_oiling():
+    """涂油中掉线：进行中的黄灯灭，已通过的两盏绿保留。"""
+
+    mapper = _mapper()
+    mapper.update(_ev(brush=0.5), 0.0)  # 涂油中：绿=0x06 黄=0x08
+    frame = mapper.update(PlcEvidence.offline(), 0.1)
+    assert (frame.vb0, frame.vb1) == (0x06, 0x00)
+    assert frame.lamps[:4] == (None, "green", "green", None)
 
 
 def test_repeated_evidence_is_idempotent():
@@ -230,31 +314,42 @@ def test_waiting_pick_stage_maps_to_step1():
 # 工步编号可配
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize(
-    ("pick", "oiling", "expect_vb1", "expect_vb2"),
+    ("pick", "oiling", "expect_green"),
     [
-        # 完成：VB1 从第 1 位连续到涂油位
-        (1, 3, 0b00000111, 0),
-        (1, 4, 0b00001111, 0),
-        (2, 5, 0b00011111, 0),
+        # 灯1 只能红，pick 必须 ≥ 2；绿从第 pick 位累计到第 oiling 位
+        (2, 4, 0b00001110),
+        (3, 5, 0b00011100),
+        (5, 7, 0b01110000),
     ],
 )
 def test_step_numbers_are_configurable(
-    pick: int, oiling: int, expect_vb1: int, expect_vb2: int
+    pick: int, oiling: int, expect_green: int
 ):
     mapper = PlcStepMapper(hold_s=1.0, steps={"pick": pick, "oiling": oiling})
     frame = mapper.update(
         _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1), 0.0
     )
-    assert (frame.vb1, frame.vb2) == (expect_vb1, expect_vb2)
+    assert frame.vb0 == expect_green
+    assert frame.vb1 == 0
+    assert frame.vb2 == 0
 
 
-def test_out_of_range_step_numbers_fall_back_to_defaults():
-    mapper = PlcStepMapper(hold_s=1.0, steps={"pick": 99, "oiling": 0})
-    frame = mapper.update(
-        _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1), 0.0
-    )
-    # 兜底：pick=1、oiling=3 ⇒ VB1 累计 0b0111
-    assert frame.vb1 == 0b0111
+def test_invalid_step_numbers_fall_back_to_default():
+    """灯1 不能用（只能红）、oiling 必须 = pick+2 且不超过灯数。"""
+
+    for steps in (
+        {"pick": 1, "oiling": 3},  # 用了灯1
+        {"pick": 1, "oiling": 4},  # 用了灯1，且顺序不对
+        {"pick": 3, "oiling": 4},  # oiling != pick+2
+        {"pick": 8, "oiling": 10},  # 超出灯数
+        {"pick": 5, "oiling": 2},  # 倒序
+    ):
+        mapper = PlcStepMapper(hold_s=1.0, steps=steps)
+        frame = mapper.update(
+            _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1), 0.0
+        )
+        # 兜底 pick=2/oiling=4 ⇒ 灯2、灯3、灯4 绿
+        assert frame.vb0 == 0b00001110, steps
 
 
 # ----------------------------------------------------------------------
@@ -284,7 +379,8 @@ def test_superseded_ng_is_reported_before_next_task():
     )
     assert frame.step == ProcessStep.FINISHED
     assert frame.task_id == "T1"
-    assert (frame.vb0, frame.vb1, frame.vb2) == (0x00, 0x03, 0b0100)
+    assert (frame.vb0, frame.vb1, frame.vb2) == (0x0E, 0x08, 0x00)
+    assert frame.lamps[:4] == (None, "green", "green", "red")
 
 
 def test_hold_window_applies_to_superseded_ng():
@@ -302,10 +398,10 @@ def test_hold_window_applies_to_superseded_ng():
     )
     assert mapper.update(ng_evidence, 0.2).step == ProcessStep.FINISHED
     assert mapper.update(ng_evidence, 0.9).step == ProcessStep.FINISHED
-    # 保持窗结束：清位回工步 1
+    # 保持窗结束：清位回工步 1（只剩灯1 黄）
     cleared = mapper.update(ng_evidence, 1.3)
     assert cleared.step == ProcessStep.IDLE
-    assert (cleared.vb1, cleared.vb2) == (0x00, 0x00)
+    assert (cleared.vb0, cleared.vb1, cleared.vb2) == (0x00, 0x02, 0x00)
     # 下一拍才按证据进入新件的工步
     picked = mapper.update(ng_evidence, 1.5)
     assert picked.step == ProcessStep.PICKED

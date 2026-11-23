@@ -32,20 +32,39 @@ from app.oilcheck.plc_link import (  # noqa: E402
     PlcLink,
 )
 
-# 协议表里定义的 4 个字节（VB0~VB3）。VB3 在本项目恒 0（PLC 只显示，不输入）。
+# 协议表里定义的 4 个字节（VB0~VB3）。本方案给每盏三色灯驱动一种颜色，
+# 位 = 灯号（bit(n-1) → 第 n 盏灯）。VB3 恒 0（PLC 只显示，不输入）。
 VB_NAMES = {
-    0: "运行中标记",
-    1: "良品数据记录",
-    2: "不良数据记录",
-    3: "手动良品判断（本项目恒 0，不读）",
+    0: "绿（本灯亮的绿信号）",
+    1: "黄（本灯亮的黄信号；与绿同位置 → 红）",
+    2: "与灯无关（实测写任何位灯都不动，本项目恒 0）",
+    3: "与灯无关（本项目恒 0）",
 }
 
-# 4 工步方案下，VB0 各位的含义（bit(n-1) = 第 n 步）。
-VB0_STEP_HINT = {
-    0: "等待取料（正在检测第1步）",
-    1: "取料完成（正在检测第2步）",
-    2: "涂油中（正在检测第3步）",
-}
+
+def _lamp_view(vbs: dict[int, int]) -> list[str]:
+    """把 VB0/VB1 按现场实测的编码解成 8 盏灯的颜色。
+
+    实测（docs/12 §3.4）：VB0.bitN → 灯 N+1 绿；VB1.bitN → 灯 N+1 黄；
+    同一位两者都为 1 → 灯 N+1 红；VB2/VB3 与灯无关。
+    """
+
+    out: list[str] = []
+    for index in range(8):
+        bit = 1 << index
+        green = bool(vbs.get(0, 0) & bit)
+        yellow = bool(vbs.get(1, 0) & bit)
+        if green and yellow:
+            color = "红"
+        elif yellow:
+            color = "黄"
+        elif green:
+            color = "绿"
+        else:
+            color = "灭"
+        if color != "灭":
+            out.append(f"灯{index + 1}={color}")
+    return out or ["全灭"]
 
 
 def _byte_view(words: list[int], order: str) -> dict[int, int]:
@@ -78,50 +97,45 @@ def _describe(words: list[int], order: str) -> list[str]:
         value = vbs.get(vb, 0)
         name = VB_NAMES.get(vb, "")
         steps = [str(step + 1) for step in range(8) if (value >> step) & 1]
-        hint = ""
-        if vb == 0 and value:
-            known = [
-                VB0_STEP_HINT[bit] for bit in range(4) if (value >> bit) & 1
-                and bit in VB0_STEP_HINT
-            ]
-            if known:
-                hint = f"  → {', '.join(known)}"
         lines.append(
             f"    VB{vb} = 0x{value:02X} [{_bits(value)}] {name}"
-            f"   置位的工步: {', '.join(steps) if steps else '无'}{hint}"
+            f"   置位的灯: {', '.join(steps) if steps else '无'}"
         )
+    lines.append(f"    → 解读：{', '.join(_lamp_view(vbs))}")
     return lines
 
 
 def _print_expected_frames() -> None:
-    """打印 4 工步方案下每一拍应该写出的字节，供与 PLC 在线监控逐位对照。"""
+    """打印每一拍应该写出的字节与灯色，供与 PLC 在线监视逐位对照。"""
 
-    print("\n== 4 工步方案的期望值（本项目写入的字节）==")
-    print("    状态             VB0    VB1    VB2   HR0    HR1   说明")
+    print("\n== 期望值（本项目写入的字节与灯色）==")
+    print("    状态             VB0  VB1   HR0     HR1    点亮的灯      说明")
     rows = [
-        ("等待取料", 0x01, 0x00, 0x00, "等下一件，记录已清零"),
-        ("取料完成", 0x02, 0x01, 0x00, "VB1 第1步通过"),
-        ("涂油中", 0x04, 0x03, 0x00, "前两步通过，第3步正在做"),
-        ("涂油完成(良)", 0x00, 0x07, 0x00, "VB0=0 表示已出结论，三步全过"),
-        ("涂油异常(NG)", 0x00, 0x03, 0x04, "VB1 停在前两步，VB2 记第3步失败"),
-        ("未检测", 0x00, "保持", "保持", "相机离线/判定停摆"),
+        ("等待取料", 0x00, 0x02, "灯2 黄：取料进行中"),
+        ("取料完成", 0x06, 0x00, "灯2、灯3 绿"),
+        ("涂油中", 0x06, 0x08, "灯2、灯3 绿 + 灯4 黄"),
+        ("涂油完成(良)", 0x0E, 0x00, "灯2、灯3、灯4 全绿"),
+        ("涂油异常(NG)", 0x0E, 0x08, "灯4 同时绿+黄 → 红"),
+        ("未检测", 0x00, "保持", "只灭纯黄，绿灯保留"),
     ]
-    for label, vb0, vb1, vb2, note in rows:
+    for label, vb0, vb1, note in rows:
         if isinstance(vb1, int):
             hr0 = (vb0 & 0xFF) | (vb1 << 8)
-            hr1 = vb2
+            lamps = " ".join(_lamp_view({0: vb0, 1: vb1}))
             print(
-                f"    {label:<14} 0x{vb0:02X}   0x{vb1:02X}   0x{vb2:02X}"
-                f"   0x{hr0:04X}  0x{hr1:04X}  {note}"
+                f"    {label:<14} 0x{vb0:02X} 0x{vb1:02X}  0x{hr0:04X}  0x0000"
+                f"  {lamps:<14} {note}"
             )
         else:
-            print(f"    {label:<14} 0x{vb0:02X}   保持   保持   -      -      {note}")
+            print(f"    {label:<14} 0x{vb0:02X} 保持    -       -      "
+                  f"{'':<14} {note}")
     print(
-        "    工步位 bit(n-1) = 第 n 步：0b0001=第1步 0b0010=第2步 0b0100=第3步"
+        "    位 = 灯号（bit(n-1) → 第 n 盏灯）："
+        "VB0.bitN = 灯 N+1 绿，VB1.bitN = 灯 N+1 黄"
     )
     print(
-        "    VB0=正在检测的步；VB1=已通过的步（累计）；VB2=失败的步。"
-        "结论出来后 VB0=0。"
+        "    同一位 VB0 与 VB1 同时为 1 → 灯 N+1 红（红不在 HR1！）。"
+        "灯1 只能红，工步从灯2 起用。"
     )
 
 
@@ -197,11 +211,11 @@ def check(
             for line in _describe(words, "msb"):
                 print(line)
         if words[1] & 0xFF == 0xFF:
-            print("  ⚠ HR1 低字节为 0xFF（= VB2 八个工步全不良）这类残留值，")
+            print("  ⚠ HR1 低字节为 0xFF（= VB2 八位全 1，三盏灯全红）这类残留值，")
             print("    说明这段数据区当前没有 PLC 侧生产者（上位机还没接管），")
             print("    请先看现场警示灯的实际状态。")
-        print("  ⚠ 仍需一次现场确认：请 PLC 只置「第一步运行中」，")
-        print("    期望 HR0 == 0x0001；若读到 0x0100 则字节序要改成 msb。")
+        print("  ⚠ 仍需一次现场确认字节序：上位机空闲时写 VB1=0x01（灯1 黄），")
+        print("    期望 HR0 == 0x0100；若读到 0x0001 则字节序要改成 msb。")
 
         print("\n== 5. 全量寄存器（VB0~VB19）==")
         try:

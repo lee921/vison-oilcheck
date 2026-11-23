@@ -1,39 +1,46 @@
-"""PLC 警示灯：4 工步状态映射与后台写入线程。
+"""PLC 警示灯：灯色状态映射与后台写入线程。
 
-协议与现场实测见 ``docs/12-PLC警示灯通信与控制.md``。
+协议表与现场逐位实测见 ``docs/12-PLC警示灯通信与控制.md`` §3.1。
 
-字节布局（首地址从 0 开始）::
+**灯色编码（实测得出，与协议表的文字描述不同）**::
 
-    HR0 = VB0 | (VB1 << 8)      VB0 运行中标记 / VB1 良品记录
-    HR1 = VB2 | (VB3 << 8)      VB2 不良记录   / VB3 恒 0（本方案不读）
+    HR0 = VB0 | (VB1 << 8)
+    HR1 = VB2 | (VB3 << 8)      恒写 0——与灯完全无关
+
+    VB0（HR0 低字节）bitN = 1  →  灯 N+1 亮绿
+    VB1（HR0 高字节）bitN = 1  →  灯 N+1 亮黄
+    同一位 VB0 与 VB1 同时为 1  →  灯 N+1 亮红（红不在 HR1）
+    HR1 任何位                 →  灯完全不动
+
+实测依据：``HR0=0x0101``→灯1 红、``0x0202``…``0x8080``→灯2…灯8 红、
+``0x00FF``→灯2~灯8 绿、``0xFF00``→灯2~灯8 黄、``0xFFFF``→全红。
+
+**灯1 只能红**：``VB0.bit0`` 无反应、``VB1.bit0`` 直接亮红。所以工步从第 2
+盏灯起用（默认 ``pick=2, oiling=4``），见 :class:`_StepBits`。
 
 本系统只有两个判定点（取料、人工二次涂油），现场流程是 4 个工步::
 
     等待取料 → 取料完成 → 涂油中 → 涂油完成/异常
 
-工步位（bit(n-1) = 第 n 步）::
+各状态的灯色与字节（默认 ``pick=2, oiling=4``）::
 
-    状态             VB0        VB1        VB2
-    等待取料       0b0001     0b0000        0
-    取料完成       0b0010     0b0001        0
-    涂油中         0b0100     0b0011        0
-    涂油完成(良)   0b0000     0b0111        0
-    涂油异常(NG)   0b0000     0b0011     0b0100
-    未检测         0x00       保持       保持
+    状态            灯1 灯2 灯3 灯4    VB0(绿)  VB1(黄)  HR0
+    等待取料        灭   黄   灭   灭      0x00     0x02   0x0200
+    取料完成        灭   绿   绿   灭      0x06     0x00   0x0006
+    涂油中          灭   绿   绿   黄      0x06     0x08   0x0806
+    涂油完成(良)    灭   绿   绿   绿      0x0E     0x00   0x000E
+    涂油异常(NG)    灭   绿   绿   红      0x0E     0x08   0x080E
+    未检测          保持（只清纯黄，保留红灯）
 
 三条语义约定：
 
-- ``VB0`` 是「**正在检测**的工步」位。判定结束后不再是任何一步，所以
-  涂油完成/异常时 ``VB0 = 0``——这是「这一件做完了」，不是「上位机掉线」
-  （掉线也写 0，靠 VB1/VB2 是否已有结论区分）。
-- ``VB1`` 是「**已经通过**的工步」累计位：第 1 步通过就 0b0001，前两步
-  通过就 0b0011，三步全过就 0b0111。取料完成即置第 1 位。
-- ``VB2`` 记「**失败**的那一步」位：只有漏涂时置第 3 位（``0b0100``），
-  此时 VB1 停在 ``0b0011``（前两步已过）。
+- **绿是累计位**：第 ``pick``..k 盏灯全绿表示这几步已通过。良品时灯 2/3/4
+  全绿；不能只看「绿亮不亮」。
+- **黄只亮一盏**：只有「正在进行的那盏灯」是黄色（等待取料时是灯2）。
+- **红只亮一盏**：漏涂时那盏灯**同时**给绿和黄，PLC 显示红；所以红灯的绿位
+  也是 1。
 
-**PLC 只负责显示信号，不做任何处理**，所以运行期只写不读：VB3 恒写 0，
-不做读-改-写，也没有人工改判回写。若将来 PLC 侧启用 VB3 输入，必须先改成
-读-改-写（VB3 与 VB2 共用 HR1）。
+**PLC 只负责显示信号，不做任何处理**，所以运行期只写不读，也不做读-改-写。
 """
 
 from __future__ import annotations
@@ -46,7 +53,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .config import PlcConfig
+from .config import PLC_LAMP_COUNT, PlcConfig
 from .plc_link import ModbusError, ModbusLinkError, PlcLink
 from .types import TaskResult, TaskStage
 
@@ -89,21 +96,20 @@ _STEP_ORDER: dict[ProcessStep, int] = {
     ProcessStep.FINISHED: 3,
 }
 
-# VB0 的运行中标记：**正在检测**哪一步（bit(n-1)）。判定结束的件不再是每一步，
-# 所以涂油完成/异常时 VB0 写 0——PLC 看到 0 表示「本件已出结论或未检测」，
-# 靠 VB1/VB2 里是否已有第 3 步的结论区分。
-_VB0_BY_STEP: dict[ProcessStep, int] = {
-    ProcessStep.IDLE: 0b0001,
-    ProcessStep.PICKED: 0b0010,
-    ProcessStep.OILING: 0b0100,
-    ProcessStep.FINISHED: 0x00,
-    ProcessStep.OFFLINE: 0x00,
-}
+# 灯色编码（现场逐位实测，见 docs/12 §3.1.1）：
+#   VB0(HR0 低字节) bitN = 1 → 灯 N+1 绿
+#   VB1(HR0 高字节) bitN = 1 → 灯 N+1 黄
+#   同一位置 VB0 与 VB1 同时为 1 → 灯 N+1 红
+#   HR1(VB2/VB3) 与灯完全无关
+_LAMP_LABELS: dict[str, str] = {"red": "🔴", "yellow": "🟡", "green": "🟢"}  # noqa: RUF001
 
 
 @dataclass(frozen=True)
 class PlcFrame:
-    """要写到 PLC 的 4 个字节 + 可读的过程信息（日志/UI/审计用）。"""
+    """写到 PLC 的两个寄存器 + 可读的过程信息（日志/UI/审计用）。
+
+    只有 ``HR0`` 驱动灯；``HR1``（VB2/VB3）恒写 0。
+    """
 
     vb0: int
     vb1: int
@@ -138,9 +144,40 @@ class PlcFrame:
     def step_label(self) -> str:
         return STEP_LABELS.get(self.step, self.step.value)
 
+    @property
+    def lamps(self) -> tuple[str | None, ...]:
+        """每盏灯的颜色，位置 = 灯号（bit0 → 灯1）。
+
+        「同一位置绿+黄」按现场实测显示为红，所以红不需要单独的字节。
+        """
+
+        colors: list[str | None] = []
+        for index in range(LAMP_COUNT):
+            bit = 1 << index
+            green = bool(self.vb0 & bit)
+            yellow = bool(self.vb1 & bit)
+            if green and yellow:
+                colors.append("red")
+            elif yellow:
+                colors.append("yellow")
+            elif green:
+                colors.append("green")
+            else:
+                colors.append(None)
+        return tuple(colors)
+
+    @property
+    def lamp_text(self) -> str:
+        """灯色的一行文字表示（日志/离线工具用），例如 ``灭 🟢 🟢 🟡``。"""
+
+        return " ".join(
+            _LAMP_LABELS.get(color, "灭") if color else "灭" for color in self.lamps
+        )
+
     def describe(self) -> str:
         return (
             f"VB0=0x{self.vb0:02X} VB1=0x{self.vb1:02X} VB2=0x{self.vb2:02X}"
+            f" 灯[{self.lamp_text}]"
             f" 工步{self.step_number} {self.step_label}"
             f"（HR0=0x{self.hr0:04X} HR1=0x{self.hr1:04X}）"
         )
@@ -151,6 +188,7 @@ class PlcFrame:
             "vb1": self.vb1,
             "vb2": self.vb2,
             "vb3": self.vb3,
+            "lamps": list(self.lamps),
             "step": self.step.value,
             "step_number": self.step_number,
             "step_label": self.step_label,
@@ -180,16 +218,30 @@ class PlcEvidence:
         return cls(online=False)
 
 
+#: 现场灯的数量。位 = 灯号（bit(n-1) → 第 n 盏），所以工步号不能超过它。
+LAMP_COUNT = PLC_LAMP_COUNT
+
+
 @dataclass(frozen=True)
 class _StepBits:
-    """工步号配置：取料记在哪一步、涂油结论记在哪一步。
+    """工步号配置：取料记在第几步、涂油结论记在第几步。
 
-    默认 1/3：现场流程是「等待取料 → 取料完成 → 涂油中 → 涂油完成/异常」，
-    取料占第 1 步、涂油占第 3 步（第 2 步是「取料已完成、等待涂油」的过程位）。
+    默认 2/4：现场流程是「等待取料 → 取料完成 → 涂油中 → 涂油完成/异常」，
+    取料占第 2 盏灯、涂油占第 4 盏（第 3 盏是「取料已完成、等待涂油」的过程位）。
+
+    为什么从第 2 盏起：**灯1 只能红**（实测 VB0.bit0 无反应、VB1.bit0 直接
+    亮红），用它表示「等待取料」会显示成红灯，正是现场最初反馈的问题。
+
+    约束（位 = 灯号，共 :data:`LAMP_COUNT` 盏灯）：
+
+    - ``pick >= 2``：不用灯1；
+    - ``oiling == pick + 2``：取料完成亮到第 ``pick+1`` 盏绿，涂油中亮到
+      第 ``oiling-1`` 盏绿 + 第 ``oiling`` 盏黄，两者相等才单调；
+    - ``oiling <= LAMP_COUNT``：红灯要有对应的灯可亮。
     """
 
-    pick: int = 1
-    oiling: int = 3
+    pick: int = 2
+    oiling: int = 4
 
     @classmethod
     def from_steps(cls, steps: dict[str, int]) -> _StepBits:
@@ -200,10 +252,20 @@ class _StepBits:
                 return default
             return value if 1 <= value <= 8 else default
 
-        return cls(
-            pick=_clamp(steps.get("pick"), 1),
-            oiling=_clamp(steps.get("oiling"), 3),
-        )
+        pick = _clamp(steps.get("pick"), 2)
+        oiling = _clamp(steps.get("oiling"), 4)
+        if pick < 2 or oiling != pick + 2 or oiling > LAMP_COUNT:
+            logger.warning(
+                "PLC 工步配置非法（pick=%d oiling=%d）：%d 盏灯要求 "
+                "pick>=2（灯1 只能红）、oiling=pick+2、oiling<=%d，"
+                "已回退默认 2/4",
+                pick,
+                oiling,
+                LAMP_COUNT,
+                LAMP_COUNT,
+            )
+            return cls()
+        return cls(pick=pick, oiling=oiling)
 
 
 def _bit(step: int) -> int:
@@ -212,15 +274,17 @@ def _bit(step: int) -> int:
     return 1 << (step - 1)
 
 
-def _cumulative_mask(last_step: int) -> int:
-    """第 1 步到第 ``last_step`` 步全通过时的累计掩码（VB1 用）。
+def _cumulative_mask(first_step: int, last_step: int) -> int:
+    """第 ``first_step`` 到 ``last_step`` 步全通过时的累计掩码。
 
-    现场语义是「已经通过的工步全部置 1」：前两步通过 = 0b0011，三步全过 =
-    0b0111。所以掩码是低位连续的若干位，而不是只置最后一步。
+    现场语义是「已经通过的工步全部置 1」，所以掩码是连续的一段位。注意
+    **起点不是 1**：灯1 只能红（见 :class:`_StepBits`），工步从第 2 盏灯
+    起用，累计也必须从第 2 位起，否则灯1 会被点亮成绿。
     """
 
-    last = max(1, min(8, int(last_step)))
-    return (1 << last) - 1
+    first = max(1, min(8, int(first_step)))
+    last = max(first, min(8, int(last_step)))
+    return ((1 << last) - 1) & ~((1 << (first - 1)) - 1)
 
 
 @dataclass
@@ -297,19 +361,41 @@ class PlcStepMapper:
     def reset(self) -> None:
         self._state = _MapperState()
 
+    def prime_idle(self) -> PlcFrame:
+        """启动时用：把状态置为「等待取料」并返回该帧。
+
+        仅用于压掉 PLC 上电残留值（实测 ``HR1=0x00FF`` → 三盏全红）。它会
+        清空映射内部状态（相当于 :meth:`reset`），所以只能在线程刚起来、
+        还没处理过任何证据时调用。
+        """
+
+        self._state = _MapperState()
+        frame = self._make_frame(ProcessStep.IDLE, None, "启动时先写等待取料")
+        self._state.last_frame = frame
+        return frame
+
     def update(self, ev: PlcEvidence, now: float) -> PlcFrame:
         """算出一帧。``now`` 是**墙钟**时间（不能用媒体时间）。"""
 
         st = self._state
 
         if not ev.online:
-            # 未检测：只清 VB0，记录字节原样保留——PC 掉线不该把已经写出的
-            # 良品/不良记录抹掉，那是这一件的历史。
+            # 未检测：只灭「纯黄」（正在进行的那一步），保留绿灯与红灯。
+            #
+            # 红灯 = 绿+黄 同时亮，所以**不能把黄位一刀切清掉**——那会把红灯
+            # 变成绿灯，把已经判出的 NG 显示成良品。这里只清那些「有黄没绿」
+            # 的位（纯黄 = 进行中），红位（绿+黄）整位保留。
             prev = st.last_frame
+            if prev is None:
+                vb0 = vb1 = 0
+            else:
+                vb0 = prev.vb0
+                # 纯黄 = 有黄没绿；红 = 绿+黄，保留它的黄位
+                vb1 = prev.vb1 & prev.vb0
             frame = PlcFrame(
-                vb0=0x00,
-                vb1=prev.vb1 if prev else 0,
-                vb2=prev.vb2 if prev else 0,
+                vb0=vb0,
+                vb1=vb1,
+                vb2=0x00,  # HR1 与灯无关，恒 0
                 step=ProcessStep.OFFLINE,
                 task_id=ev.task_id or (prev.task_id if prev else None),
                 reason="相机离线或未检测",
@@ -415,50 +501,51 @@ class PlcStepMapper:
         return frame
 
     # -- 内部 ---------------------------------------------------------
-    def _state_step(self, step: ProcessStep) -> int:
-        """这个状态对应「正在检测第几步」（1 起）。0 = 不在检测任何步。"""
-
-        if step == ProcessStep.IDLE:
-            return self._bits.pick
-        if step == ProcessStep.PICKED:
-            # 取料已过、等涂油：这一步夹在取料与涂油之间。
-            return self._bits.pick + 1
-        if step == ProcessStep.OILING:
-            return self._bits.oiling
-        return 0  # FINISHED / OFFLINE：本件已出结论，不在检测任何步
-
-    def _passed_mask(self, through: int) -> int:
-        """第 1 步到第 ``through`` 步已通过的累计掩码。"""
-
-        if through < 1:
-            return 0x00
-        return _cumulative_mask(through)
-
     def _make_frame(
         self, step: ProcessStep, task_id: str | None, reason: str
     ) -> PlcFrame:
-        current = self._state_step(step)
-        vb0 = 0x00 if current <= 0 else _bit(current)
-        if step in (ProcessStep.IDLE, ProcessStep.OFFLINE):
-            vb1 = 0x00
-            vb2 = 0x00
+        """按现场实测出来的编码算 ``HR0`` 的两个字节。
+
+        编码（8 盏灯，位 = 灯号，灯1 只能红所以从 bit1 起用）::
+
+            VB0（HR0 低字节）bitN = 1 → 灯 N+1 绿
+            VB1（HR0 高字节）bitN = 1 → 灯 N+1 黄
+            同一位置 VB0 和 VB1 都为 1 → 灯 N+1 红
+            HR1（VB2/VB3）与灯完全无关，恒写 0
+
+        所以「红」= 该位置**同时**置绿和黄。各状态的取法（``pick=2``、
+        ``oiling=4`` 为例，灯1 不参与）::
+
+            等待取料   灯2 黄
+            取料完成   灯2、灯3 绿
+            涂油中     灯2、灯3 绿 + 灯4 黄
+            良品       灯2、灯3、灯4 绿
+            漏涂 NG    灯2、灯3 绿 + 灯4 同时绿黄（红）
+        """
+
+        pick, oiling = self._bits.pick, self._bits.oiling
+        green = yellow = 0x00
+
+        if step == ProcessStep.IDLE:
+            yellow = _bit(pick)
+        elif step == ProcessStep.PICKED:
+            green = _cumulative_mask(pick, pick + 1)
+        elif step == ProcessStep.OILING:
+            green = _cumulative_mask(pick, oiling - 1)
+            yellow = _bit(oiling)
         elif step == ProcessStep.FINISHED:
             if self._state.finished_result == TaskResult.NG:
-                # 漏涂：前序工步已通过，失败的是涂油那一步。
-                vb1 = self._passed_mask(self._bits.oiling - 1)
-                vb2 = _bit(self._bits.oiling)
+                # 漏涂：前序全绿，失败那盏同时给绿+黄 → PLC 显示红
+                green = _cumulative_mask(pick, oiling)
+                yellow = _bit(oiling)
             else:
-                # 良品：从第 1 步累计到涂油步全通过。
-                vb1 = self._passed_mask(self._bits.oiling)
-                vb2 = 0x00
-        else:
-            # 取料完成 / 涂油中：只把「已经通过」的工步写进 VB1。
-            vb1 = self._passed_mask(current - 1)
-            vb2 = 0x00
+                green = _cumulative_mask(pick, oiling)
+        # OFFLINE 的两个字节由 update() 里的离线分支单独给（保持上一次结论）
+
         return PlcFrame(
-            vb0=vb0,
-            vb1=vb1,
-            vb2=vb2,
+            vb0=green,
+            vb1=yellow,
+            vb2=0x00,  # HR1 与灯无关，恒 0
             step=step,
             task_id=task_id,
             reason=reason,
@@ -587,7 +674,7 @@ class PlcIoThread:
             self._cfg.hold_s,
         )
 
-    def check_connection(self) -> tuple[bool, str]:
+    def check_connection(self, *, keep_open: bool = False) -> tuple[bool, str]:
         """测一次 PLC 连通性：建连 + 读 HR0..HR1。**不写任何寄存器**。
 
         返回 ``(是否成功, 说明)``。只读联调模式下也一样能测——读不需要
@@ -598,6 +685,10 @@ class PlcIoThread:
         超时。所以这里先关掉写入线程自己的连接再探测，探测完让线程按
         退避自行重连，否则「测试连接」在生产模式下必然失败，提示还会把
         现场引向「检查博途在线监控」。
+
+        ``keep_open=True`` 时**成功就不关连接**，留给调用方直接用。启动
+        检测走这条路：现场实测「关掉后同一时刻再建连要等约 1 s」，先关
+        再开必然超时（`connect_timeout_s` 默认正好 1 s），启动帧会白写。
         """
 
         base = self._cfg.register_base
@@ -606,15 +697,18 @@ class PlcIoThread:
             # 与写入线程共用同一个 PlcLink 对象：close() 之后线程下一拍
             # 会发现 not connected 并重新 open()。
             self._link.close()
+        ok = False
         try:
             self._link.open()
             registers = self._link.read_holding(base, 2)
+            ok = True
         except (ModbusLinkError, ModbusError) as exc:
             return False, str(exc)
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
         finally:
-            self._link.close()
+            if not (keep_open and ok):
+                self._link.close()
             if owns_link:
                 # 让写入线程立刻重写完整帧：上次写入的值已不可信。
                 self._io.last_written = None
@@ -640,9 +734,14 @@ class PlcIoThread:
             return self._status.to_dict()
 
     def _startup_probe(self) -> None:
-        """开机连通性检测：结果写进 status，失败只告警不退出。"""
+        """开机连通性检测：结果写进 status，失败只告警不退出。
 
-        ok, message = self.check_connection()
+        **成功时保持连接不关**（``keep_open=True``）：启动帧要紧接着用同一条
+        socket 写，先关再开会撞上「同一时刻第二条建连等约 1 s」的惩罚，写入
+        必然超时（现场日志实证）。失败时连接已在 ``check_connection`` 里关掉。
+        """
+
+        ok, message = self.check_connection(keep_open=True)
         with self._lock:
             self._status.startup_ok = ok
             self._status.startup_message = message
@@ -674,6 +773,11 @@ class PlcIoThread:
         # 第一步就是连通性检测：放在线程里做，既满足「启动前测一次」，
         # 又不阻塞调用方（service.start() 跑在 UI 线程上）。
         self._startup_probe()
+        # 检测通过后先主动写一次「等待取料」帧：PLC 这段数据区上电残留
+        # HR1=0x00FF（VB2 八位全 1），按现场灯色就是**三盏全红**。不压掉的话
+        # 现场要一直看到三红，直到主循环第一拍（最多 200ms）才被覆盖；PLC
+        # 重启后同理，这里也把「重启即自愈」提前到进循环之前。
+        self._prime_idle_frame()
         interval = max(0.02, self._cfg.poll_interval_ms / 1000.0)
         while not self._stop.is_set():
             started = time.monotonic()
@@ -685,6 +789,36 @@ class PlcIoThread:
                 self._log.exception("PLC 写入线程异常")
             elapsed = time.monotonic() - started
             self._stop.wait(max(0.0, interval - elapsed))
+
+    def _prime_idle_frame(self) -> None:
+        """启动检测通过后写一次「等待取料」帧，压掉上电残留值。
+
+        只在**非只读**且**启动检测通过**时写。失败不阻止启动：主循环会按
+        退避重连，并靠「值变立即写 / 1s 无条件重写」自行补上。
+        """
+
+        if self._cfg.dry_run:
+            return
+        with self._lock:
+            if not self._status.startup_ok:
+                return
+        frame = self._mapper.prime_idle()
+        with self._lock:
+            self._status.step = frame.step
+            self._status.frame = frame
+        self._io.last_written = None  # 探测后连接是新开的，值不可信，写全帧
+        self._flush(frame, time.monotonic())
+        if self._io.last_written == frame.registers:
+            self._log.info(
+                "PLC 启动后先写一次「等待取料」帧：%s（压掉上电残留值）",
+                frame.describe(),
+            )
+        else:
+            # 没写成就别谎报：主循环第一拍会重试（last_written=None 保证
+            # 「值没变也要写」），最多晚一个 poll_interval。
+            self._log.warning(
+                "PLC 启动帧未写成功（%s），等主循环重试", self._status.last_error
+            )
 
     def _tick(self) -> None:
         now_wall = time.time()

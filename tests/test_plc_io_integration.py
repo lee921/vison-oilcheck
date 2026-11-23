@@ -111,15 +111,6 @@ def _plc_cfg(port: int, *, dry_run: bool = False, hold_s: float = 0.15) -> PlcCo
     )
 
 
-def _last_vb0(server: _SlaveServer) -> int:
-    """最后一次写入的 VB0（HR0 低字节）。"""
-
-    with server.lock:
-        if not server.writes:
-            return -1
-        return server.writes[-1][0] & 0xFF
-
-
 def _wait(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -130,7 +121,7 @@ def _wait(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool:
 
 
 def test_writes_step_bytes_to_real_slave(slave):
-    """取料 → 涂油中 → 完成，三个状态必须在从站寄存器上依次出现。"""
+    """取料 → 涂油中 → 完成，三个状态的灯色必须在从站寄存器上依次出现。"""
 
     state = {
         "evidence": PlcEvidence(
@@ -142,11 +133,11 @@ def test_writes_step_bytes_to_real_slave(slave):
     )
     thread.start()
     try:
-        # 工步 1：无周期
-        assert _wait(lambda: slave.registers[0] == 0x0001)
+        # 等待取料 → 灯2 黄
+        assert _wait(lambda: slave.registers[0] == 0x0200)
         assert slave.registers[1] == 0x0000
 
-        # 工步 2：已取料、未涂油
+        # 取料完成 → 灯2、灯3 绿
         state["evidence"] = PlcEvidence(
             online=True,
             task_id="T1",
@@ -154,10 +145,10 @@ def test_writes_step_bytes_to_real_slave(slave):
             final_result=TaskResult.PROCESSING,
             brush_hold_s=0.0,
         )
-        assert _wait(lambda: slave.registers[0] == 0x0102)
+        assert _wait(lambda: slave.registers[0] == 0x0006)
         assert slave.registers[1] == 0x0000
 
-        # 工步 3：涂油中
+        # 涂油中 → 灯2、灯3 绿，灯4 黄
         state["evidence"] = PlcEvidence(
             online=True,
             task_id="T1",
@@ -165,9 +156,9 @@ def test_writes_step_bytes_to_real_slave(slave):
             final_result=TaskResult.PROCESSING,
             brush_hold_s=0.4,
         )
-        assert _wait(lambda: slave.registers[0] == 0x0304)
+        assert _wait(lambda: slave.registers[0] == 0x0806)
 
-        # 工步 4：完成（VB1 = 0b1001）
+        # 良品 → 灯2、灯3、灯4 全绿
         state["evidence"] = PlcEvidence(
             online=True,
             task_id="T1",
@@ -175,14 +166,14 @@ def test_writes_step_bytes_to_real_slave(slave):
             final_result=TaskResult.COMPLETED,
             brush_hold_s=1.1,
         )
-        assert _wait(lambda: slave.registers[0] == 0x0700)
+        assert _wait(lambda: slave.registers[0] == 0x000E)
         assert slave.registers[1] == 0x0000
     finally:
         thread.stop()
 
 
 def test_ng_writes_bad_bit_then_clears(slave):
-    """漏涂写 VB2 工步 4，保持窗结束后回工步 1 并清零。"""
+    """漏涂写 VB2 工步 3 红灯，保持窗结束后回工步 1 并清零。"""
 
     state = {
         "evidence": PlcEvidence(
@@ -199,7 +190,7 @@ def test_ng_writes_bad_bit_then_clears(slave):
     )
     thread.start()
     try:
-        assert _wait(lambda: slave.registers[0] == 0x0304)
+        assert _wait(lambda: slave.registers[0] == 0x0806)
 
         state["evidence"] = PlcEvidence(
             online=True,
@@ -208,19 +199,19 @@ def test_ng_writes_bad_bit_then_clears(slave):
             final_result=TaskResult.NG,
             brush_hold_s=0.3,
         )
-        # 工步 4 不良：VB1=0x01 VB2=0x08
-        assert _wait(lambda: slave.registers[0] == 0x0300)
-        assert slave.registers[1] == 0x0004
+        # 漏涂：灯4 同时绿+黄 → 红。VB0=0x0E，VB1=0x08；HR1 恒 0
+        assert _wait(lambda: slave.registers[0] == 0x080E)
+        assert slave.registers[1] == 0x0000
 
-        # 保持窗结束后回工步 1，记录清零
-        assert _wait(lambda: slave.registers[0] == 0x0001)
+        # 保持窗结束后回等待取料（只剩灯2 黄）
+        assert _wait(lambda: slave.registers[0] == 0x0200)
         assert slave.registers[1] == 0x0000
     finally:
         thread.stop()
 
 
-def test_offline_clears_vb0_only(slave):
-    """相机离线：VB0 归零，已写出的记录保持。"""
+def test_offline_clears_yellow_only(slave):
+    """相机离线：黄灯全灭，绿灯与红灯保持（那是这一件的结论）。"""
 
     holder = {
         "evidence": PlcEvidence(
@@ -237,14 +228,14 @@ def test_offline_clears_vb0_only(slave):
     )
     thread.start()
     try:
-        # 良品完成：VB0=0x00（已出结论）、VB1=0x07（三步全过）
-        assert _wait(lambda: slave.registers[0] == 0x0700)
+        # 良品完成：灯2、灯3、灯4 全绿
+        assert _wait(lambda: slave.registers[0] == 0x000E)
         holder["evidence"] = PlcEvidence.offline()
-        # 离线只清 VB0，不动记录字节：最后一次写入应是 VB0=0 / VB1=0x07
+        # 离线不动绿：最后一次写入仍是 VB0=0x0E / VB1=0x00
         assert _wait(
             lambda: bool(slave.writes)
-            and slave.writes[-1][0] == 0x0700
-            and _last_vb0(slave) == 0x00
+            and slave.writes[-1][0] == 0x000E
+            and slave.writes[-1][1] == 0x0000
         )
     finally:
         thread.stop()
@@ -294,11 +285,11 @@ def test_periodic_rewrite_heals_after_slave_restart(slave):
     )
     thread.start()
     try:
-        assert _wait(lambda: slave.registers[0] == 0x0304)
-        # 模拟 PLC 重启：数据区回到上电残留
+        assert _wait(lambda: slave.registers[0] == 0x0806)
+        # 模拟 PLC 重启：数据区回到上电残留（VB2=0xFF，三盏全红）
         with slave.lock:
             slave.registers[:2] = [0x0000, 0x00FF]
-        assert _wait(lambda: slave.registers[0] == 0x0304, timeout=2.0)
+        assert _wait(lambda: slave.registers[0] == 0x0806, timeout=2.0)
     finally:
         thread.stop()
 
@@ -365,7 +356,62 @@ def test_startup_probe_reports_ok(slave):
         assert _wait(lambda: thread.status()["startup_ok"] is True)
         message = thread.status()["startup_message"]
         assert str(slave.port) in message
+        # 探测是纯读，读到的是写入前的残留值
         assert "HR0=0x0000" in message
+    finally:
+        thread.stop()
+
+
+def test_startup_primes_idle_frame_to_clear_residual_red(slave):
+    """启动检测通过后要立刻用「等待取料」帧压掉上电残留的三盏红。
+
+    实测该 PLC 上电 HR1=0x00FF（上电残留，与灯无关）。
+    若不等主循环第一拍才覆盖，现场会先看到一段红。
+    """
+
+    assert slave.registers[:2] == [0x0000, 0x00FF]  # 上电残留值
+    thread = PlcIoThread(
+        cfg=_plc_cfg(slave.port),
+        evidence_source=lambda: PlcEvidence(online=True),
+    )
+    thread.start()
+    try:
+        # 第一拍就是等待取料：灯1 黄、其余灭
+        assert _wait(lambda: slave.registers[:2] == [0x0200, 0x0000])
+        first = slave.writes[0] if slave.writes else None
+        assert first == (0x0200, 0x0000), slave.writes[:3]
+    finally:
+        thread.stop()
+
+
+def test_startup_prime_skipped_in_dry_run(slave):
+    """只读联调不能写：启动压残留值也要跳过。"""
+
+    thread = PlcIoThread(
+        cfg=_plc_cfg(slave.port, dry_run=True),
+        evidence_source=lambda: PlcEvidence(online=True),
+    )
+    thread.start()
+    try:
+        assert _wait(lambda: thread.status()["startup_ok"] is True)
+        time.sleep(0.2)
+    finally:
+        thread.stop()
+    assert slave.writes == []
+    assert slave.registers[:2] == [0x0000, 0x00FF]
+
+
+def test_startup_prime_skipped_when_probe_fails():
+    """连不上时不硬写：启动检测失败就交给主循环按退避重连。"""
+
+    thread = PlcIoThread(
+        cfg=_plc_cfg(1),  # 端口 1 本机不会有人监听
+        evidence_source=lambda: PlcEvidence(online=True),
+    )
+    thread.start()
+    try:
+        assert _wait(lambda: thread.status()["startup_ok"] is False)
+        assert thread.status()["startup_message"]
     finally:
         thread.stop()
 

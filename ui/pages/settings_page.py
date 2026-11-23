@@ -142,7 +142,10 @@ class SettingsPage(QWidget):
         self._plc_port = QSpinBox()
         self._plc_port.setRange(1, 65535)
         self._plc_hold_s = _double_spin(0.0, 60.0, 0.5, 1)
-        self._plc_hold_s.setToolTip("涂油完成/异常在 PLC 上保持多久再回工步 1")
+        self._plc_hold_s.setToolTip(
+            "良品（三盏绿）/ 漏涂 NG（红灯）在 PLC 上停留多久再回等待取料。"
+            "现场默认 2 秒"
+        )
         self._btn_plc_test = PushButton("测试连接")
         self._btn_plc_test.clicked.connect(self._on_plc_test)
         # 测试连接会阻塞在 socket 上，放到单线程执行器里跑，避免卡住 UI。

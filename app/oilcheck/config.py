@@ -850,6 +850,11 @@ _PLC_BYTE_ORDERS = frozenset({"lsb", "msb"})
 
 _DEFAULT_PLC_BACKOFF_MS = (200, 500, 1000, 2000, 5000)
 
+# 现场灯的数量。位 = 灯号（bit(n-1) → 第 n 盏灯）。
+# 实测 8 盏全部可点亮；注意 **灯1 只能红**（绿位无反应、黄位直接亮红），
+# 所以工步从第 2 盏灯起用，不要碰 bit0。
+PLC_LAMP_COUNT = 8
+
 
 @dataclass(frozen=True)
 class PlcConfig:
@@ -878,10 +883,12 @@ class PlcConfig:
     request_timeout_s: float = 0.5
     # 断链退避（毫秒）。实测同一时刻连发第二条建连要等约 1s，不能 0ms 猛重试
     reconnect_backoff_ms: tuple[int, ...] = _DEFAULT_PLC_BACKOFF_MS
-    # 终态（涂油完成/异常）在 PLC 上保持多久再回工步 1
-    hold_s: float = 1.0
-    # 工步编号：取料记在第几步、涂油结论记在第几步
-    steps: dict[str, int] = field(default_factory=lambda: {"pick": 1, "oiling": 3})
+    # 终态（涂油完成/异常）在 PLC 上保持多久再回工步 1。
+    # 现场要求「良品完成和漏涂 NG 时灯4 保持亮 2 秒」，所以默认 2s。
+    hold_s: float = 2.0
+    # 工步编号：取料记在第几步、涂油结论记在第几步。
+    # 位 = 灯号，且灯1 只能红，所以默认从第 2 盏灯起：2 / 4。
+    steps: dict[str, int] = field(default_factory=lambda: {"pick": 2, "oiling": 4})
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> PlcConfig:
@@ -923,10 +930,17 @@ class PlcConfig:
                         "plc", f"steps.{key}", steps_raw[key], steps[key], 1, 8
                     )
                     steps[key] = value
-        # 位语义是「VB1 = 已通过的工步累计位、VB2 = 失败的那一步」，
-        # 只有 pick < oiling 时成立；且 _state_step(PICKED) 要占 pick+1 位，
-        # 所以 oiling 最多到 7（pick=8 时 VB0=1<<8 会被 hr0 的 &0xFF 抹掉）。
-        if not (1 <= steps["pick"] < steps["oiling"] <= 7):
+        # 约束（位 = 灯号，只有 PLC_LAMP_COUNT 盏灯，且灯1 只能红）：
+        # - ``pick`` 必须 ≥ 2：bit0 对应灯1，实测它绿位无反应、黄位直接亮红，
+        #   不能用来表示「进行中」；
+        # - ``oiling == pick + 2``：取料完成亮到第 ``pick+1`` 盏绿，涂油中亮到
+        #   第 ``oiling-1`` 盏绿 + 第 ``oiling`` 盏黄，两者相等才单调；
+        # - ``oiling <= PLC_LAMP_COUNT``：红灯要有对应的灯可亮。
+        if not (
+            2 <= steps["pick"]
+            and steps["oiling"] == steps["pick"] + 2
+            and steps["oiling"] <= PLC_LAMP_COUNT
+        ):
             _warn_bad_value(
                 "plc",
                 "steps",
@@ -1878,10 +1892,17 @@ CONFIG_COMMENTS: dict[str, str] = {
     "plc.reconnect_backoff_ms": (
         "断链重连退避（毫秒）。实测同一时刻连发第二条建连要等约 1s，" "不能 0ms 猛重试"
     ),
-    "plc.hold_s": "涂油完成/异常在 PLC 上保持多久再回工步 1，给 PLC 读结论的时间",
-    "plc.steps": "工步编号：取料记在第几步、涂油结论记在第几步",
-    "plc.steps.pick": "取料记在第几工步（1~8），默认 1",
-    "plc.steps.oiling": "涂油结论（良品/不良）记在第几工步（1~8），默认 3",
+    "plc.hold_s": (
+        "涂油完成/异常（良品三绿、漏涂红灯）在 PLC 上保持多久再回等待取料。"
+        "现场要求灯4 亮 2 秒，默认 2.0"
+    ),
+    "plc.steps": (
+        "工步编号：取料记在第几步、涂油结论记在第几步。位 = 灯号（bit(n-1) → "
+        "第 n 盏），灯1 只能红所以从第 2 盏起用；默认 pick=2 / oiling=4，"
+        "要求 pick>=2、oiling=pick+2、oiling<=8"
+    ),
+    "plc.steps.pick": "取料记在第几盏灯（>=2，灯1 只能红；oiling 必须 = pick+2）",
+    "plc.steps.oiling": "涂油结论记在第几盏灯（= pick+2，<=8）",
     # ---- stations ----
     "stations": "工位列表，每个工位一台相机",
     "stations[].station_id": "工位 ID，事件与日志里用它区分",

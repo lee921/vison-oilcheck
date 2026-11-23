@@ -1029,7 +1029,7 @@ def test_plc_config_defaults_are_off_and_read_only():
     assert cfg.port == 502
     assert cfg.register_base == 0
     assert cfg.byte_order == "lsb"
-    assert cfg.steps == {"pick": 1, "oiling": 3}
+    assert cfg.steps == {"pick": 2, "oiling": 4}
 
 
 def test_plc_config_roundtrips():
@@ -1041,14 +1041,13 @@ def test_plc_config_roundtrips():
             "dry_run": False,
             "host": "10.0.0.5",
             "hold_s": 2.5,
-            "steps": {"pick": 2, "oiling": 5},
         }
     )
     assert cfg.enabled is True
     assert cfg.dry_run is False
     assert cfg.host == "10.0.0.5"
     assert cfg.hold_s == 2.5
-    assert cfg.steps == {"pick": 2, "oiling": 5}
+    assert cfg.steps == {"pick": 2, "oiling": 4}
     assert PlcConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
 
 
@@ -1064,10 +1063,10 @@ def test_plc_config_rejects_bad_values():
         }
     )
     assert cfg.byte_order == "lsb"
-    assert cfg.hold_s == 1.0
+    assert cfg.hold_s == 2.0
     assert cfg.reconnect_backoff_ms == (200, 500, 1000, 2000, 5000)
     # 越界工步号回退默认，不写进配置
-    assert cfg.steps == {"pick": 1, "oiling": 3}
+    assert cfg.steps == {"pick": 2, "oiling": 4}
 
 
 def test_legacy_config_gets_plc_section(tmp_path):
@@ -1317,15 +1316,26 @@ def test_plc_string_booleans_are_parsed():
 
 
 def test_plc_step_order_is_validated():
-    """pick >= oiling 时位语义不成立，必须回退默认并记 warning。"""
+    """8 盏灯，但灯1 只能红，所以 pick 必须 ≥ 2 且 oiling = pick + 2。
+
+    位 = 灯号：pick=1 会用灯1（绿位无反应、黄位直接亮红）；oiling≠pick+2
+    会让绿灯位数不单调；oiling>8 则红灯没有对应的灯。
+    """
 
     from app.oilcheck.config import PlcConfig
 
-    for steps in ({"pick": 3, "oiling": 3}, {"pick": 5, "oiling": 2}):
-        assert PlcConfig.from_dict({"steps": steps}).steps == {"pick": 1, "oiling": 3}
-    # 合法组合原样保留
-    assert PlcConfig.from_dict({"steps": {"pick": 2, "oiling": 5}}).steps == {
-        "pick": 2,
+    default = {"pick": 2, "oiling": 4}
+    for steps in (
+        {"pick": 1, "oiling": 3},  # 用了灯1
+        {"pick": 3, "oiling": 3},  # oiling != pick+2
+        {"pick": 5, "oiling": 2},  # 倒序
+        {"pick": 2, "oiling": 5},  # oiling != pick+2
+        {"pick": 7, "oiling": 9},  # 超出灯数
+    ):
+        assert PlcConfig.from_dict({"steps": steps}).steps == default, steps
+    # 合法组合原样保留（pick=3/oiling=5 → 灯3/4/5）
+    assert PlcConfig.from_dict({"steps": {"pick": 3, "oiling": 5}}).steps == {
+        "pick": 3,
         "oiling": 5,
     }
 
