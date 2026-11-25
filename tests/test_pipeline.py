@@ -344,24 +344,22 @@ def test_grip_detected_when_screw_sticks_out_of_hand_corner():
 
 
 def test_screw_still_inside_tray_does_not_count_as_leaving_tray():
-    """杆心还在手工盘区内、只是随手动了一下：不算「带丝杆出盘」。
+    """杆心还在手工盘区内时不算「带丝杆出盘」；带出盘区之后才算。
 
     取料的口径是**空手入盘、带丝杆出盘**，盘区就是手工划定的那块
     ``tray_roi``。手已经退到盘外、但手里那根杆的中心仍落在盘区内时，这根
-    还没出盘，不能当作取料证据。
+    还没出盘，不能当作取料证据——这条曾经被放开（按「位置稳定性」而不是
+    按盘区），代价是示例① 第 88~103 帧那类动作被凭空判成取料：工人只是
+    把手伸进盘点按夹具，离盘瞬间盘内 (1489,501) 那根杆与手框交叠，静置
+    判定又因为手在动、杆的框跟着抖了一下而失手，于是多出一件 PICK。
 
-    这条曾经被放开（按「位置稳定性」而不是按盘区），代价是示例① 第
-    88~103 帧那类动作被凭空判成取料：工人只是把手伸进盘点按夹具，离盘
-    瞬间盘内 (1489,501) 那根杆与手框交叠，静置判定又因为手在动、杆的框
-    跟着抖了一下而失手，于是多出一件 PICK，下一件真取料反被判漏涂。
+    但「还没出盘」不等于「空手离盘」：杆心晚于手出盘是常态，示例⑤ 第 2 次
+    取料手在 6.53s 出盘、杆要到 8.73s 才跨出盘区边线，中间 2.2s 都在盘区下沿
+    带着杆往下走。这段时间既不能当成「手里没杆」投票，也不能按离盘后的固定
+    时长结算——那样整件取料会被判成空手离开（示例⑤ 第 2、3 次取料即如此）。
+    正确做法是等杆出盘（上限 ``_CARRY_OUT_OF_TRAY_MAX_S``）。
 
-    这个用例让手持杆在盘区下沿附近持续横向移动（杆心仍在盘区内）：
-    出盘之前这段不能判取料，进盘过程按「空手离盘」结算。
-
-    「离盘后才把杆带出盘区」不会补判：离盘后的盘外握持采样攒满
-    ``pick_history_samples`` 点即定论，此时杆还没出盘，结论就是空手。
-    现场的真取料是在离盘后一两帧内就把杆带到盘区外（四段示例视频全部
-    如此），不受这条影响。
+    所以这里断言两件事：杆在盘区内期间不出 PICK；杆一出盘区就出 PICK。
     """
 
     pipeline, events = make_pipeline()
@@ -391,13 +389,173 @@ def test_screw_still_inside_tray_does_not_count_as_leaving_tray():
     for cx, cy in path:
         feed(pipeline, next(ts_iter), hand_at(cx + 30, 545.0),
              held_screw_at(cx, cy), parked)
-    # 随后才带出盘区。
+
+    assert [e for e in events if e.event_type == EventType.PICK] == [], \
+        "杆心还在盘区内就判了取料"
+
+    # 随后才带出盘区：这时才是真正的「带丝杆出盘」。
     for _ in range(4):
         feed(pipeline, next(ts_iter), hand_at(440.0, 600.0),
              held_screw_at(440.0, 600.0), parked)
 
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert len(picks) == 1, "杆出了盘区却没判出这一次取料"
+
+
+def test_carrying_screw_out_slowly_still_picks():
+    """手出盘后把杆在盘区下沿停住带走、过了结算时长才出盘：仍要判取料。
+
+    示例⑤ 第 2 次取料：手 6.53s 出盘，之后 2.2s 一直握着杆在盘区下沿慢慢
+    往下走（杆心还在盘区内），8.73s 才跨出盘区。旧的实现按「离盘后攒够
+    采样 / 超过结算时长就定论」处理，杆出盘之前采样窗口一直是空的，于是
+    按空手结算，整件取料丢掉。
+
+    这里让杆在盘区内停住不动一段时间再出盘：停住会让「位置稳定性」判据
+    把它当成盘里的存货，所以这条也守着「按进盘时的存货快照区分」这一条。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    tray_screw = screw_at(*TRAY_SCREW)
+    for step in range(5):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(HAND_TARGET[0] - step * 10, HAND_TARGET[1] + step * 10),
+        )
+    enter_tray_empty(pipeline, ts_iter, screw=tray_screw)
+
+    # 手退到盘区外，杆心仍在盘区内（y=495 < 520），并在盘区下沿**停住**
+    # 十几帧（约 2.5s，远超 pick_sample_every_frames × pick_history_samples
+    # 换算出的结算时长）。
+    for _ in range(14):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(470.0, 545.0),
+            held_screw_at(470.0, 495.0),
+            tray_screw,
+        )
+
     assert [e for e in events if e.event_type == EventType.PICK] == [], \
         "杆心还在盘区内就判了取料"
+
+    # 杆终于跨出盘区边线。
+    for cy in (515.0, 535.0, 555.0, 575.0):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(470.0, cy + 50),
+            held_screw_at(470.0, cy),
+            tray_screw,
+        )
+
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert len(picks) == 1, "杆晚出盘就不判取料了——示例⑤ 第 2、3 次取料正是这么丢的"
+
+
+def test_inventory_screw_in_tray_does_not_look_like_carrying():
+    """盘里的存货杆在手边、位置也没变过：不能当成「正在带出门的那根」。
+
+    手在盘区外、手边同时有「进盘时就在盘里、一直没动过的存货杆」和
+    「正被带走、暂时停在盘区内的杆」时，只看手边有没有杆会把存货当成
+    正在带出门的那根。必须按**进盘时的存货快照**区分：存货在快照里，
+    手上那根不在。
+
+    示例⑤ 第 3 次取料就是这个形态：盘里还剩一根存货，手带着另一根从它
+    旁边经过。若把存货当成手上的杆，刷油锚点会锁到存货上，这一件的涂油
+    永远累计不上（判成漏涂 NG）。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    # 盘里的存货杆：进盘前后一直在盘区里，位置不动。
+    inventory = screw_at(460.0, 120.0)
+    for step in range(5):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(HAND_TARGET[0] - step * 10, HAND_TARGET[1] + step * 10),
+            inventory,
+        )
+    enter_tray_empty(pipeline, ts_iter, screw=inventory)
+
+    # 手退到盘区外，手里那根杆心还在盘区内（y=495）。存货杆离手框更近，
+    # 只看「手边最近的杆」会选中它。
+    for _ in range(14):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(470.0, 545.0),
+            held_screw_at(470.0, 495.0),
+            inventory,
+        )
+
+    assert [e for e in events if e.event_type == EventType.PICK] == [], \
+        "杆心还在盘区内就判了取料"
+
+    # 杆出盘：这时才能判取料，且锚点要锁在带出去的那根上（y≈575），
+    # 不是留在盘里的存货（y=120）。
+    for cy in (515.0, 535.0, 555.0, 575.0):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(470.0, cy + 50),
+            held_screw_at(470.0, cy),
+            inventory,
+        )
+    # 取料后手持杆继续在工作区里，刷头靠近。
+    for _ in range(4):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(470.0, 575.0),
+            held_screw_at(470.0, 575.0),
+            inventory,
+        )
+
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert len(picks) == 1, "晚出盘的这一次取料被判丢了"
+    # 锚点若锁到存货杆上，取料后的涂油会一直刷在存货上（示例⑤ 那种漏检）。
+    center = pipeline._cycles[picks[0].task_id].screw_anchor
+    assert center is not None
+    assert center[1] > 400.0, f"锚点锁到了盘里的存货杆上：{center}"
+
+
+def test_screw_never_leaving_tray_does_not_pick():
+    """杆一直在盘区里、只是被手碰着动了动：等满上限后按空手结算。
+
+    示例① 第 88~103 帧那种「伸手进盘点按夹具」的动作：手在盘外、手边那根
+    杆动过（碰了一下），但它始终没离开盘区。等超过 ``_CARRY_OUT_OF_TRAY_MAX_S``
+    仍不出盘，就不能再当成「正在带出门」，按空手离盘结算。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+
+    tray_screw = screw_at(*TRAY_SCREW)
+    for step in range(5):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(HAND_TARGET[0] - step * 10, HAND_TARGET[1] + step * 10),
+        )
+    enter_tray_empty(pipeline, ts_iter, screw=tray_screw)
+
+    # 手在盘区外、杆心在盘区内并一直小幅晃动（不是静态），始终不出盘。
+    for i in range(40):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(470.0, 545.0),
+            held_screw_at(470.0 + (i % 3) * 4, 495.0 + (i % 2) * 4),
+            tray_screw,
+        )
+
+    assert [e for e in events if e.event_type == EventType.PICK] == [], \
+        "杆始终没出盘却判了取料"
 
 
 def test_parked_screw_in_tray_does_not_count_as_grip_after_exit():
@@ -742,6 +900,78 @@ def test_brush_briefly_near_does_not_complete_oiling():
     assert task.stage == TaskStage.PICKED
     assert task.final_result == TaskResult.PROCESSING
     assert 0.0 < task.brush_hold_s < 1.0
+
+
+def test_brush_contact_measured_to_screw_axis_not_center():
+    """刷子贴着长杆的中下部刷：离杆心远也算靠近。
+
+    示例⑤ 第 2 次取料：手持杆框实测 60×300 px，刷头工作点贴杆身中下部，
+    到杆心的归一化距离在 0.056~0.074 之间摆动（门限 0.06），一半的帧被判
+    成「没靠近」，接触累计只到 0.93 s，整件被误判漏涂 NG。接触的物理含义
+    是刷子碰到**杆身**，沿杆方向的偏移不该算进距离。
+    """
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5)
+    ts_iter = timestamps()
+    do_pick(pipeline, ts_iter)
+
+    # 手持杆竖着：杆身从 y=500 到 y=800，杆心 (350, 650)。
+    long_screw = Detection(
+        label="screw",
+        confidence=0.9,
+        box=BBox(340.0, 500.0, 360.0, 800.0),
+        angle=math.pi * 0.5,
+    )
+    # 刷头工作点贴在杆身下段：离杆心 130px（归一化 0.092 > 门限 0.06），
+    # 离杆身中线为 0。
+    point = (HAND_TARGET[0], HAND_TARGET[1] + 130.0)
+    for _ in range(4):
+        ts = next(ts_iter)
+        feed(
+            pipeline,
+            ts,
+            hand_at(*HAND_TARGET),
+            long_screw,
+            brush_at(*point),
+        )
+
+    oils = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    assert len(oils) == 1, "贴着杆身刷却按「离杆心太远」判成没靠近"
+    task = pipeline.tasks[0]
+    assert task.stage == TaskStage.OILED
+    assert task.brush_hold_s >= 0.5
+
+
+def test_brush_away_from_screw_axis_is_not_contact():
+    """刷子横向离开杆身中线超过门限：不算靠近。
+
+    与上一条配套：距离改按杆身中线量之后，垂直于杆的方向仍要保留门限，
+    否则「沿杆方向任意远」会把其实没碰到杆的刷子也算进来。
+    """
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5)
+    ts_iter = timestamps()
+    do_pick(pipeline, ts_iter)
+
+    long_screw = Detection(
+        label="screw",
+        confidence=0.9,
+        box=BBox(340.0, 500.0, 360.0, 800.0),
+        angle=math.pi * 0.5,
+    )
+    # 沿杆身方向对齐、但横向偏出 130px（归一化 0.092 > 0.06）。
+    for _ in range(4):
+        ts = next(ts_iter)
+        feed(
+            pipeline,
+            ts,
+            hand_at(*HAND_TARGET),
+            long_screw,
+            brush_at(HAND_TARGET[0] + 130.0, HAND_TARGET[1]),
+        )
+
+    assert [e for e in events if e.event_type == EventType.MANUAL_OILING] == []
+    assert pipeline.tasks[0].stage == TaskStage.PICKED
 
 
 def test_second_cycle_is_detected_after_first_completes():

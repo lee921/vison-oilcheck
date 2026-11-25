@@ -7,7 +7,7 @@
 指标口径与判定逻辑严格对应：
 
 - ``brush_hold_s`` —— ``_update_oiling`` 累加的那个值，判定完成与否的唯一依据；
-- ``brush_min_distance`` —— 本周期内刷头工作点到杆心的最小归一化距离，
+- ``brush_min_distance`` —— 本周期内刷头工作点到杆身中线的最小归一化距离，
   与 ``_nearest_brush`` 同一算法（``brush_work_point``）；
 - ``brush_near_frames`` / ``screw_visible_frames`` —— 让复核员看出「偶尔蹭到」
   与「一直在刷」、以及判定本身受漏检影响的程度。
@@ -250,7 +250,7 @@ def _min_distance_metric(
     if distance is None:
         return ReviewMetric(
             key="brush_min_distance",
-            label="刷头离杆最近距离",
+            label="刷头离杆身最近距离",
             value="-",
             required=f"≤ {contact_s:.3f}" if contact_s is not None else None,
             passed=False if contact_s is not None else None,
@@ -259,7 +259,7 @@ def _min_distance_metric(
     passed = None if contact_s is None else distance <= contact_s
     return ReviewMetric(
         key="brush_min_distance",
-        label="刷头离杆最近距离",
+        label="刷头离杆身最近距离",
         value=f"{distance:.3f}",
         required=f"≤ {contact_s:.3f}" if contact_s is not None else None,
         passed=passed,

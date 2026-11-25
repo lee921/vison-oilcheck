@@ -81,6 +81,22 @@ _SCREW_STATIC_BACK = 8
 _SCREW_STATIC_IOU = 0.5
 _SCREW_HISTORY_MAX = _SCREW_STATIC_BACK + 2
 
+# 手已出盘、手里那根杆还没出盘时，最多等这么久（按实际帧率缩放）。
+#
+# 取料的定义是「带杆**出**盘」，杆心在盘区内的读数是无效的，既不能进采样
+# 窗口，也不能用来结算。这段时间要按「杆出盘」算：现场实测杆心比手晚出门
+# 一秒上下是常态，示例⑤ 第 2 次取料更是在盘区下沿一边刷一边把杆往下带，
+# 手出盘 6.53s、杆出盘 8.73s，隔了 2.2s。而按离盘后的固定结算时长
+# （0.4s）计时，示例⑤ 会在杆出盘之前就按空手定论、整件取料丢掉。
+#
+# 上限只作兜底：正常情况下「还握着并带着杆」这个条件本身会先消失（手离开
+# 那根杆、或杆出了盘），不会真等满。示例① 第 88~103 帧那种盘边点按的
+# 假动作，手一撤这条就断，几帧内就按空手结算。
+_CARRY_OUT_OF_TRAY_MAX_S = 5.0
+
+# 判断「这根杆是不是进盘时那批存货」的 IoU 门限。
+_INVENTORY_SAME_IOU = 0.5
+
 # 对**位置没动过**的杆，握持要求杆有足够面积落在手框右上区（实测盘边蹭到的
 # 静置杆 0.25~0.42，真正攥住的 ≥0.44）；对已经在动的杆，只要与右上区相交
 # 即算——它不可能是静置杆。
@@ -163,6 +179,12 @@ class _HandVisit:
     dwell_in_tray_s: float = 0.0
     # 这一段进盘过程中途接过几次手部轨迹（视觉 ID 重建）。只用于排查与日志。
     rebinds: int = 0
+    # 进盘前一帧盘区里那批丝杆的框（存货快照）。
+    # 用来区分「手里正带着走的那根」与「盘里的存货」：存货在这趟进盘前后
+    # 一直在盘里；手上那根是**新进入盘区**的。只看位置稳不稳不够——工人
+    # 把杆停在盘区下沿歇一下（示例⑤ 第 2 次取料停了 2s 多），位置就不再
+    # 变化，会被 ``_screw_static`` 误当成存货，整件取料丢掉。
+    entry_inventory: tuple[BBox, ...] = ()
 
     def tick(self, *, every_frames: int) -> bool:
         """推进一步并返回本帧是否到采样点（每 k 帧一个）。"""
@@ -272,6 +294,30 @@ def _gripped_by_corner(
         return False
     frac = _grip_corner_fraction(hand_box, screw_box)
     return frac > 0 and frac >= min_frac
+
+
+def _distance_to_long_axis(box: BBox, point: tuple[float, float]) -> float:
+    """点到杆身中线的垂直距离（像素）；投影落到杆身之外时按端点计。
+
+    丝杆框又细又长（现场框 60×300 px，长宽比 p50≈4、p90 以上 6~10），
+    「到框中心」的距离随杆的朝向与长短剧烈变化：刷子贴着手持杆的中下部
+    刷，工作点离杆心天然就有 0.05~0.07 对角线，而门限只有 0.06——同一段
+    涂油里一半的帧会被判成「没靠近」，累计时长因此偏短，整件被误判漏涂
+    （示例⑤ 第 2 次取料：刷了 1.3 s，累计只到 0.93 s）。
+
+    接触的物理含义是「刷子碰到杆身」，不是「刷子碰到杆的中点」，所以取
+    到中线的垂距；沿杆身方向的偏移不算距离。杆的朝向按框的较长边取
+    （检测器不输出 OBB 角度，见 :meth:`BBox.long_axis`）。
+    """
+
+    cx, cy = box.center
+    if box.width >= box.height:
+        over = max(box.x1 - point[0], 0.0, point[0] - box.x2)
+        perp = point[1] - cy
+    else:
+        over = max(box.y1 - point[1], 0.0, point[1] - box.y2)
+        perp = point[0] - cx
+    return math.hypot(over, perp)
 
 
 @dataclass
@@ -913,23 +959,45 @@ class StationPipeline:
                     visit.restart_holding()
                     visit.holding_seen = False
                     continue
+                # 手已出盘、手里的杆还没出盘的那几帧**既不采样也不定论**。
+                #
+                # 杆心比手晚出盘是常态：示例④ 第 3 次取料手在 f348 出盘、
+                # 杆在 f352 才出盘，中间 4 帧按「杆必须出盘」都是「手里没杆」。
+                # 把这几帧记成 False，窗口 [F,F,T] 多数票就是「空手」，
+                # 整件取料丢掉；掉一帧窗口错位，结论更随机。跳过这几帧后，
+                # 采样窗口只包含杆真正出盘之后的读数。
+                #
+                # 也不能让这几帧照常走「攒够就定论 / 超时就定论」：示例⑤ 第 2、
+                # 3 次取料手在 6.53s / 13.13s 出盘，手里那根杆一直在盘区下沿
+                # 慢慢往下带，杆心出盘要 1s 以上（第 2 次 2.2s）。按离盘后的
+                # 固定时长计算，0.4s 的结算期一到，采样窗口还是空的、「见过
+                # 没见过手握杆」也还是假的，于是当场按空手定论，整件取料丢掉。
+                # 等待的时限按 ``_carry_wait_s()``，不能用离盘后的固定时长。
+                #
+                # 「离盘」本身由采样窗口确认（可能比手真正出盘晚一两帧，
+                # 所以这一段在 exited 之后才判得到）。判据是「手边有随手动、
+                # 但杆心仍在盘区内的杆」——那是这一件正在出门，不是空手离开；
+                # 进盘时就在盘里的存货不算（``entry_inventory``）。
+                if self._carrying_out_of_tray(hand_box, visit.entry_inventory):
+                    if ts - visit.exited_at_ts <= self._carry_wait_s():
+                        # 等杆出盘的这段里，手确实在盘外：照常记「盘外空手」
+                        # 历史，供**下一次**进盘定性。旧实现这几帧已经结算、
+                        # 重建了进盘过程，每帧都在记；现在过程还挂着，不补
+                        # 记录就断了窗口（示例③在 7.5fps 下下一件被误判成
+                        # 「带料进盘」而漏掉）。
+                        if due:
+                            self._record_outside_holding(
+                                hand.track_id, holding, ts
+                            )
+                        continue
+                    # 等太久了还没把杆带出去（贴着盘沿刷、或检测框一直在盘区
+                    # 内抖动）：不再等，用已经攒到的盘外读数定论。
                 # 正面证据不挑采样点：采样按 k 帧一个，手离盘后很快就
                 # 出画面时窗口可能一个点都攒不到。
                 if holding_now:
                     visit.holding_seen = True
                 if due:
-                    # 手已出盘、手里的杆还没出盘的那几帧**不采样**。
-                    #
-                    # 杆心比手晚出盘是常态：示例④ 第 3 次取料手在 f348 出盘、
-                    # 杆在 f352 才出盘，中间 4 帧按「杆必须出盘」都是「手里没杆」。
-                    # 把这几帧记成 False，窗口 [F,F,T] 多数票就是「空手」，
-                    # 整件取料丢掉；掉一帧窗口错位，结论更随机。跳过这几帧后，
-                    # 采样窗口只包含杆真正出盘之后的读数。
-                    #
-                    # 判据是「手边有随手动、但杆心仍在盘区内的杆」——那是这一件
-                    # 正在出门，不是空手离开；盘里不动的料不算（_screw_static）。
-                    if not self._carrying_out_of_tray(hand_box):
-                        visit.push_holding(holding_now, keep)
+                    visit.push_holding(holding_now, keep)
                 # 攒满窗口才定论（和之前一致）。提前定论会改变后面几段的
                 # 「进盘时手上有没有杆」：实测 105708 在 7.5fps 下从 4 取
                 # 掉到 3 取。点数不足的情形由 holding_verdict 和「手消失」
@@ -959,6 +1027,11 @@ class StationPipeline:
                     )
                     visit.inside_tray = True
                     visit.restart_holding()
+                    # 记下这一趟进盘**之前**盘区里那批丝杆（存货快照）。
+                    # 离盘后区分「手里带着走的那根」与「盘里的存货」用
+                    # （见 ``_carrying_out_of_tray``）。
+                    if self._screw_history:
+                        visit.entry_inventory = self._screw_history[-1]
                 elif not inside_raw:
                     self._record_outside_holding(hand.track_id, holding, ts)
                 continue
@@ -1115,6 +1188,12 @@ class StationPipeline:
         self._outside_holding_last_ts[hand_id] = ts
         window = max(0.0, self._entry_grace_s())
         history = self._outside_holding.setdefault(hand_id, deque())
+        # 「手里没杆」是一次**状态复位**：从这一刻起的观测才是这一趟进盘前
+        # 的有效依据。不清掉之前的「手持杆」观测，上一次取料后拿着杆走动的
+        # 那串记录会一直留在窗口里，下一次空手进盘被投成「带料进盘」，整件
+        # 取料判丢（示例③在 7.5fps 下第 2 件即如此）。
+        if holding is None:
+            history.clear()
         history.append((holding is None, ts))
         while history and ts - history[0][1] > window:
             history.popleft()
@@ -1228,15 +1307,23 @@ class StationPipeline:
                 visit.rebinds,
             )
 
-    def _carrying_out_of_tray(self, hand_box: BBox) -> bool:
+    def _carrying_out_of_tray(
+        self, hand_box: BBox, inventory: tuple[BBox, ...] = ()
+    ) -> bool:
         """手已在盘外、但手边那根正随着动的杆还没出盘。
 
         这种帧不能当成「手里没杆」的采样点：杆心晚几帧出盘是常态（示例④
         第 3 次取料手 f348 出盘、杆 f352 才出盘），把它记成 False 会让
         采样窗口多数票投出「空手」。它是这一件正在出门的证据，只是还没
-        跨过盘区边线。
+        跨过盘区边线。等待上限见 ``_CARRY_OUT_OF_TRAY_MAX_S``。
 
-        盘里位置没动过的杆不算——那是料架上的存货，与本件无关。
+        **盘里的存货不算**。判据是「这根杆不在进盘时的存货快照里」——
+        存货在这趟进盘前后一直在盘里；手上那根是这趟新进入盘区的。只看
+        位置稳不稳不够：工人把杆停在盘区下沿歇一下（示例⑤ 第 2 次取料
+        停了 2s 多），``_screw_static`` 就不再认为它在动，整件取料被当成
+        「空手离盘」丢掉。
+
+        ``inventory`` 为空（历史不足）时退回位置稳定性判据。
         """
 
         tray_box = self._tray_region_box(self._frame_size)
@@ -1253,6 +1340,11 @@ class StationPipeline:
                 continue
             if not _box_center_in(det.box, tray_box):
                 continue
+            if inventory:
+                # 与存货快照里任一根重合 ⇒ 它是盘里的料，与本件无关。
+                if any(det.box.iou(box) >= _INVENTORY_SAME_IOU for box in inventory):
+                    continue
+                return True
             if self._screw_static(det.box):
                 continue
             return True
@@ -1335,6 +1427,15 @@ class StationPipeline:
         else:
             typical = base_dt
         return 2.0 * max(typical, base_dt)
+
+    def _carry_wait_s(self) -> float:
+        """手出盘后等「杆也出盘」的最长时长（按实际帧率缩放）。
+
+        见 ``_CARRY_OUT_OF_TRAY_MAX_S``：这段时间不能用离盘后的固定结算
+        时长，杆心比手晚出门一秒上下是常态。
+        """
+
+        return _CARRY_OUT_OF_TRAY_MAX_S * self._frame_scale
 
     def _entry_grace_s(self) -> float:
         """进盘前多久之内的「盘外空手」观测仍算数。
@@ -1901,7 +2002,7 @@ class StationPipeline:
         )
 
     def _brush_work_distance(self, screw_box: BBox, brush: Track) -> float:
-        """刷头工作点到丝杆中心的归一化距离（复核统计用）。
+        """刷头工作点到杆身中线的归一化距离（复核统计用）。
 
         与 :meth:`_nearest_brush` 同一算法（都用 ``brush_work_point``），
         不另立口径——否则复核时看到的距离与判定用的距离会对不上。
@@ -1909,9 +2010,8 @@ class StationPipeline:
 
         width, height = self._frame_size
         diag = max(1.0, math.hypot(width, height))
-        sx, sy = screw_box.center
         point = brush_work_point(brush, self.station.detector)
-        return math.hypot(point[0] - sx, point[1] - sy) / diag
+        return _distance_to_long_axis(screw_box, point) / diag
 
     def _close_brush_run(self, task: _Cycle) -> None:
         """结束当前连续接触段，把它的时长并入「最长连续接触」。
@@ -1931,17 +2031,21 @@ class StationPipeline:
         task.brush_last_near_ts = None
 
     def _nearest_brush(self, screw_box: BBox) -> Track | None:
-        """离丝杆接触邻域最近、且已被本帧检测到的刷头。"""
+        """离杆身接触邻域最近、且已被本帧检测到的刷头。
+
+        距离量的是刷头工作点到**杆身中线**的垂距，不是到杆心的距离：杆框
+        细长，贴着杆身中下部刷时工作点离杆心天然就在门限附近，按杆心算
+        会有一半的帧被判成「没靠近」（见 ``_distance_to_long_axis``）。
+        """
 
         width, height = self._frame_size
         diag = max(1.0, math.hypot(width, height))
-        sx, sy = screw_box.center
         best: tuple[float, Track] | None = None
         for brush in self._brush_tracks:
             if not brush.matched or brush.hits < self._brush_tracker.min_hits:
                 continue
             point = brush_work_point(brush, self.station.detector)
-            distance = math.hypot(point[0] - sx, point[1] - sy) / diag
+            distance = _distance_to_long_axis(screw_box, point) / diag
             if distance > self.cfg.brush_contact_distance:
                 continue
             if best is None or distance < best[0]:

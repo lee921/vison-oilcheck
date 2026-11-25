@@ -32,7 +32,7 @@ def _summary() -> ReviewSummary:
             ),
             ReviewMetric(
                 key="brush_min_distance",
-                label="刷头离杆最近距离",
+                label="刷头离杆身最近距离",
                 value="0.031",
                 required="≤ 0.060",
                 passed=True,
@@ -70,7 +70,7 @@ def test_summary_lines_show_verdict_metrics_and_hints():
     text = "\n".join(lines)
     assert "【人工二次涂油】漏涂 NG" in text
     assert "刷头接触累计：0.42 s（要求 ≥ 1.00 s）  ✗" in text
-    assert "刷头离杆最近距离：0.031（要求 ≤ 0.060）  ✓" in text
+    assert "刷头离杆身最近距离：0.031（要求 ≤ 0.060）  ✓" in text
     assert "复核建议" in text
     assert "时间线" in text
 
