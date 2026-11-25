@@ -158,7 +158,10 @@ def main() -> int:
         f"PLC 目标: {cfg.plc.host}:{cfg.plc.port} unit={cfg.plc.unit_id} "
         f"基址={cfg.plc.register_base}"
     )
-    print(f"工步配置: {cfg.plc.steps}  保持窗: {hold_s:.1f}s  节拍: {args.tick:.2f}s")
+    print(
+        f"灯位配置: {cfg.plc.steps}  保持窗: {hold_s:.1f}s  "
+        f"结果灯: 常亮到下一个结论  节拍: {args.tick:.2f}s"
+    )
     print(
         "编码: VB0.bitN=灯N+1 绿 / VB1.bitN=灯N+1 黄 / 同位置双置=红；"
         "HR1 与灯无关"

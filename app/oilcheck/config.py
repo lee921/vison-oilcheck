@@ -128,7 +128,7 @@ def _scalar_bool(section: str, key: str, value: Any, default: bool) -> bool:
     return default
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.9"
+_CONFIG_VERSION = "2.11"
 
 # 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
 _TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
@@ -215,6 +215,16 @@ _PIPELINE_REMOVED_2_9: tuple[str, ...] = (
     "tray_max_missing_s",
     "tray_min_confidence",
 )
+
+# 2.10 删除的 plc 字段：``byte_order`` 从未接进写入路径（字节序写死在
+# ``PlcFrame.hr0/hr1``），改它不会有任何效果，只会让人以为可以切换。
+# 字节序已由现场逐位实测确认是 lsb（docs/12 §3.1.1）。同 2.9 的做法：
+# 不看版本号，键存在就删，幂等。
+_PLC_REMOVED_2_10: tuple[str, ...] = ("byte_order",)
+
+# 2.11 删除的 plc 字段：``result_hold_s``。现场要求结果灯（灯5）常亮到
+# 下一个检测结果到来，不再按时间自动灭，这个时长因此没有消费方。
+_PLC_REMOVED_2_11: tuple[str, ...] = ("result_hold_s",)
 
 # 2.1 新增的检测器字段及其默认值，迁移时补齐。
 _DETECTOR_DEFAULTS_2_1: dict[str, Any] = {
@@ -846,9 +856,9 @@ class DemoConfig:
         return None
 
 
-# PLC 允许的字节序。``lsb`` = 寄存器低字节是编号较小的 VB，这是本现场协议表
-# 四个例子自证出来的读法（见 docs/12 §3.2）。
-_PLC_BYTE_ORDERS = frozenset({"lsb", "msb"})
+# PLC 寄存器字节序固定为 lsb（`HR0` 低字节 = VB0、高字节 = VB1）。这一点已由
+# 现场逐位实测确认（docs/12 §3.1.1），不再是配置项——原先的 `plc.byte_order`
+# 从未接进写入路径，留着只会让人以为改它有用。
 
 _DEFAULT_PLC_BACKOFF_MS = (200, 500, 1000, 2000, 5000)
 
@@ -874,7 +884,6 @@ class PlcConfig:
     unit_id: int = 1
     # 首地址从 0 开始（不是 40001）
     register_base: int = 0
-    byte_order: str = "lsb"
     # 空 = 取第一个启用的工位
     station_id: str = ""
     # 一拍 200ms：兼顾工步切换延迟与保活（PLC 空闲 10~18s 会断连）
@@ -888,9 +897,12 @@ class PlcConfig:
     # 终态（涂油完成/异常）在 PLC 上保持多久再回工步 1。
     # 现场要求「良品完成和漏涂 NG 时灯4 保持亮 2 秒」，所以默认 2s。
     hold_s: float = 2.0
-    # 工步编号：取料记在第几步、涂油结论记在第几步。
-    # 位 = 灯号，且灯1 只能红，所以默认从第 2 盏灯起：2 / 4。
-    steps: dict[str, int] = field(default_factory=lambda: {"pick": 2, "oiling": 4})
+    # 工步编号：取料记在第几步、涂油结论记在第几步、上一件结果记在第几盏。
+    # 位 = 灯号，且灯1 只能红，所以默认从第 2 盏灯起：2 / 4 / 5。
+    # result=0 表示不显示上一件结果。
+    steps: dict[str, int] = field(
+        default_factory=lambda: {"pick": 2, "oiling": 4, "result": 5}
+    )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> PlcConfig:
@@ -926,32 +938,40 @@ class PlcConfig:
         steps_raw = data.get("steps")
         steps = dict(d.steps)
         if isinstance(steps_raw, dict):
-            for key in ("pick", "oiling"):
+            for key in ("pick", "oiling", "result"):
                 if key in steps_raw:
+                    # result 允许 0（关闭），其余灯位从 1 起
+                    lo = 0 if key == "result" else 1
                     value = _scalar_int(
-                        "plc", f"steps.{key}", steps_raw[key], steps[key], 1, 8
+                        "plc", f"steps.{key}", steps_raw[key], steps[key], lo, 8
                     )
                     steps[key] = value
         # 约束（位 = 灯号，只有 PLC_LAMP_COUNT 盏灯，且灯1 只能红）：
-        # - ``pick`` 必须 ≥ 2：bit0 对应灯1，实测它绿位无反应、黄位直接亮红，
-        #   不能用来表示「进行中」；
+        # - ``1 <= pick <= 3``：bit0 对应灯1，实测它绿位无反应、黄位直接亮红。
+        #   ``pick=1`` 只在「漏涂时灯1 本来就该红」的前提下成立（良品时它不亮），
+        #   默认仍用 2；
         # - ``oiling == pick + 2``：取料完成亮到第 ``pick+1`` 盏绿，涂油中亮到
         #   第 ``oiling-1`` 盏绿 + 第 ``oiling`` 盏黄，两者相等才单调；
-        # - ``oiling <= PLC_LAMP_COUNT``：红灯要有对应的灯可亮。
+        # - ``oiling <= 4``：进度灯只占前 4 盏，后面留给结果灯；
+        # - ``result == 0``（关闭）或 ``oiling < result <= PLC_LAMP_COUNT``：
+        #   结果灯不能与进度灯重叠。
         if not (
-            2 <= steps["pick"]
+            1 <= steps["pick"] <= 3
             and steps["oiling"] == steps["pick"] + 2
-            and steps["oiling"] <= PLC_LAMP_COUNT
+            and steps["oiling"] <= 4
+            and (
+                steps["result"] == 0
+                or steps["oiling"] < steps["result"] <= PLC_LAMP_COUNT
+            )
         ):
             _warn_bad_value(
                 "plc",
                 "steps",
                 steps_raw,
-                {"pick": d.steps["pick"], "oiling": d.steps["oiling"]},
+                dict(d.steps),
             )
             steps = dict(d.steps)
 
-        order = str(data.get("byte_order", d.byte_order)).strip().lower()
         return cls(
             enabled=_bool("enabled", d.enabled),
             dry_run=_bool("dry_run", d.dry_run),
@@ -959,7 +979,6 @@ class PlcConfig:
             port=_int("port", d.port, 1, 65535),
             unit_id=_int("unit_id", d.unit_id, 0, 255),
             register_base=_int("register_base", d.register_base, 0, 65535),
-            byte_order=order if order in _PLC_BYTE_ORDERS else d.byte_order,
             station_id=str(data.get("station_id", d.station_id)).strip(),
             poll_interval_ms=_int("poll_interval_ms", d.poll_interval_ms, 20, 5000),
             refresh_interval_s=_float(
@@ -984,7 +1003,6 @@ class PlcConfig:
             "port": self.port,
             "unit_id": self.unit_id,
             "register_base": self.register_base,
-            "byte_order": self.byte_order,
             "station_id": self.station_id,
             "poll_interval_ms": self.poll_interval_ms,
             "refresh_interval_s": self.refresh_interval_s,
@@ -1530,6 +1548,17 @@ class OilCheckConfigService:
                     pipeline.pop(key)
                     changed.append(f"-pipeline.{key}")
 
+        # 4.65) 2.10 删掉 plc.byte_order：从未接进写入路径，改它无效。
+        #       同样不看版本号，键存在就删，幂等。
+        #       2.11 删掉 plc.result_hold_s：结果灯改为常亮到下一个结论，
+        #       不再按时间自动灭，这个时长没有消费方。
+        plc_section = data.get("plc")
+        if isinstance(plc_section, dict):
+            for key in _PLC_REMOVED_2_10 + _PLC_REMOVED_2_11:
+                if key in plc_section:
+                    plc_section.pop(key)
+                    changed.append(f"-plc.{key}")
+
         # 4.45) 检测置信度必须低于 ByteTrack 高置信度阈值，否则低分框在
         #       检测层就被丢掉，第二阶段补救关联永远收不到输入。旧配置里
         #       常见的 0.5 > 0.3 就属于这种情况，等价于关掉了第二阶段。
@@ -1877,10 +1906,6 @@ CONFIG_COMMENTS: dict[str, str] = {
     "plc.port": "Modbus TCP 端口，现场协议表为 502",
     "plc.unit_id": "从站 unit id。该 PLC 不校验（实测 0/1/2/255 都接受）",
     "plc.register_base": "保持寄存器首地址。现场协议表从 0 开始（不是 40001）",
-    "plc.byte_order": (
-        "字节序：lsb = 寄存器低字节是编号较小的 VB（协议表四个例子自证的读法），"
-        "msb = 反过来。除非现场确认字节序相反，不要改"
-    ),
     "plc.station_id": "取哪个工位的判定状态；留空 = 第一个启用的工位",
     "plc.poll_interval_ms": (
         "一拍周期。PLC 空闲 10~18s 会断连，且只允许一条 Modbus 会话，"
@@ -1900,12 +1925,16 @@ CONFIG_COMMENTS: dict[str, str] = {
         "现场要求灯4 亮 2 秒，默认 2.0"
     ),
     "plc.steps": (
-        "工步编号：取料记在第几步、涂油结论记在第几步。位 = 灯号（bit(n-1) → "
-        "第 n 盏），灯1 只能红所以从第 2 盏起用；默认 pick=2 / oiling=4，"
-        "要求 pick>=2、oiling=pick+2、oiling<=8"
+        "灯位编号。位 = 灯号（bit(n-1) → 第 n 盏）。pick 取料、oiling 涂油结论、"
+        "result 上一件检测结果；默认 2 / 4 / 5，要求 1<=pick<=3、oiling=pick+2 "
+        "且 <=4（进度灯只占前 4 盏）、result=0 或 oiling<result<=8"
     ),
-    "plc.steps.pick": "取料记在第几盏灯（>=2，灯1 只能红；oiling 必须 = pick+2）",
-    "plc.steps.oiling": "涂油结论记在第几盏灯（= pick+2，<=8）",
+    "plc.steps.pick": "取料记在第几盏灯（1~3，灯1 只能红；oiling 必须 = pick+2）",
+    "plc.steps.oiling": "涂油结论记在第几盏灯（= pick+2，<=4）",
+    "plc.steps.result": (
+        "上一件检测结果记在第几盏灯（默认 5，必须 > oiling；0 = 不显示）。"
+        "切换结论时先闪 0.3 秒黄，再常亮（良品绿、漏涂红）到下一个结论到来"
+    ),
     # ---- stations ----
     "stations": "工位列表，每个工位一台相机",
     "stations[].station_id": "工位 ID，事件与日志里用它区分",

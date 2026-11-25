@@ -333,13 +333,6 @@ class OilCheckService:
                 cfg.register_base,
             )
             return
-        if cfg.byte_order != "lsb":
-            # 协议表的四个例子只在 lsb 下成立。选了 msb 说明现场确认过相反，
-            # 但这是高风险配置，日志里明确留痕。
-            self._logger.warning(
-                "PLC 字节序配置为 %s（非默认 lsb），请确认已与 PLC 侧逐位核对",
-                cfg.byte_order,
-            )
         self._plc = PlcIoThread(
             cfg=cfg,
             evidence_source=self._plc_evidence,

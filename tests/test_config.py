@@ -25,8 +25,8 @@ def test_repo_oilcheck_template_is_valid():
     data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
-    assert cfg.version == "2.9"
-    assert data["version"] == "2.9"
+    assert cfg.version == "2.11"
+    assert data["version"] == "2.11"
     assert cfg.stations
     station = cfg.stations[0]
     assert station.station_id == "ST01"
@@ -203,7 +203,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.9"
+    assert cfg.version == "2.11"
     assert station.detector.kind == "yolo"
     assert station.detector.model_path.endswith("best.pt")
     assert station.detector.brush_label == "brush"
@@ -272,7 +272,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.9"
+    assert cfg.version == "2.11"
     # 用户调过的 ROI 与判定参数保留
     assert station.tray_roi.points == ((0.5, 0.1), (0.72, 0.44))
     assert station.work_roi.points == ((0.35, 0.0), (0.99, 0.95))
@@ -454,7 +454,7 @@ def test_tracking_threshold_migrates_only_from_old_default(tmp_path):
 
     path = _write_config(tmp_path, _old_default)
     cfg = OilCheckConfigService(path.parent).load()
-    assert cfg.version == "2.9"
+    assert cfg.version == "2.11"
     assert cfg.pipeline.bytetrack_high_thresh == 0.45
     # 新键补默认值（关闭），不会因为迁移被打开
     assert cfg.pipeline.brush_spawn_max_distance == 0.0
@@ -727,7 +727,7 @@ def test_repo_template_is_commented():
     text = path.read_text(encoding="utf-8")
     assert "//" in text, "模板应带注释"
     # 注释不破坏可解析性
-    assert json.loads(strip_json_comments(text))["version"] == "2.9"
+    assert json.loads(strip_json_comments(text))["version"] == "2.11"
 
 
 def test_save_preserves_comments(tmp_path):
@@ -1028,8 +1028,7 @@ def test_plc_config_defaults_are_off_and_read_only():
     assert cfg.host == "192.168.1.88"
     assert cfg.port == 502
     assert cfg.register_base == 0
-    assert cfg.byte_order == "lsb"
-    assert cfg.steps == {"pick": 2, "oiling": 4}
+    assert cfg.steps == {"pick": 2, "oiling": 4, "result": 5}
 
 
 def test_plc_config_roundtrips():
@@ -1047,7 +1046,7 @@ def test_plc_config_roundtrips():
     assert cfg.dry_run is False
     assert cfg.host == "10.0.0.5"
     assert cfg.hold_s == 2.5
-    assert cfg.steps == {"pick": 2, "oiling": 4}
+    assert cfg.steps == {"pick": 2, "oiling": 4, "result": 5}
     assert PlcConfig.from_dict(cfg.to_dict()).to_dict() == cfg.to_dict()
 
 
@@ -1056,17 +1055,15 @@ def test_plc_config_rejects_bad_values():
 
     cfg = PlcConfig.from_dict(
         {
-            "byte_order": "middle",
             "hold_s": "x",
             "reconnect_backoff_ms": "nope",
             "steps": {"pick": 99, "oiling": 0},
         }
     )
-    assert cfg.byte_order == "lsb"
     assert cfg.hold_s == 2.0
     assert cfg.reconnect_backoff_ms == (200, 500, 1000, 2000, 5000)
     # 越界工步号回退默认，不写进配置
-    assert cfg.steps == {"pick": 2, "oiling": 4}
+    assert cfg.steps == {"pick": 2, "oiling": 4, "result": 5}
 
 
 def test_legacy_config_gets_plc_section(tmp_path):
@@ -1091,6 +1088,70 @@ def test_legacy_config_gets_plc_section(tmp_path):
     assert data["plc"]["enabled"] is False
     assert data["plc"]["dry_run"] is True
     assert data["plc"]["host"] == "192.168.1.88"
+
+
+def test_migration_removes_obsolete_plc_byte_order(tmp_path):
+    """2.10 起删掉 plc.byte_order：它从未接进写入路径，改它无效。
+
+    旧配置里存在这个键时必须被清掉，否则「当前版本不认识的键」会一直挂在
+    文件里，并且每次加载都留一条警告。
+    """
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "oilcheck.json").write_text(
+        json.dumps(
+            {
+                "version": "2.9",
+                "plc": {"enabled": False, "byte_order": "msb", "steps": {"pick": 2, "oiling": 4}},
+                "demo": {"videos": []},
+                "stations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    from app.oilcheck.config import OilCheckConfigService
+
+    OilCheckConfigService(config_dir).load()
+    data = json.loads(
+        strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    )
+    assert "byte_order" not in data["plc"]
+    assert data["version"] == "2.11"
+
+
+def test_migration_removes_obsolete_plc_result_hold_s(tmp_path):
+    """2.11 起删掉 plc.result_hold_s：结果灯改为常亮到下一个结论。
+
+    这个时长已经没有消费方，留着只会让现场以为改它有效。
+    """
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "oilcheck.json").write_text(
+        json.dumps(
+            {
+                "version": "2.10",
+                "plc": {
+                    "enabled": False,
+                    "result_hold_s": 8.0,
+                    "steps": {"pick": 2, "oiling": 4, "result": 5},
+                },
+                "demo": {"videos": []},
+                "stations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    from app.oilcheck.config import OilCheckConfigService
+
+    cfg = OilCheckConfigService(config_dir).load()
+    assert not hasattr(cfg.plc, "result_hold_s")
+    data = json.loads(
+        strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
+    )
+    assert "result_hold_s" not in data["plc"]
+    assert data["version"] == "2.11"
 
 
 def test_console_filter_drops_file_only_records(tmp_path):
@@ -1316,28 +1377,39 @@ def test_plc_string_booleans_are_parsed():
 
 
 def test_plc_step_order_is_validated():
-    """8 盏灯，但灯1 只能红，所以 pick 必须 ≥ 2 且 oiling = pick + 2。
+    """进度灯占前 4 盏，结果灯在其后；oiling 必须 = pick + 2。
 
-    位 = 灯号：pick=1 会用灯1（绿位无反应、黄位直接亮红）；oiling≠pick+2
-    会让绿灯位数不单调；oiling>8 则红灯没有对应的灯。
+    位 = 灯号：pick=1 只在「漏涂时灯1 本来就该红」时可用；oiling≠pick+2
+    会让绿灯位数不单调；进度灯超过第 4 盏会占掉结果灯的位置；结果灯与
+    进度灯重叠或超出灯数都不允许。
     """
 
     from app.oilcheck.config import PlcConfig
 
-    default = {"pick": 2, "oiling": 4}
+    default = {"pick": 2, "oiling": 4, "result": 5}
     for steps in (
-        {"pick": 1, "oiling": 3},  # 用了灯1
+        {"pick": 0, "oiling": 2},  # pick 从 1 起
         {"pick": 3, "oiling": 3},  # oiling != pick+2
         {"pick": 5, "oiling": 2},  # 倒序
         {"pick": 2, "oiling": 5},  # oiling != pick+2
         {"pick": 7, "oiling": 9},  # 超出灯数
+        {"pick": 4, "oiling": 6},  # 进度灯占掉第 5 盏
+        {"pick": 2, "oiling": 4, "result": 3},  # 结果灯与进度灯重叠
     ):
         assert PlcConfig.from_dict({"steps": steps}).steps == default, steps
-    # 合法组合原样保留（pick=3/oiling=5 → 灯3/4/5）
-    assert PlcConfig.from_dict({"steps": {"pick": 3, "oiling": 5}}).steps == {
-        "pick": 3,
-        "oiling": 5,
+    # 合法组合原样保留（pick=3/oiling=5 不行——进度灯只占前 4 盏）
+    assert PlcConfig.from_dict({"steps": {"pick": 1, "oiling": 3}}).steps == {
+        "pick": 1,
+        "oiling": 3,
+        "result": 5,
     }
+    # 结果灯可以关掉，也可以往后挪
+    assert PlcConfig.from_dict(
+        {"steps": {"pick": 2, "oiling": 4, "result": 0}}
+    ).steps == {"pick": 2, "oiling": 4, "result": 0}
+    assert PlcConfig.from_dict(
+        {"steps": {"pick": 2, "oiling": 4, "result": 8}}
+    ).steps == {"pick": 2, "oiling": 4, "result": 8}
 
 
 def test_migration_keeps_station_with_only_pick_roi(tmp_path):

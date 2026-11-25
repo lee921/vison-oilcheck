@@ -30,8 +30,24 @@ def _ev(
     )
 
 
-def _mapper(hold_s: float = 1.0) -> PlcStepMapper:
-    return PlcStepMapper(hold_s=hold_s, steps={"pick": 2, "oiling": 4})
+def _mapper(
+    hold_s: float = 1.0,
+    *,
+    steps: dict[str, int] | None = None,
+) -> PlcStepMapper:
+    return PlcStepMapper(
+        hold_s=hold_s,
+        steps=steps or {"pick": 2, "oiling": 4, "result": 0},
+    )
+
+
+def _mapper_with_result(hold_s: float = 1.0):
+    """带结果灯（默认灯5）的映射器：多数结果灯用例用它。"""
+
+    return PlcStepMapper(
+        hold_s=hold_s,
+        steps={"pick": 2, "oiling": 4, "result": 5},
+    )
 
 
 # ----------------------------------------------------------------------
@@ -316,16 +332,17 @@ def test_waiting_pick_stage_maps_to_step1():
 @pytest.mark.parametrize(
     ("pick", "oiling", "expect_green"),
     [
-        # 灯1 只能红，pick 必须 ≥ 2；绿从第 pick 位累计到第 oiling 位
+        # 绿从第 pick 位累计到第 oiling 位；进度灯只占前 4 盏
+        (1, 3, 0b00000111),
         (2, 4, 0b00001110),
-        (3, 5, 0b00011100),
-        (5, 7, 0b01110000),
     ],
 )
 def test_step_numbers_are_configurable(
     pick: int, oiling: int, expect_green: int
 ):
-    mapper = PlcStepMapper(hold_s=1.0, steps={"pick": pick, "oiling": oiling})
+    mapper = PlcStepMapper(
+        hold_s=1.0, steps={"pick": pick, "oiling": oiling, "result": 0}
+    )
     frame = mapper.update(
         _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1), 0.0
     )
@@ -338,11 +355,13 @@ def test_invalid_step_numbers_fall_back_to_default():
     """灯1 不能用（只能红）、oiling 必须 = pick+2 且不超过灯数。"""
 
     for steps in (
-        {"pick": 1, "oiling": 3},  # 用了灯1
-        {"pick": 1, "oiling": 4},  # 用了灯1，且顺序不对
+        {"pick": 0, "oiling": 2},  # pick 从 1 起
+        {"pick": 4, "oiling": 6},  # 进度灯只占前 4 盏
         {"pick": 3, "oiling": 4},  # oiling != pick+2
         {"pick": 8, "oiling": 10},  # 超出灯数
         {"pick": 5, "oiling": 2},  # 倒序
+        {"pick": 2, "oiling": 4, "result": 3},  # 结果灯与进度灯重叠
+        {"pick": 2, "oiling": 4, "result": 9},  # 结果灯超出灯数
     ):
         mapper = PlcStepMapper(hold_s=1.0, steps=steps)
         frame = mapper.update(
@@ -505,3 +524,108 @@ def test_superseded_reported_when_new_task_is_processing():
     )
     assert current is not None and current.task_id == "TASK-2"
     assert superseded is not None and superseded.task_id == "TASK-1"
+
+
+# ----------------------------------------------------------------------
+# 结果灯（默认灯5）：显示上一件检测结果
+#
+# 现场要求：切换到一个新的检测结果时**先闪一下黄**，然后常亮（良品绿、
+# 漏涂红），**一直亮到下一个结果到来**，不按时间自动灭。同一件不会被重复
+# 闪——工步 4 的保持窗里每拍都在重算帧，不判重的话闪烁会随节拍反复重放。
+# ----------------------------------------------------------------------
+def test_result_lamp_flashes_yellow_then_green_for_ok():
+    mapper = _mapper_with_result(hold_s=1.0)
+    done = _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1)
+
+    # 新结论到来的第一拍：黄闪，灯5 只亮黄（绿位要清掉）
+    flash = mapper.update(done, 0.0)
+    assert flash.lamps[4] == "yellow"
+    assert flash.vb0 & 0b10000 == 0
+    assert flash.vb1 & 0b10000
+
+    # 闪完转常亮：灯5 绿
+    steady = mapper.update(done, 0.5)
+    assert steady.lamps[4] == "green"
+
+    # 一直常亮，不按时间灭（远超过旧的 5 秒窗口）
+    assert mapper.update(done, 4.0).lamps[4] == "green"
+    assert mapper.update(done, 5.5).lamps[4] == "green"
+    assert mapper.update(done, 3600.0).lamps[4] == "green"
+
+
+def test_result_lamp_flashes_yellow_then_red_for_ng():
+    mapper = _mapper_with_result(hold_s=1.0)
+    done = _ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.2)
+
+    assert mapper.update(done, 0.0).lamps[4] == "yellow"
+    # 红 = 同一位绿+黄
+    red = mapper.update(done, 0.5)
+    assert red.lamps[4] == "red"
+    assert red.vb0 & 0b10000 and red.vb1 & 0b10000
+    # 常亮到下一个结论
+    assert mapper.update(done, 60.0).lamps[4] == "red"
+
+
+def test_result_lamp_flash_is_not_replayed_within_the_same_task():
+    """保持窗里每拍都重算帧：同一件不能反复重闪黄。"""
+
+    mapper = _mapper_with_result(hold_s=3.0)
+    done = _ev(stage=TaskStage.OILED, result=TaskResult.COMPLETED, brush=1.1)
+    mapper.update(done, 0.0)  # 闪
+    for tick in (0.2, 0.4, 0.6, 0.8, 1.0):
+        assert mapper.update(done, tick).lamps[4] in ("yellow", "green")
+    # 闪烁阶段过后必须一直是绿，不再回到黄
+    for tick in (1.5, 2.0, 2.5):
+        assert mapper.update(done, tick).lamps[4] == "green"
+
+
+def test_new_task_result_flashes_again():
+    """下一件判完时结果灯重新闪一次，显示的是新的结论。"""
+
+    mapper = _mapper_with_result(hold_s=0.5)
+    ok = _ev(task_id="T1", stage=TaskStage.OILED, result=TaskResult.COMPLETED)
+    ng = _ev(task_id="T2", stage=TaskStage.OILED, result=TaskResult.NG)
+    mapper.update(ok, 0.0)
+    assert mapper.update(ok, 0.5).lamps[4] == "green"
+
+    # 下一件在半秒后判完：先闪黄
+    assert mapper.update(ng, 1.0).lamps[4] == "yellow"
+    # 再显示红
+    assert mapper.update(ng, 1.5).lamps[4] == "red"
+
+
+def test_result_lamp_survives_hold_window_and_next_pick():
+    """结果灯与工步 4 的保持窗是两条时间线。
+
+    工步 4 只亮 1 秒（hold_s）；保持窗结束后回到工步 1、下一件正在取料时，
+    灯5 仍要一直显示上一件的结论，直到下一个结果到来。
+    """
+
+    mapper = _mapper_with_result(hold_s=1.0)
+    done = _ev(task_id="T1", stage=TaskStage.OILED, result=TaskResult.NG)
+    mapper.update(done, 0.0)
+    mapper.update(done, 0.5)  # 常亮红
+
+    # 保持窗结束时回到工步 1，但结果灯还在
+    idle = mapper.update(done, 1.2)
+    assert idle.step == ProcessStep.IDLE
+    assert idle.lamps[4] == "red"
+
+    # 下一件已取料：进度灯换成工步 2，结果灯仍是上一件的红
+    picked = mapper.update(_ev(task_id="T2", brush=0.0), 1.5)
+    assert picked.step == ProcessStep.PICKED
+    assert picked.lamps[4] == "red"
+
+    # 很久之后仍亮着（不再自动灭）
+    later = mapper.update(_ev(task_id="T2", brush=0.0), 600.0)
+    assert later.lamps[4] == "red"
+
+
+def test_result_lamp_off_by_zero():
+    """``steps.result = 0`` 关闭结果灯：灯5 永远不亮。"""
+
+    mapper = _mapper()
+    done = _ev(stage=TaskStage.OILED, result=TaskResult.NG, brush=0.2)
+    for tick in (0.0, 0.5, 2.0, 6.0):
+        assert mapper.update(done, tick).lamps[4] is None
+

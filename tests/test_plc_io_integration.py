@@ -95,7 +95,13 @@ def slave():
         server.stop()
 
 
-def _plc_cfg(port: int, *, dry_run: bool = False, hold_s: float = 0.15) -> PlcConfig:
+def _plc_cfg(
+    port: int,
+    *,
+    dry_run: bool = False,
+    hold_s: float = 0.15,
+    steps: dict[str, int] | None = None,
+) -> PlcConfig:
     return replace(
         PlcConfig(),
         enabled=True,
@@ -105,6 +111,10 @@ def _plc_cfg(port: int, *, dry_run: bool = False, hold_s: float = 0.15) -> PlcCo
         poll_interval_ms=20,
         refresh_interval_s=0.1,
         hold_s=hold_s,
+        # 默认关掉结果灯（steps.result=0）：这些用例逐个断言工步字节，
+        # 结果灯在灯5 上闪烁会同时改变两个寄存器，把断言搅乱。
+        # 结果灯本身由下面的 test_result_lamp_* 专门验证。
+        steps=steps or {"pick": 2, "oiling": 4, "result": 0},
         connect_timeout_s=1.0,
         request_timeout_s=0.5,
         reconnect_backoff_ms=(20, 50, 100),
@@ -241,6 +251,75 @@ def test_offline_clears_yellow_only(slave):
         thread.stop()
 
 
+def test_result_lamp_flashes_then_holds_ok_on_lamp5(slave):
+    """结果灯（灯5）走真实写入路径：先黄闪，再常亮绿，一直亮到下一个结论。
+
+    闪烁固定 0.3 s，之后常亮不自动灭。``hold_s`` 设成 0.4 s，让工步 4 很快
+    结束回到等待取料，用来验证结果灯不受工步保持窗影响：回到工步 1 之后
+    灯5 仍是绿的。
+    灯5 = bit4：VB0 置位是绿、VB1 置位是黄、两者同置是红。
+    """
+
+    done = PlcEvidence(
+        online=True,
+        task_id="T1",
+        stage=TaskStage.OILED,
+        final_result=TaskResult.COMPLETED,
+        brush_hold_s=1.1,
+    )
+    cfg = _plc_cfg(
+        slave.port, hold_s=0.4, steps={"pick": 2, "oiling": 4, "result": 5}
+    )
+    thread = PlcIoThread(cfg=cfg, evidence_source=lambda: done)
+    thread.start()
+    try:
+        seen = lambda value: _wait(  # noqa: E731
+            lambda: value in [w[0] for w in slave.writes], timeout=3.0
+        )
+        # 黄闪：工步 4 三盏绿 + 灯5 黄（VB0=0x0E，VB1=0x10）
+        assert seen(0x100E)
+        # 常亮绿：灯2/3/4/5 全绿（VB0=0x1E，VB1=0x00）
+        assert seen(0x001E)
+        # 保持窗结束后回工步 1（灯2 黄），灯5 仍是绿：VB0=0x10、VB1=0x02
+        assert seen(0x0210)
+        # 结果灯**不会**自动灭：0x0200（工步 1、灯5 灭）只会出现在启动那一帧
+        # （压上电残留值），判出结论之后再也没写过
+        values = [w[0] for w in slave.writes]
+        assert values.count(0x0200) == 1
+        assert values.index(0x0200) < values.index(0x100E)
+        assert values[-1] == 0x0210
+        assert all(w[1] == 0 for w in slave.writes), "HR1 必须恒 0"
+    finally:
+        thread.stop()
+
+
+def test_result_lamp_shows_red_on_ng(slave):
+    """漏涂：结果灯常亮红（同一位绿+黄），与工步 4 的红是两盏不同的灯。"""
+
+    done = PlcEvidence(
+        online=True,
+        task_id="T1",
+        stage=TaskStage.OILED,
+        final_result=TaskResult.NG,
+        brush_hold_s=0.2,
+    )
+    cfg = _plc_cfg(
+        slave.port, hold_s=3.0, steps={"pick": 2, "oiling": 4, "result": 5}
+    )
+    thread = PlcIoThread(cfg=cfg, evidence_source=lambda: done)
+    thread.start()
+    try:
+        seen = lambda value: _wait(  # noqa: E731
+            lambda: value in [w[0] for w in slave.writes], timeout=3.0
+        )
+        # 黄闪：灯4 红（VB0/VB1 各 0x08）+ 灯5 黄（VB1 再加 0x10）
+        assert seen(0x180E)
+        # 常亮红：灯4 红 + 灯5 红 → VB0=0x1E，VB1=0x18
+        assert seen(0x181E)
+    finally:
+        thread.stop()
+
+
 def test_dry_run_never_writes(slave):
     """只读模式只算帧，一个字节都不许写。"""
 
@@ -331,7 +410,9 @@ def test_plc_config_enabled_builds_thread(tmp_path):
     service = _build(
         replace(
             base,
-            plc=replace(base.plc, enabled=True, host="127.0.0.1", port=1),
+            plc=replace(
+                base.plc, enabled=True, dry_run=True, host="127.0.0.1", port=1
+            ),
         )
     )
     try:

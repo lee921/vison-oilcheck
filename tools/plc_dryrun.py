@@ -161,8 +161,8 @@ def main() -> int:
     print(f"配置: {cfg_service.config_path}")
     print(
         f"PLC: {cfg.plc.host}:{cfg.plc.port} unit={cfg.plc.unit_id} "
-        f"字节序={cfg.plc.byte_order} 工步={cfg.plc.steps} "
-        f"保持窗={cfg.plc.hold_s if args.hold is None else args.hold}s"
+        f"灯位={cfg.plc.steps} "
+        f"保持窗={cfg.plc.hold_s if args.hold is None else args.hold}s "
     )
     print("本工具不连接 PLC，只打印每一拍应该写出的字节。")
 

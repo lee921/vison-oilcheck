@@ -401,3 +401,33 @@ def test_event_table_pages_through_event_history():
     finally:
         page.deleteLater()
         app.processEvents()
+
+
+# ----------------------------------------------------------------------
+# PLC 灯色芯片：灯5 是上一件检测结果
+# ----------------------------------------------------------------------
+def test_lamp_chip_shows_five_lamps_including_result_lamp():
+    """监控页灯色要显示到灯5——工步位只占灯2~灯4，灯5 是上一件结果。"""
+
+    from app.oilcheck.plc_io import PlcFrame, ProcessStep
+    from ui.pages.monitor_page import _lamp_chip_text
+
+    def chip(frame: PlcFrame) -> str:
+        return _lamp_chip_text(frame.to_dict())
+
+    # 工步 3 涂油中 + 灯5 黄闪（VB0=0x06, VB1=0x18）
+    assert chip(PlcFrame(vb0=0x06, vb1=0x18, vb2=0, step=ProcessStep.OILING)) == (
+        "灭 🟢 🟢 🟡 🟡"
+    )
+    # 良品 + 灯5 常亮绿（VB0=0x1E）
+    assert chip(PlcFrame(vb0=0x1E, vb1=0, vb2=0, step=ProcessStep.FINISHED)) == (
+        "灭 🟢 🟢 🟢 🟢"
+    )
+    # 漏涂 + 灯5 常亮红（VB0=0x1E, VB1=0x18）
+    assert chip(PlcFrame(vb0=0x1E, vb1=0x18, vb2=0, step=ProcessStep.FINISHED)) == (
+        "灭 🟢 🟢 🔴 🔴"
+    )
+    # 灯6~灯8 不显示，避免把芯片挤满（8 盏全绿+全黄也只看前 5 盏）
+    assert chip(PlcFrame(vb0=0xFF, vb1=0xFF, vb2=0, step=ProcessStep.IDLE)) == (
+        "🔴 🔴 🔴 🔴 🔴"
+    )

@@ -224,24 +224,32 @@ LAMP_COUNT = PLC_LAMP_COUNT
 
 @dataclass(frozen=True)
 class _StepBits:
-    """工步号配置：取料记在第几步、涂油结论记在第几步。
+    """工步号配置：取料记在第几步、涂油结论记在第几步、上一件结果记在第几盏。
 
-    默认 2/4：现场流程是「等待取料 → 取料完成 → 涂油中 → 涂油完成/异常」，
-    取料占第 2 盏灯、涂油占第 4 盏（第 3 盏是「取料已完成、等待涂油」的过程位）。
+    默认 ``pick=2``、``oiling=4``、``result=5``：现场流程是「等待取料 → 取料完成
+    → 涂油中 → 涂油完成/异常」，取料占第 2 盏灯、涂油占第 4 盏（第 3 盏是
+    「取料已完成、等待涂油」的过程位），第 5 盏专门显示**上一件的检测结果**。
 
     为什么从第 2 盏起：**灯1 只能红**（实测 VB0.bit0 无反应、VB1.bit0 直接
     亮红），用它表示「等待取料」会显示成红灯，正是现场最初反馈的问题。
 
+    工步位只允许落在前 4 盏（``oiling <= 4``）：5 盏之后留给结果灯，否则
+    结果灯会与进度灯重叠。
+
     约束（位 = 灯号，共 :data:`LAMP_COUNT` 盏灯）：
 
-    - ``pick >= 2``：不用灯1；
+    - ``1 <= pick <= 3``：``pick=1`` 只在「漏涂时灯1 本来就该红」的前提下可用
+      （灯1 没有绿/黄，良品时它不亮）；
     - ``oiling == pick + 2``：取料完成亮到第 ``pick+1`` 盏绿，涂油中亮到
       第 ``oiling-1`` 盏绿 + 第 ``oiling`` 盏黄，两者相等才单调；
-    - ``oiling <= LAMP_COUNT``：红灯要有对应的灯可亮。
+    - ``oiling <= 4``：进度灯只占前 4 盏；
+    - ``result > oiling``：结果灯不能与进度灯重叠；0 = 关闭。
     """
 
     pick: int = 2
     oiling: int = 4
+    # 上一件检测结果灯：0 = 不显示
+    result: int = 5
 
     @classmethod
     def from_steps(cls, steps: dict[str, int]) -> _StepBits:
@@ -250,22 +258,29 @@ class _StepBits:
                 value = int(raw)
             except (TypeError, ValueError):
                 return default
-            return value if 1 <= value <= 8 else default
+            return value if 0 <= value <= LAMP_COUNT else default
 
         pick = _clamp(steps.get("pick"), 2)
         oiling = _clamp(steps.get("oiling"), 4)
-        if pick < 2 or oiling != pick + 2 or oiling > LAMP_COUNT:
+        result = _clamp(steps.get("result"), 5)
+        if (
+            not 1 <= pick <= 3
+            or oiling != pick + 2
+            or oiling > 4
+            or result != 0
+            and not oiling < result <= LAMP_COUNT
+        ):
             logger.warning(
-                "PLC 工步配置非法（pick=%d oiling=%d）：%d 盏灯要求 "
-                "pick>=2（灯1 只能红）、oiling=pick+2、oiling<=%d，"
-                "已回退默认 2/4",
+                "PLC 工步配置非法（pick=%d oiling=%d result=%d）：要求 "
+                "1<=pick<=3、oiling=pick+2 且 <=4（进度灯只占前 4 盏）、"
+                "result=0 或 oiling<result<=%d，已回退默认 2/4/5",
                 pick,
                 oiling,
-                LAMP_COUNT,
+                result,
                 LAMP_COUNT,
             )
             return cls()
-        return cls(pick=pick, oiling=oiling)
+        return cls(pick=pick, oiling=oiling, result=result)
 
 
 def _bit(step: int) -> int:
@@ -292,7 +307,7 @@ class _MapperState:
     """``PlcStepMapper`` 的可变内部状态。
 
     单独拆出来是为了让「映射规则」与「状态」分开读：规则在
-    :meth:`PlcStepMapper.update`，状态只有这 6 个字段。
+    :meth:`PlcStepMapper.update`，状态只有这些字段。
     """
 
     last_task_id: str | None = None
@@ -309,11 +324,27 @@ class _MapperState:
     # 「涂油中」，工步会一直冻在那里（警示灯整夜显示涂油中）。
     no_task_since: float | None = None
     last_frame: PlcFrame | None = None
+    # ---- 结果灯（显示上一件的检测结果）----
+    # 已经显示过结论的 task_id。同一条周期反复出现在快照里时不能反复重闪。
+    result_task_id: str | None = None
+    # 结论：``"ok"`` / ``"ng"``；还没出过结论为 None。
+    result_verdict: str | None = None
+    # 结论第一次被看到（也就是这次闪烁的起点）的墙钟时刻。
+    result_flash_started_at: float | None = None
+    # 闪烁是否已经结束。闪烁只在「切换到新结论」时闪一次；结束之后常亮
+    # **直到下一个结论到来**，不按时间自动灭。
+    result_flashed: bool = False
 
 
 # 「快照里没有任务」持续超过这个时长就回落 IDLE。取得比完成保持窗长，
 # 避免清理把工步从 4 拉回 1；但又必须有限，否则重置后永久冻结。
 _NO_TASK_IDLE_TIMEOUT_S = 5.0
+
+# 结果灯（默认灯5）：新结论到来时先闪一下黄，再常亮显示结论，**一直亮到
+# 下一个结论到来**（现场要求：不自动灭）。闪烁只在**切换结论**时发生——
+# 同一件反复出现在快照里不会重闪，否则工步 4 的保持窗每过一秒就把闪烁重放
+# 一遍。
+_RESULT_FLASH_S = 0.3
 
 
 def _resolve_step(ev: PlcEvidence) -> tuple[ProcessStep, str]:
@@ -345,7 +376,12 @@ class PlcStepMapper:
        可见之间有观察空档。此时**不能**回工步 1，要等保持窗自然到期。
     """
 
-    def __init__(self, *, hold_s: float = 1.0, steps: dict[str, int] | None = None):
+    def __init__(
+        self,
+        *,
+        hold_s: float = 1.0,
+        steps: dict[str, int] | None = None,
+    ):
         self._hold_s = max(0.0, float(hold_s))
         self._bits = _StepBits.from_steps(steps or {})
         self._state = _MapperState()
@@ -370,7 +406,7 @@ class PlcStepMapper:
         """
 
         self._state = _MapperState()
-        frame = self._make_frame(ProcessStep.IDLE, None, "启动时先写等待取料")
+        frame = self._make_frame(ProcessStep.IDLE, None, "启动时先写等待取料", 0.0)
         self._state.last_frame = frame
         return frame
 
@@ -392,6 +428,7 @@ class PlcStepMapper:
                 vb0 = prev.vb0
                 # 纯黄 = 有黄没绿；红 = 绿+黄，保留它的黄位
                 vb1 = prev.vb1 & prev.vb0
+            vb0, vb1 = self._apply_result_lamp(vb0, vb1, now)
             frame = PlcFrame(
                 vb0=vb0,
                 vb1=vb1,
@@ -409,7 +446,7 @@ class PlcStepMapper:
         if st.current_step == ProcessStep.FINISHED and st.finished_at is not None:
             if now - st.finished_at < self._hold_s:
                 frame = self._make_frame(
-                    ProcessStep.FINISHED, st.last_task_id, "完成保持窗内"
+                    ProcessStep.FINISHED, st.last_task_id, "完成保持窗内", now
                 )
                 st.last_frame = frame
                 return frame
@@ -421,7 +458,7 @@ class PlcStepMapper:
             # last_task_id 保留：这一件还在快照里，靠 hold_done_task_id 挡住
             # 重复上报；真有新件时 task_id 会变，自然走「新的一件」分支。
             frame = self._make_frame(
-                ProcessStep.IDLE, finished_task, "保持窗结束，回到等待取料"
+                ProcessStep.IDLE, finished_task, "保持窗结束，回到等待取料", now
             )
             st.last_frame = frame
             return frame
@@ -440,8 +477,9 @@ class PlcStepMapper:
             st.current_step = ProcessStep.FINISHED
             st.finished_at = now
             st.finished_result = ev.superseded_result or TaskResult.NG
+            self._note_result(superseded, st.finished_result, now)
             frame = self._make_frame(
-                ProcessStep.FINISHED, superseded, "上一件已终态，先报结论"
+                ProcessStep.FINISHED, superseded, "上一件已终态，先报结论", now
             )
             st.last_frame = frame
             return frame
@@ -493,16 +531,72 @@ class PlcStepMapper:
             st.finished_result = (
                 ev.final_result or st.finished_result or TaskResult.COMPLETED
             )
+            # 结果灯跟着工步 4 走：同一件只认一次，之后由 ``result_verdict``
+            # 的记忆维持（保持窗内、以及下一件期间都靠它）。
+            self._note_result(st.last_task_id, st.finished_result, now)
         else:
             st.current_step = candidate
 
-        frame = self._make_frame(candidate, st.last_task_id, reason)
+        frame = self._make_frame(candidate, st.last_task_id, reason, now)
         st.last_frame = frame
         return frame
 
     # -- 内部 ---------------------------------------------------------
+    def _note_result(
+        self, task_id: str | None, result: TaskResult | None, now: float
+    ) -> None:
+        """记下一条新结论，并让结果灯从这一刻起重新闪一次黄。
+
+        只在结论**属于新的一件**、或同一件的结论发生变化时才重置闪烁：
+        工步 4 在保持窗内每拍都会走一遍这里（``FINISHED`` 分支），不判重
+        的话闪烁会随节拍反复重放。``None`` 结论按良品处理（mapper 走到
+        ``FINISHED`` 时 ``finished_result`` 已兜底成 COMPLETED）。
+        """
+
+        st = self._state
+        verdict = "ng" if result == TaskResult.NG else "ok"
+        if st.result_task_id == task_id and st.result_verdict == verdict:
+            return
+        st.result_task_id = task_id
+        st.result_verdict = verdict
+        st.result_flash_started_at = now
+        st.result_flashed = False
+
+    def _apply_result_lamp(self, vb0: int, vb1: int, now: float) -> tuple[int, int]:
+        """把「上一件检测结果」画到结果灯上，返回新的 (VB0, VB1)。
+
+        时序：新结论到 → 黄闪 ``_RESULT_FLASH_S`` → **常亮到下一个结论到来**
+        （OK 绿、NG 红）。没有新结论就一直亮着，不按时间自动灭。
+
+        灯1 只能红（没有绿/黄位）。结果灯若配成灯1，黄闪无法显示，直接
+        显示红色/不亮——配置校验不禁止结果灯落在灯1，现场若真这么配，
+        行为与工步位用灯1 的取舍一致。
+        """
+
+        lamp = self._bits.result
+        if lamp <= 0 or self._state.result_verdict is None:
+            return vb0, vb1
+        started = self._state.result_flash_started_at
+        if started is None:
+            return vb0, vb1
+        bit = _bit(lamp)
+        elapsed = max(0.0, now - started)
+        if not self._state.result_flashed:
+            if elapsed < _RESULT_FLASH_S:
+                # 闪烁阶段：只亮黄。先清掉这一位，避免叠加到别的颜色上。
+                return vb0 & ~bit, vb1 | bit
+            self._state.result_flashed = True
+        if self._state.result_verdict == "ng":
+            # 红 = 同一位绿+黄
+            return vb0 | bit, vb1 | bit
+        return vb0 | bit, vb1 & ~bit
+
     def _make_frame(
-        self, step: ProcessStep, task_id: str | None, reason: str
+        self,
+        step: ProcessStep,
+        task_id: str | None,
+        reason: str,
+        now: float,
     ) -> PlcFrame:
         """按现场实测出来的编码算 ``HR0`` 的两个字节。
 
@@ -521,6 +615,9 @@ class PlcStepMapper:
             涂油中     灯2、灯3 绿 + 灯4 黄
             良品       灯2、灯3、灯4 绿
             漏涂 NG    灯2、灯3 绿 + 灯4 同时绿黄（红）
+
+        进度灯之外另有**结果灯**（默认灯5，见 ``_apply_result_lamp``）：
+        新的一件判完时先闪一下黄，再常亮到下一个结论到来（良品绿、漏涂红）。
         """
 
         pick, oiling = self._bits.pick, self._bits.oiling
@@ -541,6 +638,8 @@ class PlcStepMapper:
             else:
                 green = _cumulative_mask(pick, oiling)
         # OFFLINE 的两个字节由 update() 里的离线分支单独给（保持上一次结论）
+
+        green, yellow = self._apply_result_lamp(green, yellow, now)
 
         return PlcFrame(
             vb0=green,

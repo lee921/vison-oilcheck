@@ -1202,10 +1202,10 @@ _LAMP_TEXT = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
 
 
 def _lamp_chip_text(frame) -> str:
-    """PLC 帧里的灯色，如 ``灭 🟡 灭 灭``。无帧时返回空串。
+    """PLC 帧里的灯色，如 ``灭 🟡 灭 灭 灭 🟢``。无帧时返回空串。
 
-    只显示前 4 盏：现场的工步映射在灯2~灯4，灯5~灯8 目前恒灭，全列出来
-    会把芯片挤满。
+    灯1 永远不参与判定（只能红），工步位占灯2~灯4，灯5 是「上一件检测
+    结果」。灯6~灯8 目前恒灭，不列出来以免把芯片挤满。
     """
 
     if not isinstance(frame, dict):
@@ -1213,7 +1213,7 @@ def _lamp_chip_text(frame) -> str:
     lamps = frame.get("lamps") or ()
     if not lamps:
         return ""
-    shown = lamps[:4]
+    shown = lamps[:5]
     return " ".join(_LAMP_TEXT.get(str(color), "灭") for color in shown)
 
 

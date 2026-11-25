@@ -283,7 +283,7 @@ def main() -> int:
         "--byte-order",
         choices=("lsb", "msb"),
         default="lsb",
-        help="字节序解读（默认 lsb，与 plc.byte_order 一致）",
+        help="按哪种字节序解读寄存器（默认 lsb，这是程序写入时用的读法）",
     )
     parser.add_argument("--watch", type=float, default=0.0, help="额外持续观察的秒数")
     parser.add_argument(
