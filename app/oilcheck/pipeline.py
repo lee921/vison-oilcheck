@@ -34,6 +34,14 @@ from app.review import SUMMARY_KEY, ReviewSummary
 from .association import brush_work_point
 from .bytetrack_adapter import ByteTrackObjectTracker
 from .config import PipelineConfig, StationConfig
+from .judge import Episode, EpisodeSegmenter, JudgeResult, LogisticJudge
+from .raw_features import (
+    OilingAggregator,
+    PickAggregator,
+    RawFrame,
+    measure_oiling,
+    measure_pick,
+)
 from .review import (
     build_oiling_missing_summary,
     build_oiling_summary,
@@ -104,6 +112,32 @@ _INVENTORY_SAME_IOU = 0.5
 # 取 4 帧（15fps 下约 0.27s），既能排除「划过」，又不至于要求太久。
 _CARRY_CONFIRM_FRAMES = 4
 
+# carry 那根杆「确实被手带着走」的门限（见 ``_CarryEvidence``）。
+#
+# 光「手边有盘内的杆」不够：手框接近盘宽（实测 350×400 px），盘里的存货、
+# 夹具上的杆都会落进来。真取料时杆要么持续落在手框里，要么跟着手动。
+#
+# 严格锁杆后实测（9 段示例视频，逐次进盘）：
+#
+#   真取料        落手达标帧数 3~33，或 杆/手 位移比 0.6~1.2
+#   示例⑧ 装夹具  落手 0 帧，杆位移 0.000 / 手 0.028
+#   示例⑨ 盘边划过 落手 0 帧，杆位移 0.001 / 手 0.061
+#   示例① 点按夹具 落手 0 帧，杆/手 位移比 0.21
+#
+# 「落手面积 ≥0.30」的分档依据：盘边蹭到的静置杆 0.25~0.42、真攥住 ≥0.44
+# （与 ``_GRIP_PARKED_MIN_FRAC`` 同一批实测），取 0.30 落在划过与攥住之间。
+_CARRY_INHAND_MIN = 0.30
+_CARRY_INHAND_FRAMES = 3
+_CARRY_ROD_MOVE_MIN = 0.010
+_CARRY_ROD_FOLLOW_RATIO = 0.40
+# 「杆跟着手动」还要求两者同向：位移向量夹角的余弦 ≥ 这个值（约 60°）。
+# 夹具上的杆会随检测框抖动慢慢漂移，位移方向与手完全无关（示例⑨：手往
+# 盘下沿走 +y，杆却在原地小幅晃动）。
+_CARRY_FOLLOW_COS = 0.50
+# 锁杆后单帧允许的位置跳变（归一化）。盘里相邻杆间距 0.02~0.03，取 0.05
+# 既跟得住被带走时的手，又不会一步跳到旁边另一根上。
+_CARRY_LOCK_STEP = 0.05
+
 
 # 对**位置没动过**的杆，握持要求杆有足够面积落在手框右上区（实测盘边蹭到的
 # 静置杆 0.25~0.42，真正攥住的 ≥0.44）；对已经在动的杆，只要与右上区相交
@@ -136,6 +170,96 @@ _OILING_SAME_ROD_STEP = 0.06
 # 单靠时间分不开，所以这个上限只用来兜底「长时间不碰就该收段」，
 # 真正的切分由杆的位置决定（见 ``_same_oiling_rod``）。
 _OILING_STITCH_GAP_S = 1.6
+
+
+@dataclass
+class _CarryEvidence:
+    """离盘后「等杆出盘」那段（carry）的累积证据。
+
+    carry 分支要回答的是一个比「手边有没有盘内的杆」更难的问题：**这根杆
+    是不是真的被手带着往外走**。手在盘外、手边有盘内杆，这只是必要条件
+    ——手框很大（实测 350×400 px，接近盘宽），盘里的存货、夹具上的杆都会
+    落进来。
+
+    - 示例⑧ 工人把杆装上白色夹具：手按着杆不动，杆自己的位置也一动不动，
+      但「手边有盘内杆」帧帧成立，于是被判成一次取料；
+    - 示例⑨ 手从盘边划过、紧挨着的那根杆压在夹具上，同样一动不动。
+
+    真正取料的形态是反过来的：杆**跟着手一起动**（示例⑥/⑦ 一边刷一边把杆
+    往下带，杆自身位移与手的位移同量级），或者杆**持续**落在手框里（攥在
+    手里刷）。夹具上的杆两者都不成立：手划过时落手面积只有零星一两帧勉强
+    够格，杆的位移也跟不上手（示例⑧⑨ 全程 ≤0.001）。
+    """
+
+    # 锁定的那根杆的初位置、上一帧位置，与当时的手位置（归一化）。
+    start_rod: tuple[float, float] | None = None
+    last_rod: tuple[float, float] | None = None
+    start_hand: tuple[float, float] | None = None
+    frames: int = 0
+    # 锁定后丢掉的帧数（杆漏检、或候选偏离锁定位置）。
+    gaps: int = 0
+    # 杆框落在手框内的面积比例、手框与杆框的 IoU、虎口重叠比例的最大值。
+    max_inhand: float = 0.0
+    max_iou: float = 0.0
+    max_grip: float = 0.0
+    # 落手面积 ≥ ``_CARRY_INHAND_MIN`` 的帧数（持续性，不是单帧峰值）。
+    inhand_frames: int = 0
+    # 「杆自身位移」与「手自身位移」的最大值，以及取到最大值那一刻的位移向量。
+    rod_move: float = 0.0
+    hand_move: float = 0.0
+    rod_vec: tuple[float, float] | None = None
+    hand_vec: tuple[float, float] | None = None
+
+    @property
+    def carried(self) -> bool:
+        """这段证据够不够认作「这根杆确实被手带着走」。
+
+        两条任一成立：
+
+        - **杆持续落在手里**：落手面积达标的帧数 ≥ ``_CARRY_INHAND_FRAMES``。
+          真握着刷/带走时是一整片连续帧；手从杆旁边划过只有零星一两帧。
+        - **杆跟着手动**：杆自身位移 ≥ ``_CARRY_ROD_MOVE_MIN``，且达到手
+          位移的 ``_CARRY_ROD_FOLLOW_RATIO`` 以上。只看杆有没有动不够——
+          手一划过去、杆被碰歪一点也会动；「跟着手走」要求位移同量级。
+
+        实测（9 段示例视频，严格锁杆后）：
+
+        - 真取料：落手达标帧数 3~33，或杆/手位移比 0.6~1.2；
+        - 示例⑧：落手达标 0 帧，杆位移 0.000 / 手 0.028；
+        - 示例⑨：落手达标 0 帧，杆位移 0.001 / 手 0.061；
+        - 示例①「手伸进盘点按夹具」：落手 0 帧，杆/手位移比 0.21。
+        """
+
+        if self.inhand_frames >= _CARRY_INHAND_FRAMES:
+            return True
+        if self.rod_move < _CARRY_ROD_MOVE_MIN or self.hand_move < _CARRY_ROD_MOVE_MIN:
+            return False
+        # 杆跟着手动：两者朝同一个方向走。只看位移大小不够——夹具上的杆会
+        # 随检测框抖动慢慢漂移（示例⑨ 0.0097 已接近门限），而手是往盘下沿
+        # 去的，方向完全不同。
+        return self._aligned(self.rod_vec, self.hand_vec, _CARRY_FOLLOW_COS)
+
+    @staticmethod
+    def _aligned(
+        rod_vec: tuple[float, float] | None,
+        hand_vec: tuple[float, float] | None,
+        min_cos: float,
+    ) -> bool:
+        """两个位移向量是否同向（夹角的余弦 ≥ ``min_cos``）且长度相当。"""
+
+        if rod_vec is None or hand_vec is None:
+            return False
+        rn = math.hypot(*rod_vec)
+        hn = math.hypot(*hand_vec)
+        if rn <= 0.0 or hn <= 0.0:
+            return False
+        if rn < hn * _CARRY_ROD_FOLLOW_RATIO:
+            return False
+        cosine = (rod_vec[0] * hand_vec[0] + rod_vec[1] * hand_vec[1]) / (rn * hn)
+        return cosine >= min_cos
+
+    def reset(self) -> None:
+        self.__init__()
 
 
 @dataclass
@@ -210,6 +334,15 @@ class _HandVisit:
     # 把杆停在盘区下沿歇一下（示例⑤ 第 2 次取料停了 2s 多），位置就不再
     # 变化，会被 ``_screw_static`` 误当成存货，整件取料丢掉。
     entry_inventory: tuple[BBox, ...] = ()
+    # 离盘后「等杆出盘」那段的证据（见 ``_CarryEvidence``）。判定真正
+    # 「握着杆往盘外走」用的是它，而不是亮着的 frames 计数：手在盘外、
+    # 手边有盘内杆，既不等于握住了，也不等于杆会跟着动。
+    carry: "_CarryEvidence" = field(default_factory=lambda: _CarryEvidence())
+    # 二级判定模型的输入：**原始检测框**的逐帧测量聚合（见 raw_features）。
+    # 只喂模型用，不参与任何规则判定——规则判定仍走上面那些字段。
+    raw: PickAggregator = field(default_factory=PickAggregator)
+    # 这趟进盘开始时盘区里的杆数。聚合特征要用「进盘到结算」的差值。
+    raw_entry_rods: int | None = None
 
     def tick(self, *, every_frames: int) -> bool:
         """推进一步并返回本帧是否到采样点（每 k 帧一个）。"""
@@ -405,7 +538,6 @@ class _Cycle:
 
 
 @dataclass
-@dataclass
 class _OilingSession:
     """一段连续接触：刷头工作点持续贴着**同一根**手持丝杆。
 
@@ -426,6 +558,18 @@ class _OilingSession:
     # 由几个接触片段拼成（中途抬手又放回来会加一）。
     parts: int = 1
     reported_ts: float | None = None
+    # ---- 复核 / 二级判定用的接触统计（每帧更新，不参与规则判定）----
+    # 接触候选里那只手确实握着这根杆的帧数。与 ``frames`` 的差别在
+    # 「杆在手边」还是「杆在手里」——正刷着时两者一致，刷到盘子边上的
+    # 存货时前者成立、后者不成立。
+    held_frames: int = 0
+    # 这段接触里杆自身移动的最大归一化距离（手换位置刷时杆也应跟着动）。
+    rod_move: float = 0.0
+    # 杆第一次进入接触时的位置，用来算 ``rod_move``。
+    rod_start: tuple[float, float] | None = None
+    # 二级判定模型的输入：刷涂期间**原始检测框**的逐帧测量聚合。
+    # 只喂模型用，不参与规则判定。
+    raw: OilingAggregator = field(default_factory=OilingAggregator)
 
 
 class StationPipeline:
@@ -505,7 +649,7 @@ class StationPipeline:
         self._oiling_start_ts: float | None = None
         # 已经判完、但当时还没有取料周期可挂的涂油（「一边取料一边刷」）。
         # 取料确认时如果就是这根杆，补挂到那条周期上，而不是当成无主涂油。
-        self._pending_oilings: list[tuple[_OilingSession, float]] = []
+        self._pending_oilings: list[tuple[_OilingSession, float, Episode | None]] = []
 
         self._last_frame_ts: float | None = None
         self._frame_size: tuple[int, int] = (0, 0)
@@ -529,6 +673,40 @@ class StationPipeline:
         # 本帧的时间是否可信。长间隔/时间倒退时不可信：不桥接空档、
         # 不把掉帧的时间算进停留/涂油时长。
         self._timing_reliable = True
+
+        # 二级判定（逻辑回归）。没有权重文件时两者都是 None，判定退化成
+        # 纯规则，行为与以前完全一致。见 app/oilcheck/judge.py。
+        self._pick_judge: LogisticJudge | None = None
+        self._oiling_judge: LogisticJudge | None = None
+        # 逐帧概率分段器：**一段动作一个**（每趟进盘 / 每次刷涂），键是
+        # (``"pick"``, 手部轨迹 ID) 或 (``"oiling"``, 涂油段的 id())。
+        # 共用一个大分段器会把相邻两件的动作并成一段。
+        self._segmenters: dict[tuple[str, int], EpisodeSegmenter] = {}
+        # 已收段的结果：(类型, 归属键, 段)。归属键用于把段配给正确的事件。
+        self._judge_episodes: list[tuple[str, int, Episode]] = []
+        # 完整动作区间（涂油事件发出后，等这一段刷完才得到的整段起止）。
+        self._last_full_episodes: list[tuple[str, Episode]] = []
+        # 训练钩子：tools/train_judge.py 用来把特征与标签落盘。
+        # 生产路径不设，零开销。
+        self._training_pick_hook = None
+        self._training_oiling_hook = None
+
+    def attach_judges(
+        self, pick: LogisticJudge | None, oiling: LogisticJudge | None
+    ) -> None:
+        """挂上二级判定模型（``None`` = 不启用）。"""
+
+        self._pick_judge = pick
+        self._oiling_judge = oiling
+        self._segmenters.clear()
+        self._judge_episodes.clear()
+        self._last_full_episodes.clear()
+
+    def set_training_hooks(self, *, pick=None, oiling=None) -> None:
+        """设置训练用的特征回调 ``callable(values: dict, ts: float)``。"""
+
+        self._training_pick_hook = pick
+        self._training_oiling_hook = oiling
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -575,6 +753,10 @@ class StationPipeline:
         self._gap_samples.clear()
         self._frame_scale = 1.0
         self._timing_reliable = True
+        # 分段器随判定状态一起复位：上一段视频的进行中动作不能带进来。
+        self._segmenters.clear()
+        self._judge_episodes.clear()
+        self._last_full_episodes.clear()
 
     def process(self, *, detections: FrameDetections) -> StationSnapshot:
         ts = float(detections.ts)
@@ -679,6 +861,9 @@ class StationPipeline:
         self._brush_tracks = brush_out.active
 
         self._update_pick(ts=ts, dt=dt, tray_box=tray_box)
+        # 逐帧给逻辑回归打分并分段，得到「取料/涂油从什么时候到什么时候」。
+        # 放在规则判定之后：分段器用的是本帧已经算好的证据。
+        self._update_judge_episodes(ts=ts)
         # 本帧的丝杆框在**判定之后**入库：``_screw_history`` 表示「此前若干
         # 帧」的位置，静置杆判据拿 [-BACK] 与之比较，多入一帧会整体错位。
         self._screw_history.append(
@@ -904,6 +1089,42 @@ class StationPipeline:
             kept.append(det if near else _demote_for_continuation(det, self.cfg))
         return tuple(kept)
 
+    def _raw_frame(self, ts: float) -> RawFrame:
+        """把当前这一帧的**原始检测框**打包给特征提取用。
+
+        只交检测框、标定区域与丝杆历史。规则的中间结论（``_HandVisit`` /
+        ``_CarryEvidence`` / ``_OilingSession``）一律不进来——模型的输入
+        必须能从原始素材复算，训练脚本才采得到同样的特征。
+        """
+
+        width, height = self._frame_size
+        station = self.station
+        labels = station.detector
+        return RawFrame(
+            ts=ts,
+            width=width,
+            height=height,
+            screws=[
+                det for det in self._last_detections
+                if det.label == labels.screw_label
+            ],
+            hands=[
+                (track.track_id, track.observation_box())
+                for track in self._hand_tracks
+                if track.matched
+            ],
+            brushes=[
+                (track.track_id, track.observation_box())
+                for track in self._brush_tracks
+                if track.matched
+            ],
+            tray=self._tray_region_box((width, height)),
+            work=station.work_roi.pixel_bbox(width, height),
+            oiling=station.oiling_roi.pixel_bbox(width, height),
+            screw_history=list(self._screw_history),
+            detector=labels,
+        )
+
     def _tray_region_box(self, frame_size: tuple[int, int]) -> BBox | None:
         """涂油盘区：**只用**手工标定的 ``tray_roi``。
 
@@ -998,6 +1219,15 @@ class StationPipeline:
             visit.last_seen_ts = ts
             visit.last_hand_box = hand_box
             visit.last_outside_holding = None if inside_raw else holding_now
+            # 二级判定的输入：逐帧累积**原始检测框**的测量。只喂模型，
+            # 规则判定完全走下面的原有逻辑，不受影响。
+            if visit.entered_confirmed and not visit.holding_on_entry:
+                frame = self._raw_frame(ts)
+                if visit.raw_entry_rods is None:
+                    visit.raw_entry_rods = sum(
+                        1 for det in frame.screws if frame.in_tray(det.box)
+                    )
+                visit.raw.add(measure_pick(frame, hand.track_id, hand_box))
             # 记录「本趟第一次进盘」。起点不取首次见到手的时刻（那会把盘外
             # 跟踪时长算进去），也不逐帧累加盘内帧（手在盘内整段漏检时
             # 会严重低估，示例①第 3 次取料只有 4 帧命中盘区）。
@@ -1019,6 +1249,7 @@ class StationPipeline:
                     visit.exited_at_ts = None
                     visit.restart_holding()
                     visit.holding_seen = False
+                    visit.carry.reset()
                     continue
                 # 手已出盘、手里的杆还没出盘的那几帧**既不采样也不定论**。
                 #
@@ -1039,7 +1270,9 @@ class StationPipeline:
                 # 所以这一段在 exited 之后才判得到）。判据是「手边有随手动、
                 # 但杆心仍在盘区内的杆」——那是这一件正在出门，不是空手离开；
                 # 进盘时就在盘里的存货不算（``entry_inventory``）。
-                if self._carrying_out_of_tray(hand_box, visit.entry_inventory):
+                if self._carrying_out_of_tray(
+                    hand_box, visit.entry_inventory, visit.carry
+                ):
                     if ts - visit.exited_at_ts <= self._carry_wait_s():
                         # 「手边有随手动、杆心还在盘区内」是**带杆出门**的
                         # 暂定证据：工人把杆停在盘区下沿刷完再带走时，杆心一
@@ -1048,13 +1281,14 @@ class StationPipeline:
                         #
                         # 但「手在盘外 + 手边有盘内杆」本身不够：手框很大，
                         # 盘里/夹具上的杆都会落进来。示例① 工人按夹具、示例⑧
-                        # 工人把杆装上夹具，都会被凭空判成一次取料。
+                        # 工人把杆装上夹具、示例⑨ 手从夹具边划过，都会被凭空
+                        # 判成一次取料。
                         #
-                        # 差别在**持续握住同一根**：示例⑥ 第 2 件连续 8 帧
-                        # 手边都是同一根杆、并一路把它带出盘；示例① 只在
-                        # 手划过的 2 帧里碰到杆。所以这里按连续帧数认定。
+                        # 差别在**这根杆是不是真的被手带着走**：真取料时杆
+                        # 跟着手动（自身位移 ≥0.017）或明显落在手框里；夹具上
+                        # 的杆全程不动、落手面积也不够（见 ``_CarryEvidence``）。
                         visit.carry_frames += 1
-                        if visit.carry_frames >= _CARRY_CONFIRM_FRAMES:
+                        if visit.carry.carried:
                             visit.holding_seen = True
                         # 等杆出盘的这段里，手确实在盘外：照常记「盘外空手」
                         # 历史，供**下一次**进盘定性。旧实现这几帧已经结算、
@@ -1103,6 +1337,7 @@ class StationPipeline:
                     )
                     visit.inside_tray = True
                     visit.restart_holding()
+                    visit.carry.reset()
                     # 记下这一趟进盘**之前**盘区里那批丝杆（存货快照）。
                     # 离盘后区分「手里带着走的那根」与「盘里的存货」用
                     # （见 ``_carrying_out_of_tray``）。
@@ -1120,6 +1355,7 @@ class StationPipeline:
             visit.inside_tray = False
             visit.exited_at_ts = ts
             visit.restart_holding()
+            visit.carry.reset()
             if not inside_raw:
                 # 手此刻确实在盘外：这个读数就是离盘后的第一个证据。
                 visit.last_outside_holding = holding_now
@@ -1215,11 +1451,26 @@ class StationPipeline:
                 dwell,
             )
             return
-        if not visit.holding_verdict(keep):
+        values = self._pick_features(visit, ts=ts, dwell=dwell)
+        verdict = visit.holding_verdict(keep)
+        judge_result = self._judge_pick(values, rule=verdict)
+        if self._training_pick_hook is not None:
+            self._training_pick_hook(values, ts)
+        if judge_result is not None and not judge_result.used:
             self._logger.debug(
-                "手 %s 离盘后 %d 个采样点里没有见到手里的杆，不判取料",
+                "手 %s 取料判定：规则=%s，逻辑回归 p=%.3f（未参与）",
+                hand_track_id,
+                verdict,
+                judge_result.probability,
+            )
+        if not verdict and (judge_result is None or not judge_result.decision):
+            self._logger.debug(
+                "手 %s 离盘后 %d 个采样点里没有见到手里的杆，不判取料%s",
                 hand_track_id,
                 len(visit.holding_samples),
+                ""
+                if judge_result is None
+                else f"（逻辑回归 p={judge_result.probability:.3f}）",
             )
             return
         screw = holding
@@ -1231,7 +1482,103 @@ class StationPipeline:
             hand_track_id=hand_track_id,
             screw=screw,
             dwell_s=dwell,
+            judge=judge_result,
         )
+
+    def _pick_features(
+        self, visit: _HandVisit, *, ts: float, dwell: float
+    ) -> dict[str, float]:
+        """取料判定的特征向量：**规则字段 + 原始检测框聚合特征**。
+
+        两套字段并存，各有分工：
+
+        - ``hs_n`` / ``hs_true`` / ``seen`` / ``carry_*``：规则自己算出来的
+          结论，用于 ``_judge_pick`` 的门限（规则这一路投没投票）；
+        - 原始几何聚合（``rod_moved_max`` / ``rod_iou_max`` / ``found_ratio``
+          …）：模型的输入，全部能从 YOLO 检测框复算（见 ``raw_features``）。
+
+        模型只读原始那套——它必须能独立判断，而不是复述规则结论。
+        """
+
+        carry = visit.carry
+        samples = list(visit.holding_samples)
+        rods_in_tray = sum(
+            1
+            for det in self._last_detections
+            if det.label == self.station.detector.screw_label
+            and self._tray_region_box(self._frame_size) is not None
+            and _box_center_in(
+                det.box, self._tray_region_box(self._frame_size)  # type: ignore[arg-type]
+            )
+        )
+        values: dict[str, float] = {
+            "dwell": float(dwell),
+            "hs_n": float(len(samples)),
+            "hs_true": float(sum(1 for value in samples if value)),
+            "carry_frames": float(carry.frames),
+            "seen": float(visit.holding_seen),
+            "inventory_n": float(len(visit.entry_inventory)),
+            "carry_inhand_frames": float(carry.inhand_frames),
+            "carry_inhand_max": float(carry.max_inhand),
+            "carry_rod_move": float(carry.rod_move),
+            "carry_hand_move": float(carry.hand_move),
+            "carry_align": self._carry_alignment(carry),
+            "rods_in_tray_delta": float(
+                len(visit.entry_inventory) - rods_in_tray
+            ),
+            # 以下两项只给训练脚本打标签用（进盘/离盘区间），不是判定特征。
+            "_visit_start": float(visit.first_inside_ts or ts - dwell),
+            "_visit_exit": float(visit.exited_at_ts or ts),
+        }
+        values.update(
+            visit.raw.features(dwell=dwell, start_tray_rods=visit.raw_entry_rods)
+        )
+        return values
+
+    def _carry_alignment(self, carry: _CarryEvidence) -> float:
+        """carry 那根杆与手的位移方向余弦（无证据时为 0）。"""
+
+        if carry.rod_vec is None or carry.hand_vec is None:
+            return 0.0
+        rn = math.hypot(*carry.rod_vec)
+        hn = math.hypot(*carry.hand_vec)
+        if rn <= 1e-9 or hn <= 1e-9:
+            return 0.0
+        cosine = (
+            carry.rod_vec[0] * carry.hand_vec[0]
+            + carry.rod_vec[1] * carry.hand_vec[1]
+        ) / (rn * hn)
+        return max(-1.0, min(1.0, cosine))
+
+    def _judge_pick(
+        self, values: dict[str, float], *, rule: bool
+    ) -> JudgeResult | None:
+        """取料二级判定：规则与逻辑回归的融合。
+
+        融合的关键是**分工边界**。现场实测（9 段示例视频）说明两层证据
+        互补：
+
+        - 规则擅长「持握采样多数为真」这一路——盘外手持杆检出率 96~99%；
+        - 模型擅长「采样不足、但有零散线索」这一路——杆跟着手动、杆持续
+          落在手框里、或只见过一两帧握持。这类帧恰恰是规则投不出票的地方。
+
+        所以门限按「规则这一路有没有投出票」来分：
+
+        - 规则多数投「是」（``rule=True``）：**以规则为准**，模型只记录
+          概率。规则手里有完整窗口，比小样本模型可靠。
+        - 规则投「否」但见过握持（``hs_true > 0``）：**模型说了算**。
+          这正是示例⑦ 第 1 件的形态（``hs=1/3``、carry 一帧都没有），
+          规则多数票判否会把真取料丢掉，模型 p=0.65 能救回来。
+        - 一帧握持都没有（``hs_true == 0``）：空手离开，规则与模型都判否。
+        """
+
+        if self._pick_judge is None:
+            return None
+        if rule or values["hs_true"] <= 0.0:
+            # 规则已定论（投是 / 完全没有正面证据）：模型不参与。
+            return self._pick_judge.decide(values, rule=rule)
+        # 规则投否、但有过握持：中间带，模型定。
+        return self._pick_judge.decide(values, rule=None)
 
     def _record_outside_holding(
         self, hand_id: int, holding: Detection | None, ts: float
@@ -1384,7 +1731,10 @@ class StationPipeline:
             )
 
     def _carrying_out_of_tray(
-        self, hand_box: BBox, inventory: tuple[BBox, ...] = ()
+        self,
+        hand_box: BBox,
+        inventory: tuple[BBox, ...] = (),
+        evidence: _CarryEvidence | None = None,
     ) -> bool:
         """手已在盘外、但手边那根正随着动的杆还没出盘。
 
@@ -1400,6 +1750,10 @@ class StationPipeline:
         「空手离盘」丢掉。
 
         ``inventory`` 为空（历史不足）时退回位置稳定性判据。
+
+        传了 ``evidence`` 时，顺带把这根候选杆的握持证据累积进去（见
+        :class:`_CarryEvidence`）——「手边有盘内杆」只是必要条件，够不够
+        算握持由调用方按 :attr:`_CarryEvidence.carried` 决定。
         """
 
         tray_box = self._tray_region_box(self._frame_size)
@@ -1408,11 +1762,14 @@ class StationPipeline:
         width, height = self._frame_size
         diag = max(1.0, math.hypot(width, height))
         hx, hy = hand_box.center
+        width, height = self._frame_size
+        candidates: list[tuple[float, BBox]] = []
         for det in self._last_detections:
             if det.label != self.station.detector.screw_label:
                 continue
             cx, cy = det.box.center
-            if math.hypot(cx - hx, cy - hy) / diag > self.cfg.hand_screw_max_distance:
+            distance = math.hypot(cx - hx, cy - hy) / diag
+            if distance > self.cfg.hand_screw_max_distance:
                 continue
             if not _box_center_in(det.box, tray_box):
                 continue
@@ -1420,11 +1777,84 @@ class StationPipeline:
                 # 与存货快照里任一根重合 ⇒ 它是盘里的料，与本件无关。
                 if any(det.box.iou(box) >= _INVENTORY_SAME_IOU for box in inventory):
                     continue
-                return True
-            if self._screw_static(det.box):
+            elif self._screw_static(det.box):
                 continue
-            return True
-        return False
+            candidates.append((distance, det.box))
+        if not candidates:
+            if evidence is not None:
+                evidence.gaps += 1
+            return False
+        rod = None
+        if evidence is not None and evidence.last_rod is not None:
+            # 已锁定：这一帧只认锁定位置附近的那根。附近找不到就记一次
+            # 空缺、跳过这一帧，**不**退回到「离手最近的那根」——那正是换
+            # 目标的地方，两根杆的位移拼在一起会拼出虚假的「随手动」
+            # （示例⑨ 夹具上相邻杆间距 0.03，跳一次 rod_move 就到 0.015）。
+            near = [
+                (math.hypot(box.center[0] / width - evidence.last_rod[0],
+                            box.center[1] / height - evidence.last_rod[1]), box)
+                for _, box in candidates
+            ]
+            near = [item for item in near if item[0] <= _CARRY_LOCK_STEP]
+            if not near:
+                evidence.gaps += 1
+                return True
+            rod = min(near, key=lambda item: item[0])[1]
+        else:
+            rod = min(candidates, key=lambda item: item[0])[1]
+        if evidence is not None:
+            self._update_carry_evidence(evidence, hand_box, rod)
+        return True
+
+    def _update_carry_evidence(
+        self, evidence: _CarryEvidence, hand_box: BBox, rod_box: BBox
+    ) -> None:
+        """把这一帧的候选杆折进 carry 证据（见 :class:`_CarryEvidence`）。
+
+        杆是**锁定**跟踪的：第一次锁定后，后续帧只在离锁定位置
+        ``_CARRY_LOCK_STEP`` 以内找同一根杆，找不到就丢这一帧，不换目标。
+        不锁的话，手一划过去最近的那根就变成旁边另一根，两根杆的位移混在
+        一起拼出虚假的「随手动」（实测夹具上那排杆两两间距 0.02~0.03，
+        换目标一次就够把 memory 里的 rod_move 抬到门限以上）。
+        """
+
+        width, height = self._frame_size
+        hand = (hand_box.center[0] / width, hand_box.center[1] / height)
+        rod = (rod_box.center[0] / width, rod_box.center[1] / height)
+        if evidence.start_rod is None:
+            evidence.start_hand = hand
+            evidence.start_rod = rod
+        evidence.last_rod = rod
+        evidence.frames += 1
+        area = rod_box.width * rod_box.height
+        if area > 0:
+            inhand = hand_box.intersection_area(rod_box) / area
+            evidence.max_inhand = max(evidence.max_inhand, inhand)
+            # 持续落在手里的帧数：「手从杆旁边划过」只会有零星一两帧达标，
+            # 真握着刷/带走时是连续的一大片。
+            if inhand >= _CARRY_INHAND_MIN:
+                evidence.inhand_frames += 1
+        evidence.max_iou = max(evidence.max_iou, hand_box.iou(rod_box))
+        evidence.max_grip = max(
+            evidence.max_grip, _grip_corner_fraction(hand_box, rod_box)
+        )
+        rod_vec = (
+            rod[0] - evidence.start_rod[0],
+            rod[1] - evidence.start_rod[1],
+        )
+        hand_vec = (
+            hand[0] - evidence.start_hand[0],
+            hand[1] - evidence.start_hand[1],
+        )
+        rod_len = math.hypot(*rod_vec)
+        if rod_len > evidence.rod_move:
+            evidence.rod_move = rod_len
+            evidence.rod_vec = rod_vec
+        hand_len = math.hypot(*hand_vec)
+        if hand_len > evidence.hand_move:
+            evidence.hand_move = hand_len
+            evidence.hand_vec = hand_vec
+
 
     def _screw_parked_in_tray(self, screw: Detection) -> bool:
         """这根杆是不是盘里那根**没被动过**的静置杆。
@@ -1600,6 +2030,7 @@ class StationPipeline:
         hand_track_id: int,
         screw: Detection,
         dwell_s: float,
+        judge: JudgeResult | None = None,
     ) -> None:
         task = self._ensure_cycle(ts, hand_track_id=hand_track_id)
         task.stage = TaskStage.PICKED
@@ -1624,17 +2055,30 @@ class StationPipeline:
         task.last_seen_ts = ts
         task.evidence.append("SCREW_LEFT_TRAY_WITH_HAND")
         task.timeline.append((TaskStage.PICKED.value, ts))
+        # 事件的区间优先用逻辑回归分段出来的「这件事从什么时候到什么时候」；
+        # 没有模型时退回「结算帧 - 盘内停留」到结算帧（旧口径）。
+        start_ts, end_ts, episode = self._episode_bounds(
+            "pick",
+            owner=hand_track_id,
+            fallback_start=ts - dwell_s,
+            fallback_end=ts,
+        )
+        extra = {
+            "hand_track_id": hand_track_id,
+            "dwell_in_tray_s": round(dwell_s, 3),
+            "screw_confidence": round(float(screw.confidence), 3),
+        }
+        if judge is not None:
+            extra["judge"] = judge.to_dict()
+        if episode is not None:
+            extra["judge_episode"] = episode.to_dict()
         self._emit_event(
             task,
             event_type=EventType.PICK,
             reason="pick_confirmed",
-            extra={
-                "hand_track_id": hand_track_id,
-                "dwell_in_tray_s": round(dwell_s, 3),
-                "screw_confidence": round(float(screw.confidence), 3),
-            },
-            start_ts=ts - dwell_s,
-            end_ts=ts,
+            extra=extra,
+            start_ts=start_ts,
+            end_ts=end_ts,
             review=build_pick_summary(task, dwell_s=dwell_s),
         )
         self._logger.info(
@@ -1686,6 +2130,10 @@ class StationPipeline:
 
         if matched is not None:
             distance, box, brush = matched
+            held = any(
+                hand_box.iou(box) > 0.0
+                for hand_box in (hand.observation_box() for hand in self._hand_tracks)
+            )
             if session is None:
                 # 首帧也把这一帧的 dt 记进去：刷头此刻确实贴着，和后续帧
                 # 一样是有效接触。脚本没有 dt 概念、只能从第二帧起算，
@@ -1699,6 +2147,8 @@ class StationPipeline:
                     frames=1,
                     min_distance=distance,
                     brush_track_id=brush.track_id,
+                    held_frames=1 if held else 0,
+                    rod_start=box.center,
                 )
                 self._publish_oiling_progress(self._active_oiling)
                 return
@@ -1715,9 +2165,22 @@ class StationPipeline:
             session.last_ts = ts
             session.last_seen_ts = ts
             session.frames += 1
+            if held:
+                session.held_frames += 1
+            if session.rod_start is not None:
+                width, height = self._frame_size
+                diag = max(1.0, math.hypot(width, height))
+                moved = math.hypot(
+                    box.center[0] - session.rod_start[0],
+                    box.center[1] - session.rod_start[1],
+                ) / diag
+                session.rod_move = max(session.rod_move, moved)
             session.anchor = box.center
             session.min_distance = min(session.min_distance, distance)
             session.brush_track_id = brush.track_id
+            # 二级判定的输入：本帧刷头与手持杆的**原始几何**。只喂模型。
+            frame = self._raw_frame(ts)
+            session.raw.add(measure_oiling(frame, self._oiling_hand_box(frame, box)))
             self._publish_oiling_progress(session)
             if (
                 session.reported_ts is None
@@ -1899,33 +2362,85 @@ class StationPipeline:
         ) * self._frame_scale
 
     def _close_oiling(self) -> None:
-        """收掉当前接触段；还没报过且累计够长的才算一次涂油。"""
+        """收掉当前接触段；还没报过且够了 ``brush_hold_s`` 才发一次涂油事件。"""
 
         session = self._active_oiling
         if session is None:
             return
         self._active_oiling = None
-        if (
-            session.reported_ts is None
-            and session.cum_s >= self.cfg.brush_hold_s - 1e-9
+        # 先把这一段的分段器收掉——区间要退回到「刷头第一次贴上」。
+        # 已经报过（攒够时长那帧就发了）的段，区间由事后补写落在事件上
+        # （见 `_finish_oiling` 的 `_pending_episode`）。
+        episode = self._take_oiling_episode(session)
+        if session.reported_ts is None and (
+            session.cum_s >= self.cfg.brush_hold_s - 1e-9
         ):
-            self._finish_oiling(session.last_ts, session=session)
+            self._finish_oiling(
+                session.last_ts, session=session, episode=episode
+            )
+            return
+        if episode is not None:
+            # 事件在攒够 `brush_hold_s` 的那一帧就发了（那时人还在继续刷），
+            # 这里记下整段动作的起止给复核统计——事件本身是 frozen 的，
+            # 不能再写回；`_last_full_episodes` 供监控/复核展示。
+            self._last_full_episodes.append(("oiling", episode))
+            self._logger.debug(
+                "涂油整段区间 %.2fs → %.2fs（%.2fs）",
+                episode.start_ts,
+                episode.end_ts,
+                episode.duration,
+            )
+        # 没够 brush_hold_s 的短接触也交给训练钩子：涂油的负样本只能从这里
+        # 来（规则没命中就没有事件），没有负样本就无法训练二级判定。
+        if self._training_oiling_hook is not None and session.frames > 0:
+            self._training_oiling_hook(
+                self._oiling_features(session), session.last_ts or 0.0
+            )
+
+    def _take_oiling_episode(self, session: _OilingSession) -> Episode | None:
+        """收掉这个涂油段的分段器，返回它的区间。"""
+
+        segmenter = self._segmenters.pop(("oiling", id(session)), None)
+        if segmenter is None:
+            return None
+        segmenter.close()
+        episodes = segmenter.drain()
+        return episodes[-1] if episodes else None
 
     def _finish_oiling(
-        self, ts: float, *, session: _OilingSession | None = None
+        self,
+        ts: float,
+        *,
+        session: _OilingSession | None = None,
+        episode: Episode | None = None,
     ) -> None:
-        """一次涂油达成：并入最近的取料周期，或单独报一条。"""
+        """一次涂油达成：并入最近的取料周期，或单独报一条。
+
+        ``ts`` 是这一段的结束时刻（收段时传 ``session.last_ts``），
+        ``episode`` 是逻辑回归分段出来的整段区间（刷头贴上 → 离开）。
+        """
 
         session = session or self._active_oiling
         if session is None:
             return
-        # 不把这一段从 ``_active_oiling`` 摘下来：刷手判完通常还在这根杆上
-        # 继续刷，摘掉就会在下一帧另开一段、再报一次。等杆换了或离开，
-        # ``_close_oiling`` 才会收段。
         session.reported_ts = ts
+        values = self._oiling_features(session)
+        if self._training_oiling_hook is not None:
+            self._training_oiling_hook(values, ts)
+        judge_result = self._judge_oiling(values)
+        if judge_result is not None and judge_result.used and not judge_result.decision:
+            # 二级判定否掉了这一段的「人工二次涂油」结论。规则已经攒够
+            # brush_hold_s，但证据（杆不在手里、杆没跟着刷手动、接触零散）
+            # 说明刷的不是手上这根——判成完成会让漏刷件直接过关。
+            self._logger.info(
+                "涂油完成被二级判定否掉：累计 %.2fs，逻辑回归 p=%.3f",
+                session.cum_s,
+                judge_result.probability,
+            )
+            return
         task = self._oiling_target_cycle(session)
         if task is not None:
-            self._attach_oiling(task, session, ts)
+            self._attach_oiling(task, session, ts, judge=judge_result, episode=episode)
             return
         # 还没有取料周期可挂。分两种情形：
         #
@@ -1935,9 +2450,210 @@ class StationPipeline:
         # - 没有手在盘区里：这是纯涂油（录像开头就在刷、取完又补刷），
         #   现场按规则不算异常，直接报出去。
         if session.anchor is not None and self._pick_in_progress():
-            self._pending_oilings.append((session, ts))
+            self._pending_oilings.append((session, ts, episode))
             return
-        self._emit_free_oiling(session, ts)
+        self._emit_free_oiling(session, ts, episode=episode)
+
+    def _oiling_hand_box(
+        self, frame: RawFrame, rod_box: BBox
+    ) -> BBox | None:
+        """刷的这根杆，此刻最可能是哪只手在拿。
+
+        没有关键点也没有直接关联，只能按位置取最近的那只手；比刷头本身
+        更可靠——刷头是工具，杆在谁手里由手决定。
+        """
+
+        if not frame.hands:
+            return None
+        cx, cy = rod_box.center
+        return min(
+            (box for _, box in frame.hands),
+            key=lambda box: (
+                (box.center[0] - cx) ** 2 + (box.center[1] - cy) ** 2
+            ),
+        )
+
+    def _oiling_features(self, session: _OilingSession) -> dict[str, float]:
+        """涂油判定的特征向量：**规则字段 + 原始检测框聚合特征**。
+
+        同取料：规则字段供 ``_judge_oiling`` 的弱证据门限用，原始聚合
+        （``contact_ratio`` / ``held_ratio`` / ``brush_rod_dist_min`` …）
+        是模型真正的输入，全部能从检测框复算。
+        """
+
+        frames = max(1, session.frames)
+        values: dict[str, float] = {
+            "cum_s": float(session.cum_s),
+            "frames": float(session.frames),
+            "min_distance": float(session.min_distance),
+            "parts": float(session.parts),
+            "held_ratio": session.held_frames / frames,
+            "rod_move": float(session.rod_move),
+            "contact_ratio": float(session.cum_s) / max(
+                1e-6, float(self.cfg.brush_hold_s)
+            ),
+        }
+        values.update(
+            session.raw.features(cum_s=session.cum_s, frames=session.frames)
+        )
+        return values
+
+    def _judge_oiling(self, values: dict[str, float]) -> JudgeResult | None:
+        """涂油二级判定。
+
+        规则已经很保守（贴着杆身中线累计够 ``brush_hold_s``），所以这里
+        **只在证据偏弱时**（杆在手里的比例不高、或杆几乎没跟着刷手动）
+        让它参与；证据充分时直接用规则结论，避免模型把稳定的判定搅乱。
+        """
+
+        if self._oiling_judge is None:
+            return None
+        weak = values["held_ratio"] < 0.5 or values["rod_move"] < 0.005
+        return self._oiling_judge.decide(values, rule=None if weak else True)
+
+    def _update_judge_episodes(self, *, ts: float) -> None:
+        """逐帧打分并切段，记录「取料/涂油从什么时候到什么时候」。
+
+        规则判定回答的是「这一帧够不够格算一次」，分段器回答的是「这件事
+        真正发生在哪个时间段」：取料是手进盘到带杆出盘，涂油是刷头贴上到
+        真正离开。事件里的 ``start_ts`` / ``end_ts`` 直接用分段结果，不再
+        由结算帧往回推。
+
+        **一段动作一个分段器**（每趟进盘、每次刷涂各一个）：整段视频共用
+        一个分段器时，前一件的尾巴和后一件的开头会被 ``bridge_s`` 的空档
+        并成一段，区间横跨两件（实测示例④ 一次涂油的区间被拉成 8.0s，
+        把取料也框进去了）。分到各个动作上，边界就落在这件自己的动作上。
+        """
+
+        if self._pick_judge is not None:
+            live: set[tuple[str, int]] = set()
+            for hand_id, visit in self._visits.items():
+                if not visit.entered_confirmed or visit.holding_on_entry:
+                    continue
+                live.add(("pick", hand_id))
+                start = (
+                    visit.first_inside_ts if visit.first_inside_ts is not None else ts
+                )
+                values = self._pick_features(visit, ts=ts, dwell=ts - start)
+                segmenter = self._segmenters.get(("pick", hand_id))
+                if segmenter is None:
+                    segmenter = self._make_segmenter(self._pick_judge, kind="pick")
+                    self._segmenters[("pick", hand_id)] = segmenter
+                segmenter.update(ts, self._pick_judge.probability(values))
+            self._retire_segmenters("pick", live)
+        if self._oiling_judge is not None:
+            live = set()
+            session = self._active_oiling
+            if session is not None:
+                key = ("oiling", id(session))
+                live.add(key)
+                values = self._oiling_features(session)
+                segmenter = self._segmenters.get(key)
+                if segmenter is None:
+                    segmenter = self._make_segmenter(self._oiling_judge, kind="oiling")
+                    self._segmenters[key] = segmenter
+                segmenter.update(ts, self._oiling_judge.probability(values))
+            self._retire_segmenters("oiling", live)
+
+    def _make_segmenter(
+        self, judge: LogisticJudge, *, kind: str
+    ) -> EpisodeSegmenter:
+        bridge = (
+            max(0.6, 0.5 * self._frame_scale)
+            if kind == "pick"
+            else max(0.8, self._oiling_stitch_gap_s() * 0.5)
+        )
+        return EpisodeSegmenter(
+            on=judge.high,
+            off=judge.low,
+            low=judge.low * 0.6,
+            bridge_s=bridge,
+        )
+
+    def _retire_segmenters(self, kind: str, live: set[tuple[str, int]]) -> None:
+        """动作结束的段收掉；同一动作再次出现时沿用旧段，不重复收。"""
+
+        for key in list(self._segmenters):
+            if key[0] != kind or key in live:
+                continue
+            segmenter = self._segmenters.pop(key)
+            segmenter.close()
+            for episode in segmenter.drain():
+                self._judge_episodes.append((kind, key[1], episode))
+
+    def live_pick_features(self, ts: float) -> list[dict[str, float]]:
+        """本帧所有「进行中的取料」的特征（训练脚本 / 排查用）。
+
+        取料在盘内那一段还没攒到离盘后的握持采样，除 ``dwell`` 以外的特征
+        基本都是空的；分段器靠 ``dwell`` 与 carry 证据的逐帧增长定位起点，
+        所以这几帧照样要打分。
+        """
+
+        sets: list[dict[str, float]] = []
+        for visit in self._visits.values():
+            if not visit.entered_confirmed or visit.holding_on_entry:
+                continue
+            start = visit.first_inside_ts if visit.first_inside_ts is not None else ts
+            sets.append(self._pick_features(visit, ts=ts, dwell=ts - start))
+        return sets
+
+    def active_oiling_session(self) -> _OilingSession | None:
+        """当前正在累计的涂油段（没有则 None）。"""
+
+        return self._active_oiling
+
+    def oiling_judge_features(self, session: _OilingSession) -> dict[str, float]:
+        """某段涂油此刻的特征（训练脚本 / 排查用）。"""
+
+        return self._oiling_features(session)
+
+    def judge_episodes(self, kind: str | None = None) -> list[Episode]:
+        """逻辑回归分段出来的动作（按结束时刻排序）。"""
+
+        items = [
+            episode
+            for name, _owner, episode in self._judge_episodes
+            if kind is None or name == kind
+        ]
+        return sorted(items, key=lambda item: item.end_ts)
+
+    def _episode_bounds(
+        self,
+        kind: str,
+        *,
+        owner: int | None,
+        fallback_start: float,
+        fallback_end: float,
+    ) -> tuple[float, float, Episode | None]:
+        """取这次判定对应的时间区间。
+
+        优先用逻辑回归分段器的结果——它给的是**动作本身的起止**（手进盘 →
+        杆出盘、刷头贴上 → 离开），而不是「证据攒够」的那一帧。
+
+        判定可能比动作结束更早（涂油攒够 ``brush_hold_s`` 时人还在继续刷），
+        所以先把该动作的分段器**就地封口**：此时已经攒到的 ``start_ts``
+        才是动作真正的起点。封口之后这一段不再参与后续帧，否则人继续刷
+        会把它一直往后拖。
+
+        ``owner`` 是动作的归属键（手部轨迹 ID / 涂油段 ``id()``），只认
+        自己那一段，不会把相邻一件的区间拿过来。
+        """
+
+        if owner is not None:
+            segmenter = self._segmenters.pop((kind, owner), None)
+            if segmenter is not None:
+                pending = segmenter.take_active()
+                if pending is not None:
+                    self._judge_episodes.append((kind, owner, pending))
+        for index, (name, key, episode) in enumerate(self._judge_episodes):
+            if name != kind:
+                continue
+            if owner is not None and key != owner:
+                continue
+            del self._judge_episodes[index]
+            return episode.start_ts, episode.end_ts, episode
+        return fallback_start, fallback_end, None
+
 
     def _pick_in_progress(self) -> bool:
         """取料是不是正在进行中（进盘过程还挂着、尚未结算）。
@@ -1979,14 +2695,20 @@ class StationPipeline:
         if not self._pending_oilings:
             return
         wait = self.cfg.oiling_timeout_s if self.cfg.oiling_timeout_s > 0 else 10.0
-        for session, oil_ts in list(self._pending_oilings):
+        for session, oil_ts, episode in list(self._pending_oilings):
             if ts - oil_ts < wait:
                 continue
-            self._pending_oilings.remove((session, oil_ts))
-            self._emit_free_oiling(session, oil_ts)
+            self._pending_oilings.remove((session, oil_ts, episode))
+            self._emit_free_oiling(session, oil_ts, episode=episode)
 
     def _attach_oiling(
-        self, task: _Cycle, session: _OilingSession, ts: float
+        self,
+        task: _Cycle,
+        session: _OilingSession,
+        ts: float,
+        *,
+        judge: JudgeResult | None = None,
+        episode: Episode | None = None,
     ) -> None:
         """把一次涂油记到某个周期上并判完成。"""
 
@@ -2000,7 +2722,7 @@ class StationPipeline:
         task.brush_near_frames = session.frames
         if task.screw_anchor is None and session.anchor is not None:
             task.screw_anchor = session.anchor
-        self._complete_oiling(task, ts)
+        self._complete_oiling(task, ts, judge=judge, session=session, episode=episode)
 
     def _close_oiling_if_settled(self) -> None:
         """当前涂油段已经完整报过（且不是暂存待挂的），就收段。"""
@@ -2022,13 +2744,13 @@ class StationPipeline:
 
         if not self._pending_oilings or task.screw_anchor is None:
             return False
-        for session, oil_ts in list(self._pending_oilings):
+        for session, oil_ts, episode in list(self._pending_oilings):
             if session.anchor is None:
                 continue
             if not self._same_anchor(task.screw_anchor, session.anchor):
                 continue
-            self._pending_oilings.remove((session, oil_ts))
-            self._attach_oiling(task, session, oil_ts)
+            self._pending_oilings.remove((session, oil_ts, episode))
+            self._attach_oiling(task, session, oil_ts, episode=episode)
             return True
         return False
 
@@ -2161,13 +2883,17 @@ class StationPipeline:
             <= _OILING_SAME_ROD_STEP * 2
         )
 
-    def _emit_free_oiling(self, session: _OilingSession, ts: float) -> None:
+    def _emit_free_oiling(
+        self, session: _OilingSession, ts: float, *, episode: Episode | None = None
+    ) -> None:
         """没有对应取料周期的涂油（录像开头就已在刷、或取完又补刷）。"""
 
         self._free_oiling_seq += 1
         event = EventRecord.create(
-            timestamp_start=float(session.start_ts or ts),
-            timestamp_end=float(ts),
+            timestamp_start=float(
+                episode.start_ts if episode is not None else (session.start_ts or ts)
+            ),
+            timestamp_end=float(episode.end_ts if episode is not None else ts),
             station_id=self.station.station_id,
             camera_id=self.station.camera_id,
             cycle_id=self.cycle_id,
@@ -2186,6 +2912,7 @@ class StationPipeline:
                 "contact_parts": session.parts,
                 "detector": self.detector_name,
                 "free_oiling_seq": self._free_oiling_seq,
+                **({} if episode is None else {"judge_episode": episode.to_dict()}),
             },
         )
         self._events_emitted += 1
@@ -2612,7 +3339,15 @@ class StationPipeline:
                 best = (distance, brush)
         return None if best is None else best[1]
 
-    def _complete_oiling(self, task: _Cycle, ts: float) -> None:
+    def _complete_oiling(
+        self,
+        task: _Cycle,
+        ts: float,
+        *,
+        judge: JudgeResult | None = None,
+        session: _OilingSession | None = None,
+        episode: Episode | None = None,
+    ) -> None:
         self._close_brush_run(task)
         task.stage = TaskStage.OILED
         task.stage_since = ts
@@ -2621,26 +3356,49 @@ class StationPipeline:
         task.reason_code = "MANUAL_OILING_COMPLETED"
         task.evidence.append("BRUSH_NEAR_SCREW_HELD")
         task.timeline.append((TaskStage.OILED.value, ts))
-        self._emit_event(
+        if episode is not None:
+            start_ts, end_ts = episode.start_ts, episode.end_ts
+        else:
+            # 起点是**这次接触**的开始，不是取料时刻。
+            #
+            # 取料与涂油并行判定，工人常常取完料过几秒才开刷（示例① 13.0s
+            # 取料、18.0s 才开刷）。按「取料时刻」当起点，事件区间会从取料
+            # 一直横跨到刷完（实测 13.93→18.93，看着像刷了 5 秒），复核页
+            # 核对时间点时对不上。``_attach_oiling`` 记下的
+            # ``_oiling_start_ts`` 才是这一段接触的起点。
+            #
+            # 终点取「接触结束」与「取料时刻」中较晚的那个：补挂的涂油是在
+            # 取料结算**之前**就刷上的（工人一边取料一边刷），接触结束可能
+            # 早于取料时刻（实测 8.73→7.47 那种倒挂），取较晚的才不出现
+            # end < start。
+            picked_at = task.picked_at or task.created_at
+            start_ts = (
+                picked_at if self._oiling_start_ts is None else self._oiling_start_ts
+            )
+            end_ts = max(ts, picked_at)
+        extra = {
+            "hand_track_id": task.hand_track_id,
+            "brush_track_id": task.brush_track_id,
+            "brush_hold_s": round(task.brush_hold_s, 3),
+            "required_s": self.cfg.brush_hold_s,
+        }
+        if judge is not None:
+            extra["judge"] = judge.to_dict()
+        if episode is not None:
+            extra["judge_episode"] = episode.to_dict()
+        emitted = self._emit_event(
             task,
             event_type=EventType.MANUAL_OILING,
             reason="manual_oiling_completed",
-            extra={
-                "hand_track_id": task.hand_track_id,
-                "brush_track_id": task.brush_track_id,
-                "brush_hold_s": round(task.brush_hold_s, 3),
-                "required_s": self.cfg.brush_hold_s,
-            },
-            # 起点取「取料时刻」和「这次接触起点」中较早的那个，终点取较晚
-            # 的那个：补挂的涂油是在取料结算之前就刷上的，按取料时刻起点会
-            # 得到倒挂区间（实测 8.73→7.47）。
-            start_ts=min(
-                task.picked_at or task.created_at,
-                self._oiling_start_ts or ts,
-            ),
-            end_ts=max(ts, task.picked_at or task.created_at),
+            extra=extra,
+            # 没有模型时：起点取「取料时刻」和「这次接触起点」中较早的那个，
+            # 终点取较晚的那个——补挂的涂油是在取料结算之前就刷上的，按取料
+            # 时刻起点会得到倒挂区间（实测 8.73→7.47）。
+            start_ts=start_ts,
+            end_ts=end_ts,
             review=build_oiling_summary(task, required_s=self.cfg.brush_hold_s),
         )
+
         self._logger.info(
             "人工二次涂油完成 %s（手持丝杆，刷头靠近 %.2fs）",
             task.task_id,

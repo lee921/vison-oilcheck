@@ -2116,3 +2116,40 @@ def test_pick_update_runs_the_split_handover(monkeypatch):
     feed(pipeline, 1.2, hand_at(*HAND_TARGET))
 
     assert len(seen) == 2, "每帧都应当先跑一次 ID 分裂接管"
+
+
+def test_oiling_event_starts_when_brushing_starts_not_at_pick_time():
+    """涂油事件的起点是「开刷」那一刻，不是取料时刻。
+
+    现场取完料常过几秒才开刷（示例① 13.0s 取料、18.0s 开刷）。若按取料
+    时刻当起点，事件区间会从取料横跨到刷完，复核页核对时间点对不上。
+    """
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5)
+    ts_iter = timestamps()
+    do_pick(pipeline, ts_iter)
+    picked = [e for e in events if e.event_type == EventType.PICK][0]
+    # 取完料先空手站着（手边有杆、刷头不在），过 2 秒再开刷。
+    ts = 0.0
+    for _ in range(10):
+        ts = next(ts_iter)
+        feed(pipeline, ts, hand_at(*HAND_TARGET), held_screw_at(*HAND_TARGET))
+    brush_start = next(ts_iter)
+    for _ in range(4):
+        ts = next(ts_iter)
+        feed(
+            pipeline,
+            ts,
+            hand_at(*HAND_TARGET),
+            held_screw_at(*HAND_TARGET),
+            brush_at(HAND_TARGET[0] + 10, HAND_TARGET[1]),
+        )
+
+    oil_events = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    assert len(oil_events) == 1
+    event = oil_events[0]
+    assert event.timestamp_start >= brush_start - 1e-6, (
+        f"事件起点 {event.timestamp_start:.2f} 早于开刷时刻 {brush_start:.2f}"
+    )
+    assert event.timestamp_start > picked.timestamp_start, "起点不该退回取料时刻"
+    assert event.timestamp_end >= event.timestamp_start

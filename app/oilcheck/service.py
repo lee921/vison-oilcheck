@@ -11,6 +11,7 @@ UI 只读取快照与事件，不直接触碰检测线程。
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -32,6 +33,7 @@ from .config import (
 )
 from .detector import Detector, create_detector
 from .events import EventStore
+from .judge import ForestJudge, LogisticJudge
 from .pipeline import StationPipeline
 from .plc_io import PlcEvidence, PlcIoThread
 from .recorder import TrainingRecorder, delete_segments, list_segments
@@ -900,6 +902,26 @@ class OilCheckService:
         self._event_store.add(event)
         self._logger.debug("事件已入库: %s", event.event_id)
 
+    def _load_judges(self):
+        """加载取料/涂油的二级判定权重（缺文件则不启用）。
+
+        权重放在配置目录（``config/judge_pick.json`` / ``judge_oiling.json``），
+        由 ``tools/train_judge.py`` 生成。两种格式都支持：
+
+        - 随机森林（``"kind": "forest"``，默认）：判别余量更大；
+        - 逻辑回归（无 ``kind`` 字段）：纯 numpy、可解释。
+
+        整个目录里都没有权重时记一条 debug 日志，启动输出不受影响，判定
+        按纯规则运行。
+        """
+
+        config_dir = self._config_service.config_dir
+        pick = _load_judge_file(config_dir / "judge_pick.json")
+        oiling = _load_judge_file(config_dir / "judge_oiling.json")
+        if pick is None and oiling is None:
+            self._logger.debug("未找到二级判定权重，判定按纯规则运行")
+        return pick, oiling
+
     def _build_runtime(self, station: StationConfig, kind: str) -> _StationRuntime:
         detector = create_detector(station, override_kind=kind)
         pipeline = StationPipeline(
@@ -910,6 +932,7 @@ class OilCheckService:
             detector_name=kind,
             logger=self._logger.getChild(f"station.{station.station_id}"),
         )
+        pipeline.attach_judges(*self._load_judges())
         return _StationRuntime(
             station=station,
             detector=detector,
@@ -1003,6 +1026,25 @@ class OilCheckService:
         except Exception:
             pass
         return None
+
+
+def _load_judge_file(path: Path):
+    """按文件里的 ``kind`` 字段挑加载器（随机森林 / 逻辑回归）。
+
+    两种格式混用是刻意的：随机森林余量大、默认用它；逻辑回归纯 numpy、
+    可解释，现场要核对「为什么判成取料」时可以换回去。
+    """
+
+    if not Path(path).is_file():
+        return None
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("二级判定权重 %s 无法解析，本次不启用", path)
+        return None
+    if isinstance(data, dict) and data.get("kind") == "forest":
+        return ForestJudge.load(path)
+    return LogisticJudge.load(path)
 
 
 def _pick_plc_task(
