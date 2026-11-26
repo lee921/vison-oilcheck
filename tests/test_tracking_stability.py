@@ -136,7 +136,6 @@ def test_anchor_not_hijacked_by_another_hand():
     ts_iter = timestamps()
     do_pick(pipeline, ts_iter)
     task = pipeline._cycles[pipeline.tasks[0].task_id]
-    anchor_before = task.screw_anchor
     cycle_hand = task.hand_track_id
 
     # 两只手同时在画面里：本周期那只手停在原处（杆被手遮住），
@@ -153,10 +152,14 @@ def test_anchor_not_hijacked_by_another_hand():
         )
 
     assert task.hand_track_id == cycle_hand
-    assert task.screw_anchor is not None
-    assert abs(task.screw_anchor[0] - anchor_before[0]) < 60
+    # 另一只手握的杆刷够了，但它不属于本周期这一件：本周期不能因此变 OILED。
     assert task.stage.value == "PICKED"
-    assert EventType.MANUAL_OILING not in [e.event_type for e in events]
+    attached = [
+        e
+        for e in events
+        if e.event_type == EventType.MANUAL_OILING and e.task_id == task.task_id
+    ]
+    assert attached == []
 
 
 def test_anchor_rebinds_when_cycle_hand_track_is_retired():

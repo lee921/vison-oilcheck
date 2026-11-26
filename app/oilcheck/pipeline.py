@@ -97,6 +97,14 @@ _CARRY_OUT_OF_TRAY_MAX_S = 5.0
 # 判断「这根杆是不是进盘时那批存货」的 IoU 门限。
 _INVENTORY_SAME_IOU = 0.5
 
+# 离盘后「手边有盘内杆」要连续多少帧，才认作真的握着这根杆往盘外带。
+#
+# 示例⑥ 第 2 件连续 8 帧以上都握着同一根杆往外走；示例① 工人按夹具、
+# 示例⑧ 工人把杆装上夹具，手只是从杆旁边划过，只有 1~2 帧命中。
+# 取 4 帧（15fps 下约 0.27s），既能排除「划过」，又不至于要求太久。
+_CARRY_CONFIRM_FRAMES = 4
+
+
 # 对**位置没动过**的杆，握持要求杆有足够面积落在手框右上区（实测盘边蹭到的
 # 静置杆 0.25~0.42，真正攥住的 ≥0.44）；对已经在动的杆，只要与右上区相交
 # 即算——它不可能是静置杆。
@@ -114,6 +122,20 @@ _CONTINUITY_STEP_ABS = 0.08
 # 仍被当成锚点自己那根。盘里相邻丝杆间距 0.02~0.03，取 0.02 以内的重叠
 # 不会把旁边的静置杆误认成锚点（见 ``_static_anchor_ok``）。
 _ANCHOR_SAME_SCREW_DISTANCE = 0.02
+
+# 「涂油还是同一根杆」的单帧位移容差（归一化，不随帧率放大）。
+#
+# 刷的时候手一直在动，杆框会随之晃动：实测同一根杆相邻帧的位置跳变在
+# 0.03 以内，换一根杆则是 0.1 以上（盘里相邻杆间距 0.02~0.03，但工人
+# 刷完一件换下一件要抬起来重新放，跨度远大于这个）。取 0.06 落在两者之间。
+_OILING_SAME_ROD_STEP = 0.06
+
+# 刷手抬开多久仍算同一次涂油（秒，按帧率放大）。
+#
+# 现场同一件料中途抬手的空档实测 0.5~1.3 s，不同料之间最短 1.07 s；
+# 单靠时间分不开，所以这个上限只用来兜底「长时间不碰就该收段」，
+# 真正的切分由杆的位置决定（见 ``_same_oiling_rod``）。
+_OILING_STITCH_GAP_S = 1.6
 
 
 @dataclass
@@ -172,6 +194,9 @@ class _HandVisit:
     last_hand_box: BBox | None = None
     # 离盘的时刻；此后继续攒盘外握持采样，攒够 n 个再定论。
     exited_at_ts: float | None = None
+    # 离盘后「手边有盘内杆」的连续帧数。攒够 ``_CARRY_CONFIRM_FRAMES`` 才
+    # 认作真正握着往盘外带走（见 ``_update_pick`` 的 carry 分支）。
+    carry_frames: int = 0
     # 是否已确认「进过盘」。一旦置真，这一段进盘过程就成立，直到离盘判定。
     entered_confirmed: bool = False
     # 逐帧累计的盘内停留时长（秒）。保留用于排查；判定用的是
@@ -379,6 +404,30 @@ class _Cycle:
         return self.final_result == TaskResult.PROCESSING
 
 
+@dataclass
+@dataclass
+class _OilingSession:
+    """一段连续接触：刷头工作点持续贴着**同一根**手持丝杆。
+
+    涂油的边界由杆决定，不由时间决定。现场同一件料上刷手会抬开 0.5~1.3 s
+    再放回来，不同料之间最短只有 1.07 s——时间上分不开，位置能分开。
+    """
+
+    anchor: tuple[float, float] | None = None
+    start_ts: float | None = None
+    # 上一帧的处理时刻（用来算空档）。
+    last_ts: float | None = None
+    # 最近一次「确实贴着刷」的时刻：判断空档该不该桥接用这个。
+    last_seen_ts: float | None = None
+    cum_s: float = 0.0
+    frames: int = 0
+    min_distance: float = 1.0
+    brush_track_id: int | None = None
+    # 由几个接触片段拼成（中途抬手又放回来会加一）。
+    parts: int = 1
+    reported_ts: float | None = None
+
+
 class StationPipeline:
     """单相机/单工位的取料与人工涂油判定。"""
 
@@ -447,6 +496,16 @@ class StationPipeline:
         self._outside_holding_last_ts: dict[int, float] = {}
         self._cycles: dict[str, _Cycle] = {}
         self._task_seq = 0
+        # 当前正在累计的涂油接触段（见 ``_OilingSession``）。与取料并行：
+        # 工人常常一边取料一边就刷上了，不能等取料周期建立再开始判涂油。
+        self._active_oiling: _OilingSession | None = None
+        # 没有对应取料周期的涂油，事件键按段递增。
+        self._free_oiling_seq = 0
+        # 正在上报那一次涂油的接触起点（``_complete_oiling`` 组事件用）。
+        self._oiling_start_ts: float | None = None
+        # 已经判完、但当时还没有取料周期可挂的涂油（「一边取料一边刷」）。
+        # 取料确认时如果就是这根杆，补挂到那条周期上，而不是当成无主涂油。
+        self._pending_oilings: list[tuple[_OilingSession, float]] = []
 
         self._last_frame_ts: float | None = None
         self._frame_size: tuple[int, int] = (0, 0)
@@ -496,6 +555,8 @@ class StationPipeline:
         self._visits.clear()
         self._outside_holding.clear()
         self._outside_holding_last_ts.clear()
+        self._active_oiling = None
+        self._pending_oilings.clear()
         self._cycles.clear()
         # 任务序号**不归零**：重置后下一件若又叫 TASK-000001，PLC 侧的
         # hold_done_task_id 会把它当成「这一件结论已报完」，整件在 PLC 上
@@ -980,6 +1041,21 @@ class StationPipeline:
                 # 进盘时就在盘里的存货不算（``entry_inventory``）。
                 if self._carrying_out_of_tray(hand_box, visit.entry_inventory):
                     if ts - visit.exited_at_ts <= self._carry_wait_s():
+                        # 「手边有随手动、杆心还在盘区内」是**带杆出门**的
+                        # 暂定证据：工人把杆停在盘区下沿刷完再带走时，杆心一
+                        # 直没出盘，holding_now 全程为假，不记这一条整件取料
+                        # 会丢（示例⑥ 第 2 件 10.07s、示例⑦ 第 2/3 件）。
+                        #
+                        # 但「手在盘外 + 手边有盘内杆」本身不够：手框很大，
+                        # 盘里/夹具上的杆都会落进来。示例① 工人按夹具、示例⑧
+                        # 工人把杆装上夹具，都会被凭空判成一次取料。
+                        #
+                        # 差别在**持续握住同一根**：示例⑥ 第 2 件连续 8 帧
+                        # 手边都是同一根杆、并一路把它带出盘；示例① 只在
+                        # 手划过的 2 帧里碰到杆。所以这里按连续帧数认定。
+                        visit.carry_frames += 1
+                        if visit.carry_frames >= _CARRY_CONFIRM_FRAMES:
+                            visit.holding_seen = True
                         # 等杆出盘的这段里，手确实在盘外：照常记「盘外空手」
                         # 历史，供**下一次**进盘定性。旧实现这几帧已经结算、
                         # 重建了进盘过程，每帧都在记；现在过程还挂着，不补
@@ -1530,12 +1606,19 @@ class StationPipeline:
         task.stage_since = ts
         task.picked_at = ts
         task.hand_track_id = hand_track_id
+        # 取料与涂油并行判定：工人一边取料一边刷时，涂油段起于取料结算
+        # 之前，**不能**因为它还没挂上周期就清掉（示例⑤ 6.47~10.20 就是
+        # 一整段连续涂抹，切成两段会多报一次）。
+        #
+        # 但「已经在某一件上报过的段」要收：那是上一件的涂油，新一件的
+        # 刷动不该并进去（两件的杆可能落在同一位置，位置判才分不开）。
+        self._close_oiling_if_settled()
         task.screw_observed = True
-        # 锚点留空：离盘那一刻手里可能还压着盘边的杆，直接拿来初始化会锁错
-        # 目标（锁成留在盘里的那根）。交给 _current_screw_box 用「跟手框交叠」
-        # 的杆初始化，那才是真正被带走的这根。
-        task.screw_anchor = None
-        task.screw_anchor_ts = None
+        # 记下取料那一刻手里那根杆的位置：之后这次涂油要么就发生在它上面，
+        # 要么在它旁边（工人会走动）。没有它就无从判断「这次涂油属于哪一件」，
+        # 另一只手握着别的杆刷够了会被错挂到本周期上（实测）。
+        task.screw_anchor = screw.box.center
+        task.screw_anchor_ts = ts
         task.confidence = screw.confidence
         task.reason_code = "PICK_CONFIRMED"
         task.last_seen_ts = ts
@@ -1560,83 +1643,560 @@ class StationPipeline:
             hand_track_id,
             dwell_s,
         )
+        # 「一边取料一边刷」：这次涂油在取料结算之前就判完了，补挂上来。
+        self._drain_pending_oilings(task, ts)
 
     # ------------------------------------------------------------------
     # 人工二次涂油判定
     # ------------------------------------------------------------------
     def _update_oiling(self, *, ts: float, dt: float) -> None:
-        """手持丝杆期间刷头持续靠近 ⇒ 人工二次涂油完成。"""
+        """人工二次涂油：刷头贴着手持丝杆累计接触 ⇒ 完成。
 
-        task = next(
-            (
-                item
-                for item in self._cycles.values()
-                if item.active and item.stage == TaskStage.PICKED
-            ),
-            None,
-        )
-        if task is None:
-            return
-        screw_box = self._current_screw_box(task, ts)
-        if screw_box is None:
-            # 手持丝杆当帧不可见、也超出预测保持时长：不累计接触时长，
-            # 但不结束周期，等丝杆重新出现。
-            return
-        task.last_seen_ts = ts
-        # 复核统计：手持丝杆被定位到的帧数（可见比例的分母）。
-        task.tap_frames += 1
+        **与取料并行判定，不依赖作业周期**。现场就是这样：工人常常一边
+        取料一边就刷上了（示例7 第 2 件、示例6 第 3 件），要等「手离开盘区」
+        才建立取料周期的话，刷的那两秒正好落在周期建立之前，整段丢掉、
+        随后还被下一次取料判成漏涂。
 
-        brush = self._nearest_brush(screw_box)
-        if brush is None:
-            # 区分两种「没靠近」：
-            # - 刷子当帧根本没被检测到 → 属于漏检，保留 last_brush_ts，
-            #   下一帧靠近时把空档补回来；
-            # - 刷子检测到了但离得远 → 确实没在刷，累计中断，清空桥接点。
-            if self._has_live_brush():
-                task.last_brush_ts = None
-                # 复核统计：连续接触段在此中断。
-                self._close_brush_run(task)
-            return
-        task.brush_track_id = brush.track_id
-        # 复核统计：接触帧数、最近距离、连续段时长（不改任何判定结果）。
-        task.brush_near_frames += 1
-        distance = self._brush_work_distance(screw_box, brush)
-        if task.brush_min_distance is None or distance < task.brush_min_distance:
-            task.brush_min_distance = distance
-        task.brush_last_near_ts = ts
-        if task.brush_run_start_ts is None:
-            task.brush_run_start_ts = ts
-        task.brush_longest_run_s = max(
-            task.brush_longest_run_s, ts - task.brush_run_start_ts
-        )
-        if dt <= 0:
-            # 时间没前进（同时间戳重复帧）：不累计，但要记住靠近状态。
-            task.last_brush_ts = ts
-            return
-        # 低帧率下刷子常有一两帧漏检，那几帧的 dt 若直接丢弃，累计会明显
-        # 偏短（3~5fps 时每漏一帧就少 0.2~0.3s）。这里把「上一次靠近」到
-        # 本帧的空档一并计入，上限按实际帧率放大后的 brush_hold_max_gap_s。
-        # 桥接空档与 dt 用同一个可信上限：原先 dt 夹到 1.0s、桥接却按
-        # brush_hold_max_gap_s×scale 给到 2.0s，一次掉帧就能把 0.2s 的
-        # 真实靠近凑成 1.0s 以上并直接判完成（实测）。时间不可信的帧
-        # 不桥接，只累计可信的 dt。
-        add = dt
-        if task.last_brush_ts is not None and self._timing_reliable:
-            gap = ts - task.last_brush_ts
-            max_gap = min(
+        「一次涂油」的边界由**杆**决定，和 ``tools/detect_operations.py``
+        同一口径：换一根杆就另起一次；同一根杆上刷手抬一下再放回来
+        （现场每件都有 0.5~1.3 s 遮挡）仍算同一次。
+        """
+
+        self._flush_stale_pending_oilings(ts)
+        session = self._active_oiling
+        contacts = self._oiling_contacts()
+        if session is not None:
+            # 只要还在跟同一根杆，不论中间空了几帧都优先续上。
+            matched = next(
+                (
+                    item
+                    for item in contacts
+                    if self._same_oiling_rod(item[1], session)
+                ),
+                None,
+            )
+            if matched is None and contacts:
+                # 场上还有别的杆在被刷：这一根换了，本段到此为止。
+                self._close_oiling()
+                session = None
+        else:
+            matched = None
+        if matched is None and session is None and contacts:
+            matched = contacts[0]
+
+        if matched is not None:
+            distance, box, brush = matched
+            if session is None:
+                # 首帧也把这一帧的 dt 记进去：刷头此刻确实贴着，和后续帧
+                # 一样是有效接触。脚本没有 dt 概念、只能从第二帧起算，
+                # 这里按判定的实际口径算，低帧率下才不会少算一帧。
+                self._active_oiling = _OilingSession(
+                    anchor=box.center,
+                    start_ts=ts,
+                    last_ts=ts,
+                    last_seen_ts=ts,
+                    cum_s=max(0.0, dt),
+                    frames=1,
+                    min_distance=distance,
+                    brush_track_id=brush.track_id,
+                )
+                self._publish_oiling_progress(self._active_oiling)
+                return
+            gap = max(0.0, ts - session.last_ts)
+            # 漏检/抬手的空档按帧率放大的桥接窗口补回来，超出就不再计入
+            # ——把整段空档都算成接触会把「刷两下就走」凑成完成。
+            bridge = min(
                 self.cfg.brush_hold_max_gap_s * self._frame_scale,
                 self._max_plausible_dt(),
             )
-            # 加一点容差：max_gap 由乘法算出（如 0.2×2），实际 gap 恰等
-            # 于它时会被浮点误差挡在门外（0.4 > 0.3999999999999999）。
-            if 0 < gap <= max_gap + 1e-9:
-                add = gap
-        task.last_brush_ts = ts
-        task.brush_hold_s += add
-        # 逐帧累加 dt 会有浮点误差（10 个 0.1s 累加小于 1.0），
-        # 留一点容差，避免刚好等于阈值时永远差一帧。
-        if task.brush_hold_s >= self.cfg.brush_hold_s - 1e-9:
-            self._complete_oiling(task, ts)
+            if gap > bridge:
+                session.parts += 1
+            session.cum_s += min(gap, bridge)
+            session.last_ts = ts
+            session.last_seen_ts = ts
+            session.frames += 1
+            session.anchor = box.center
+            session.min_distance = min(session.min_distance, distance)
+            session.brush_track_id = brush.track_id
+            self._publish_oiling_progress(session)
+            if (
+                session.reported_ts is None
+                and session.cum_s >= self.cfg.brush_hold_s - 1e-9
+            ):
+                self._finish_oiling(ts)
+            return
+
+        if session is None:
+            return
+        # 本帧没贴着刷。三种情形要分开：
+        # - 场上还有手持杆、只是刷头没贴上去 → 真的停手了，靠拼接窗口收段；
+        # - 一根手持杆都没看见（被手完全挡住 / 整帧漏检）→ 接着往下判，
+        #   把这段时间按桥接窗口补上：现场的杆本来就常被拳头压住，
+        #   不补会让「刷了 2 秒、中间遮了 0.4 秒」凑不够 brush_hold_s；
+        # - 超时 → 收段。
+        if self._oiling_held_rods() or self._screw_visible_anywhere():
+            # 场上有丝杆被检出：手确实松开了 / 刷头确实离开了，不补时间。
+            # 只有「连一根杆都检不到」才算整帧遮挡，才往下桥接——
+            # 用「有没有手持杆」区分不了这两种，杆画得出来但不在手里
+            # 和杆被手完全压住是两回事。
+            pass
+        elif ts - session.last_seen_ts <= self._oiling_occluded_hold_s():
+            bridge = min(
+                self.cfg.brush_hold_max_gap_s * self._frame_scale,
+                self._max_plausible_dt(),
+            )
+            gap = max(0.0, ts - session.last_ts)
+            if gap > bridge:
+                session.parts += 1
+            session.cum_s += min(gap, bridge)
+            session.last_ts = ts
+            session.frames += 1
+            self._publish_oiling_progress(session)
+            if (
+                session.reported_ts is None
+                and session.cum_s >= self.cfg.brush_hold_s - 1e-9
+            ):
+                self._finish_oiling(ts)
+            return
+        # 本帧没贴着刷：短暂抬手/漏检先挂着，超过拼接窗口再收段。
+        if ts - session.last_seen_ts > self._oiling_stitch_gap_s():
+            self._close_oiling()
+
+    def _publish_oiling_progress(self, session: _OilingSession) -> None:
+        """把当前接触段的进度同步到正在等涂油的那个周期上。
+
+        ``brush_hold_s`` 等字段供监控卡片、复核页与 PLC 灯效实时显示，
+        不能只在判完的那一刻才写一次。
+        """
+
+        task = self._oiling_target_cycle(session)
+        if task is None:
+            return
+        task.brush_hold_s = session.cum_s
+        task.brush_track_id = session.brush_track_id
+        task.brush_min_distance = session.min_distance
+        task.brush_near_frames = session.frames
+        task.last_seen_ts = session.last_seen_ts
+
+    def _oiling_held_rods(self) -> tuple[BBox, ...]:
+        """本帧「被手握着」的丝杆框。
+
+        不要求杆心出盘：``tray_roi`` 是为取料划的，下沿常盖住工人刷油的
+        位置，刷的时候杆压在盘区里是常态（示例6 第 1、3 件）。握着的事实
+        用「杆框与手框交叠 + 杆心在手附近」判断。
+        """
+
+        label = self.station.detector.screw_label
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        limit = self.cfg.hand_screw_max_distance * self._frame_scale
+        anchor = None if self._active_oiling is None else self._active_oiling.anchor
+        boxes: list[BBox] = []
+        for det in self._last_detections:
+            if det.label != label:
+                continue
+            cx, cy = det.box.center
+            for hand in self._hand_tracks:
+                if not hand.matched:
+                    continue
+                hand_box = hand.observation_box()
+                if not _overlaps(det.box, hand_box):
+                    continue
+                hx, hy = hand_box.center
+                if math.hypot(cx - hx, cy - hy) / diag > limit:
+                    continue
+                # 盘里那根没被动过的存货不算「被握着」：手框很大，伸进盘里
+                # 抓料时会与整排存货交叠，不排除就会把盘里的料当成正在刷的
+                # 那根，让没刷的那一件也累计够了（实测会吞掉漏涂 NG）。
+                #
+                # 只排除**在盘区内**的静置杆：盘区外台面上的待刷杆同样不动，
+                # 但它就是工人要刷的那根。
+                # 当前这一段自己那根除外——拳头压着杆时它可能连续几帧不动。
+                if (
+                    len(self._screw_history) >= _SCREW_STATIC_BACK
+                    and self._screw_parked_in_tray(det)
+                    and not self._same_rod_pos(det.box, anchor, diag)
+                ):
+                    continue
+                boxes.append(det.box)
+                break
+        return tuple(boxes)
+
+    @staticmethod
+    def _same_rod_pos(
+        box: BBox, anchor: tuple[float, float] | None, diag: float
+    ) -> bool:
+        if anchor is None:
+            return False
+        cx, cy = box.center
+        return (
+            math.hypot(cx - anchor[0], cy - anchor[1]) / diag
+            <= _OILING_SAME_ROD_STEP
+        )
+
+    def _oiling_contacts(self) -> list[tuple[float, BBox, Track]]:
+        """本帧「刷头工作点贴着某只手里的杆」的全部候选，按距离升序。
+
+        与 ``tools/detect_operations.py`` 的 ``OilingDetector._contacts``
+        同一口径：遍历本帧全部刷头轨迹与全部手持杆，取刷头工作点到杆身
+        中线的垂距 ≤ ``brush_contact_distance`` 的组合。
+        """
+
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        held = self._oiling_held_rods()
+        if not held:
+            return []
+        contacts: list[tuple[float, BBox, Track]] = []
+        for brush in self._brush_tracks:
+            if not brush.matched or brush.hits < self._brush_tracker.min_hits:
+                continue
+            point = brush_work_point(brush, self.station.detector)
+            for box in held:
+                distance = _distance_to_long_axis(box, point) / diag
+                if distance <= self.cfg.brush_contact_distance:
+                    contacts.append((distance, box, brush))
+        contacts.sort(key=lambda item: item[0])
+        return contacts
+
+    def _same_oiling_rod(self, box: BBox, session: _OilingSession) -> bool:
+        if session.anchor is None:
+            return True
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        cx, cy = box.center
+        return (
+            math.hypot(cx - session.anchor[0], cy - session.anchor[1]) / diag
+            <= _OILING_SAME_ROD_STEP
+        )
+
+    def _screw_visible_anywhere(self) -> bool:
+        """本帧是否检出了任意一根丝杆（不要求在手边）。"""
+
+        label = self.station.detector.screw_label
+        return any(det.label == label for det in self._last_detections)
+
+    def _oiling_occluded_hold_s(self) -> float:
+        """杆整帧看不见时，还能按「还在刷」往下补多久。
+
+        与「手持丝杆被预测保持多久」同一口径（``held_predict_hold_s``）：
+        拳头压住杆是常态，补一两帧能救回真实接触；补得更久就等于凭空
+        造时间，会把「刷两下就走」凑成完成。
+        """
+
+        # 不乘 frame_scale：那是给「判定门槛」用的放大，用在这里会让低帧率
+        # 下把「手早就松开了」也补进来（实测 3 倍放大后能凭空补 1.5s）。
+        # 只补得了「一两帧漏检」，最多一个可信帧间隔。
+        return min(
+            self.cfg.held_predict_hold_s,
+            self._max_plausible_dt(),
+        )
+
+    def _oiling_stitch_gap_s(self) -> float:
+        return max(
+            _OILING_STITCH_GAP_S,
+            self.cfg.brush_hold_max_gap_s,
+        ) * self._frame_scale
+
+    def _close_oiling(self) -> None:
+        """收掉当前接触段；还没报过且累计够长的才算一次涂油。"""
+
+        session = self._active_oiling
+        if session is None:
+            return
+        self._active_oiling = None
+        if (
+            session.reported_ts is None
+            and session.cum_s >= self.cfg.brush_hold_s - 1e-9
+        ):
+            self._finish_oiling(session.last_ts, session=session)
+
+    def _finish_oiling(
+        self, ts: float, *, session: _OilingSession | None = None
+    ) -> None:
+        """一次涂油达成：并入最近的取料周期，或单独报一条。"""
+
+        session = session or self._active_oiling
+        if session is None:
+            return
+        # 不把这一段从 ``_active_oiling`` 摘下来：刷手判完通常还在这根杆上
+        # 继续刷，摘掉就会在下一帧另开一段、再报一次。等杆换了或离开，
+        # ``_close_oiling`` 才会收段。
+        session.reported_ts = ts
+        task = self._oiling_target_cycle(session)
+        if task is not None:
+            self._attach_oiling(task, session, ts)
+            return
+        # 还没有取料周期可挂。分两种情形：
+        #
+        # - 有手正在盘区里（取料进行中）：工人常常一边取料一边就刷上了，
+        #   取料要等手离开盘区才结算，那会儿这次涂油已经判完。先存着，
+        #   取料确认时按杆补挂——立刻报成无主涂油会让这一件没有归属。
+        # - 没有手在盘区里：这是纯涂油（录像开头就在刷、取完又补刷），
+        #   现场按规则不算异常，直接报出去。
+        if session.anchor is not None and self._pick_in_progress():
+            self._pending_oilings.append((session, ts))
+            return
+        self._emit_free_oiling(session, ts)
+
+    def _pick_in_progress(self) -> bool:
+        """取料是不是正在进行中（进盘过程还挂着、尚未结算）。
+
+        判据用「有没挂着未结算的进盘过程」而不是「盘区里有没有手」：
+        工人常常站在盘边刷，手刚好在盘区下沿外一点点；按盘区判会在
+        涂油判完的那一刻返回 False，这次涂油就被报成无主涂油
+        （示例⑤ 6.47s、示例⑦ 11.93s 实测）。进盘过程挂着，说明这一趟
+        还没定论，涂油应该等它。
+        """
+
+        # 「已确认进盘、还没结算」才算取料进行中。手在旁边走过（还没进盘）
+        # 或只是被跟踪着，不算。
+        #
+        # 注意离盘之后、结算之前这段也算：那时正在攒盘外握持采样，
+        # 取料马上就要确认了，这一件的涂油该等它挂上去（示例⑤ 6.47s、
+        # 示例⑦ 11.93s 就落在这一段里）。
+        if any(visit.entered_confirmed for visit in self._visits.values()):
+            return True
+        # 手已在盘区里但离盘还没按采样窗口确认：这也是取料进行中。
+        tray_box = self._tray_region_box(self._frame_size)
+        if tray_box is None:
+            return False
+        return any(
+            visit.inside_tray
+            and visit.last_hand_box is not None
+            and _box_center_in(visit.last_hand_box, tray_box)
+            for visit in self._visits.values()
+        )
+
+    def _flush_stale_pending_oilings(self, ts: float) -> None:
+        """暂存太久、始终没等到对应取料的涂油，按无主涂油报出去。
+
+        现场确实有「录前就在刷、整段都没有取料」的情形（示例③④⑦ 开头）。
+        等 `oiling_timeout_s` 这么久还没有取料，就不再等；设 0 时用一个
+        保守的固定值，保证视频结束前也能报出来。
+        """
+
+        if not self._pending_oilings:
+            return
+        wait = self.cfg.oiling_timeout_s if self.cfg.oiling_timeout_s > 0 else 10.0
+        for session, oil_ts in list(self._pending_oilings):
+            if ts - oil_ts < wait:
+                continue
+            self._pending_oilings.remove((session, oil_ts))
+            self._emit_free_oiling(session, oil_ts)
+
+    def _attach_oiling(
+        self, task: _Cycle, session: _OilingSession, ts: float
+    ) -> None:
+        """把一次涂油记到某个周期上并判完成。"""
+
+        if not task.active or task.stage != TaskStage.PICKED:
+            # 这一件已经判过（多次涂油的情形），不重复上报。
+            return
+        self._oiling_start_ts = session.start_ts
+        task.brush_hold_s = session.cum_s
+        task.brush_track_id = session.brush_track_id
+        task.brush_min_distance = session.min_distance
+        task.brush_near_frames = session.frames
+        if task.screw_anchor is None and session.anchor is not None:
+            task.screw_anchor = session.anchor
+        self._complete_oiling(task, ts)
+
+    def _close_oiling_if_settled(self) -> None:
+        """当前涂油段已经完整报过（且不是暂存待挂的），就收段。"""
+
+        session = self._active_oiling
+        if session is None or session.reported_ts is None:
+            return
+        # 还在 pending 里等这一件结算的，不能收——它马上就要挂到新周期上。
+        if any(item[0] is session for item in self._pending_oilings):
+            return
+        self._close_oiling()
+
+    def _drain_pending_oilings(self, task: _Cycle, ts: float) -> bool:
+        """把暂存的涂油补挂到刚建立的周期上。
+
+        只认「同一根杆」：暂存的是工人的涂油，取料确认的是从盘里拿出来的
+        那一根，两者位置对得上才是同一件。
+        """
+
+        if not self._pending_oilings or task.screw_anchor is None:
+            return False
+        for session, oil_ts in list(self._pending_oilings):
+            if session.anchor is None:
+                continue
+            if not self._same_anchor(task.screw_anchor, session.anchor):
+                continue
+            self._pending_oilings.remove((session, oil_ts))
+            self._attach_oiling(task, session, oil_ts)
+            return True
+        return False
+
+    def _oiling_target_cycle(self, session: _OilingSession) -> _Cycle | None:
+        # 第一步就排除「这根杆在被别的手握着」：取料时记下了那是哪只手，
+        # 画面里另一只手握着另一根杆刷，不该算到这一件上。
+
+        """这次涂油该记到哪个取料周期上。
+
+        只有「同一根杆」才认：周期在取料那一刻记下了手里那根杆的位置，
+        这次刷的杆必须就是它。不校验的话，画面里另一只手握着别的杆刷够了，
+        会被错挂到本周期上、把这一件提前判成已涂油（实测会吞掉真实漏涂）。
+        """
+
+        candidates = [
+            task
+            for task in self._cycles.values()
+            if task.active and task.stage == TaskStage.PICKED
+        ]
+        if not candidates:
+            return None
+        session_anchor = session.anchor
+        if session_anchor is not None:
+            by_hand = [
+                task
+                for task in candidates
+                if self._hand_holds_point(task.hand_track_id, session_anchor)
+            ]
+            if by_hand:
+                candidates = by_hand
+            elif any(task.hand_track_id is not None for task in candidates):
+                # 取料那几只手里没有一只握着这根杆。要区分两种情形：
+                #
+                # - 取料那只手**还在画面里**（只是空着手）：这根杆是别的
+                #   手里的，不归这一件。现场实测就有一只空手站在原处、
+                #   另一只手刷另一根的情形，认了会把这一件提前判成已涂油。
+                # - 取料那只手**已经不在画面里**（拿杆走开、或视觉 ID 重建）：
+                #   无歧义，就是这一件，认。
+                if self._any_cycle_hand_still_visible(candidates):
+                    return None
+            matched = [
+                task
+                for task in candidates
+                if task.screw_anchor is not None
+                and self._same_anchor(task.screw_anchor, session_anchor)
+            ]
+            if not matched:
+                # 位置对不上。只有**确实存在另一个候选周期**时才据此拒绝：
+                # 工人取完料走动一段再刷是常有的事，只有一个周期在等涂油
+                # 时无歧义，认它；有两个以上在等，才按位置挑。
+                if len(candidates) > 1:
+                    return None
+            else:
+                candidates = matched
+        # 多次涂油时挂到最近一次取料的那一件上。
+        return max(candidates, key=lambda item: item.picked_at or item.created_at)
+
+    def _any_cycle_hand_still_visible(self, tasks: list[_Cycle]) -> bool:
+        """这些周期记下的取料那只手，还有没有一只在画面里。"""
+
+        return any(
+            task.hand_track_id is not None
+            and self._live_hand(task.hand_track_id) is not None
+            for task in tasks
+        )
+
+    def _other_hand_holds_other_rod(
+        self, anchor: tuple[float, float]
+    ) -> bool:
+        """画面的其他手里是不是也握着杆（即「这根杆归谁」存在歧义）。"""
+
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        label = self.station.detector.screw_label
+        for det in self._last_detections:
+            if det.label != label:
+                continue
+            if (
+                math.hypot(det.box.center[0] - anchor[0], det.box.center[1] - anchor[1])
+                / diag
+                <= _OILING_SAME_ROD_STEP
+            ):
+                continue
+            # 这里按「任意手与任意杆交叠」判，不套 ``_oiling_held_rods`` 的
+            # 盘内存货过滤——那只负责选当前要跟的杆，这里要回答的是
+            # 「场上有几只手里有杆」。
+            for hand in self._hand_tracks:
+                if not hand.matched:
+                    continue
+                if _overlaps(det.box, hand.observation_box()):
+                    return True
+        return False
+
+    def _hand_holds_point(
+        self, hand_track_id: int | None, point: tuple[float, float]
+    ) -> bool:
+        """那只手此刻是不是正握着这个位置上的杆。"""
+
+        if hand_track_id is None:
+            return False
+        hand = self._live_hand(hand_track_id)
+        if hand is None:
+            return False
+        hand_box = hand.observation_box()
+        if not _box_center_in(BBox(point[0] - 8, point[1] - 8, point[0] + 8, point[1] + 8), hand_box):
+            # 手框不一定「包含」杆心（握在手里时杆心常在手框边缘外），
+            # 退一步按中心距离判。
+            hx, hy = hand_box.center
+            width, height = self._frame_size
+            diag = max(1.0, math.hypot(width, height))
+            if math.hypot(point[0] - hx, point[1] - hy) / diag > (
+                self.cfg.hand_screw_max_distance
+            ):
+                return False
+        return True
+
+    def _same_anchor(
+        self, a: tuple[float, float], b: tuple[float, float]
+    ) -> bool:
+        """两个位置是不是同一根杆（按涂油判定的同杆容差，放宽两倍）。
+
+        工人取完料会走动，同一根杆后来的位置和取料那一刻可以差一截；
+        这里只用来**否定**「明显是另一根杆」，宁可放宽也不要错挂。
+        """
+
+        width, height = self._frame_size
+        diag = max(1.0, math.hypot(width, height))
+        return (
+            math.hypot(a[0] - b[0], a[1] - b[1]) / diag
+            <= _OILING_SAME_ROD_STEP * 2
+        )
+
+    def _emit_free_oiling(self, session: _OilingSession, ts: float) -> None:
+        """没有对应取料周期的涂油（录像开头就已在刷、或取完又补刷）。"""
+
+        self._free_oiling_seq += 1
+        event = EventRecord.create(
+            timestamp_start=float(session.start_ts or ts),
+            timestamp_end=float(ts),
+            station_id=self.station.station_id,
+            camera_id=self.station.camera_id,
+            cycle_id=self.cycle_id,
+            task_id="",
+            event_type=EventType.MANUAL_OILING,
+            result=EventResult.CONFIRMED,
+            evidence={
+                "task_id": "",
+                "reason": "manual_oiling_completed",
+                "cycle_attached": False,
+                "brush_track_id": session.brush_track_id,
+                "brush_hold_s": round(session.cum_s, 3),
+                "required_s": self.cfg.brush_hold_s,
+                "brush_min_distance": round(session.min_distance, 4),
+                "brush_near_frames": session.frames,
+                "contact_parts": session.parts,
+                "detector": self.detector_name,
+                "free_oiling_seq": self._free_oiling_seq,
+            },
+        )
+        self._events_emitted += 1
+        self._logger.info(
+            "人工二次涂油完成（未挂作业周期，刷头靠近 %.2fs）", session.cum_s
+        )
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:  # noqa: BLE001
+                self._logger.exception("事件回调失败")
 
     def _static_anchor_ok(self, box: BBox, anchor: tuple[float, float] | None) -> bool:
         """这根杆能不能当「手里那根」的候选。
@@ -2071,8 +2631,14 @@ class StationPipeline:
                 "brush_hold_s": round(task.brush_hold_s, 3),
                 "required_s": self.cfg.brush_hold_s,
             },
-            start_ts=task.picked_at or task.created_at,
-            end_ts=ts,
+            # 起点取「取料时刻」和「这次接触起点」中较早的那个，终点取较晚
+            # 的那个：补挂的涂油是在取料结算之前就刷上的，按取料时刻起点会
+            # 得到倒挂区间（实测 8.73→7.47）。
+            start_ts=min(
+                task.picked_at or task.created_at,
+                self._oiling_start_ts or ts,
+            ),
+            end_ts=max(ts, task.picked_at or task.created_at),
             review=build_oiling_summary(task, required_s=self.cfg.brush_hold_s),
         )
         self._logger.info(

@@ -467,6 +467,14 @@ class PipelineConfig:
     # 用空档桥接把这段补回来（按实际帧率缩放）。
     brush_hold_max_gap_s: float = 0.50
 
+    # 涂油判完之后，「同一件还在继续刷」要压住多久不再重复上报。
+    #
+    # 现场刷够 brush_hold_s 并不会立刻撒手：一件常常连续刷 3~6 秒（示例④
+    # 最长 5.93s）。判完就解除、允许再起一段，会把同一件刷成好几次。
+    # 取 2.5s：实测同一件上刷手的停顿 ≤1.5s，不同件之间最短 1.07s；这个值
+    # 落在两者之间，且按帧率放大（低帧率下两帧间隔本来就长）。
+    oiling_holdoff_s: float = 2.5
+
     # 手持丝杆离开画面后，允许重新捕获的时长。工人取完料可能拿着杆走出
     # 画面、过一会儿再回来涂油，这段时间内周期保持 PICKED 并继续等；
     # 超过该时长仍未重新出现，才认为这一件不再回来。
@@ -642,6 +650,7 @@ class PipelineConfig:
             brush_hold_max_gap_s=_f(
                 "brush_hold_max_gap_s", d.brush_hold_max_gap_s, 0.0
             ),
+            oiling_holdoff_s=_f("oiling_holdoff_s", d.oiling_holdoff_s, 0.0),
             screw_reacquire_timeout_s=_f(
                 "screw_reacquire_timeout_s", d.screw_reacquire_timeout_s, 0.0
             ),
@@ -710,6 +719,7 @@ class PipelineConfig:
             "screw_anchor_max_step_abs": self.screw_anchor_max_step_abs,
             "screw_anchor_hold_s": self.screw_anchor_hold_s,
             "brush_hold_max_gap_s": self.brush_hold_max_gap_s,
+            "oiling_holdoff_s": self.oiling_holdoff_s,
             "screw_reacquire_timeout_s": self.screw_reacquire_timeout_s,
             "frame_scale_max": self.frame_scale_max,
             "roi_track_margin": self.roi_track_margin,
@@ -1801,6 +1811,10 @@ CONFIG_COMMENTS: dict[str, str] = {
     "pipeline.brush_hold_max_gap_s": (
         "刷头整帧漏检时允许补回的最大空档。用于低帧率下不丢时间；"
         "刷子检测到了但离得远不补"
+    ),
+    "pipeline.oiling_holdoff_s": (
+        "同一件刷够时长后继续刷多久内不再算新的一次涂油。刷够并不会立刻撒手，"
+        "一件常连续刷 3~6 秒；按帧率放大"
     ),
     # ---- pipeline：周期 ----
     "pipeline.holding_lost_timeout_s": (

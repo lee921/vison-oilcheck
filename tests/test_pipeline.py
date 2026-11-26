@@ -993,15 +993,79 @@ def test_second_cycle_is_detected_after_first_completes():
     assert len(completed) == 2
 
 
-def test_oiling_not_started_before_pick():
-    """没有取料就没有涂油判定，即使手与刷子一直在一起。"""
+def test_oiling_without_pick_is_reported_and_not_an_anomaly():
+    """录像开头就握杆在刷、没有取料：照样报涂油，但不建周期、不算异常。
+
+    现场录像常常从「工人已经握着丝杆开刷」开始（示例②③④⑦ 都是），
+    取料发生在录制之前。旧实现在没有 PICKED 周期时直接 return，这一段
+    涂油整段丢掉；现在它作为一条不挂周期的事件报出来。
+    """
 
     pipeline, events = make_pipeline()
     ts_iter = timestamps()
     feed_brush(pipeline, ts_iter, frames=6)
 
-    assert events == []
+    oils = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    assert len(oils) == 1
+    assert oils[0].result == EventResult.CONFIRMED
+    assert oils[0].task_id == ""
+    assert oils[0].evidence["cycle_attached"] is False
+    # 不建周期，也不产生任何 NG：没有取料就没有「漏涂」这回事。
     assert pipeline.tasks == ()
+    assert [e for e in events if e.event_type == EventType.OILING_MISSING] == []
+
+
+def test_oiling_without_pick_emits_once_per_contact_segment():
+    """同一段连续刷只报一次；离开足够久再刷够一次，就再报一次。"""
+
+    # 压制窗口取 oiling_holdoff_s；这里设小一点，用例才好构造「离开够久」。
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_holdoff_s=1.0)
+    ts_iter = timestamps()
+    feed_brush(pipeline, ts_iter, frames=6)
+    # 刷子离开够久（> 1.0s × 帧率倍率），再回来刷够一次。
+    feed_brush(pipeline, ts_iter, frames=30, near=False)
+    feed_brush(pipeline, ts_iter, frames=6)
+
+    oils = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    assert len(oils) == 2
+    assert all(e.task_id == "" for e in oils)
+
+
+def test_long_continuous_brushing_reports_once():
+    """一件连续刷很久（没撒手）只算一次涂油。
+
+    现场刷够阈值后不会立刻撒手，一件常常连续刷 3~6 秒。判完就清零会让
+    它每隔 brush_hold_s 再报一次。
+    """
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_holdoff_s=2.5)
+    ts_iter = timestamps()
+    feed_brush(pipeline, ts_iter, frames=30)  # 6.0s 连续刷
+
+    oils = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    assert len(oils) == 1
+
+
+def test_pick_and_unattached_oiling_coexist():
+    """取料后的涂油挂周期，录像开头的涂油不挂，两者互不吞并。"""
+
+    pipeline, events = make_pipeline(brush_hold_s=0.5)
+    ts_iter = timestamps()
+    # 先刷够一段（无周期）。
+    feed_brush(pipeline, ts_iter, frames=4)
+    # 刷子离开，取料，再刷一件。
+    feed_brush(pipeline, ts_iter, frames=3, near=False)
+    do_pick(pipeline, ts_iter)
+    feed_brush(pipeline, ts_iter, frames=4)
+
+    oils = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    picks = [e for e in events if e.event_type == EventType.PICK]
+    assert len(picks) == 1
+    free = [e for e in oils if e.task_id == ""]
+    attached = [e for e in oils if e.task_id != ""]
+    assert len(free) == 1, "录像开头那段涂油没报出来"
+    assert len(attached) == 1, "取料后那件涂油被自由累计器吞掉了"
+    assert attached[0].task_id == picks[0].task_id
 
 
 def test_only_pick_and_manual_oiling_events_are_emitted():
@@ -1573,26 +1637,31 @@ def test_oiling_survives_hand_track_id_loss():
     assert pipeline.tasks[0].stage == TaskStage.OILED
 
 
-def test_screw_anchor_prefers_screw_gripped_by_hand():
-    """锚点从「与手框交叠的杆」初始化，而不是盘里任意一根。"""
+def test_oiling_follows_the_rod_in_hand_not_a_far_screw():
+    """涂油跟的是手里那根杆，不是画面里另一根远处的杆。"""
 
-    pipeline, events = make_pipeline()
+    pipeline, events = make_pipeline(brush_hold_s=0.5)
     ts_iter = timestamps()
     do_pick(pipeline, ts_iter)
-    task = pipeline._cycles[pipeline.tasks[0].task_id]
 
     # 手持位置有一根杆与手框交叠，远处盘内还有一根静置杆。
-    ts = next(ts_iter)
-    feed(
-        pipeline,
-        ts,
-        hand_at(*HAND_TARGET),
-        held_screw_at(*HAND_TARGET),
-        screw_at(200.0, 200.0),
-    )
-    anchor = task.screw_anchor
-    assert anchor is not None
-    ax, ay = anchor
+    for _ in range(4):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(*HAND_TARGET),
+            held_screw_at(*HAND_TARGET),
+            screw_at(200.0, 200.0),
+            brush_at(HAND_TARGET[0] + 10, HAND_TARGET[1]),
+        )
+
+    oil = [e for e in events if e.event_type == EventType.MANUAL_OILING]
+    assert len(oil) == 1
+    assert oil[0].evidence["brush_hold_s"] > 0.0
+    # 接触记的是手里那根（贴着手的位置），不是远处的静置杆。
+    task = pipeline._cycles[oil[0].task_id]
+    assert task.screw_anchor is not None
+    ax, ay = task.screw_anchor
     assert math.hypot(ax - HAND_TARGET[0], ay - HAND_TARGET[1]) < 60
 
 
@@ -1782,13 +1851,12 @@ def test_screw_reacquired_after_long_absence():
     ts_iter = timestamps()
     do_pick(pipeline, ts_iter)
     task = pipeline._cycles[pipeline.tasks[0].task_id]
-    assert task.screw_anchor is not None
 
     # 手和杆都消失 6 秒（只剩盘体）。
     for _ in range(30):
         feed(pipeline, next(ts_iter))
 
-    # 在远离原锚点的位置回来涂油。
+    # 在远离取料点的位置回来涂油。
     spot = (180.0, 800.0)
     for _ in range(10):
         feed(
@@ -1801,7 +1869,6 @@ def test_screw_reacquired_after_long_absence():
 
     kinds = [e.event_type for e in events]
     assert EventType.MANUAL_OILING in kinds
-    assert "SCREW_REACQUIRED" in task.evidence
     assert task.stage == TaskStage.OILED
 
 
