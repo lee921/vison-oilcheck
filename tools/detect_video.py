@@ -200,10 +200,12 @@ def main() -> int:
     for item in args.video:
         videos.append(Path(item))
     if not videos:
-        for video in cfg.demo.videos:
+        for video in cfg.demo.videos():
             videos.append(Path(resolve_runtime_file(video.path, repo_root=runtime_root())))
     if not videos:
-        raise SystemExit("没有可用视频：请在 config/oilcheck.json 的 demo.videos 中登记")
+        raise SystemExit(
+            f"没有可用视频：把录像放到 {cfg.demo.sample_dir}，或用 --video 指定"
+        )
 
     results = []
     for path in videos:

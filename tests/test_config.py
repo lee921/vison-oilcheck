@@ -25,8 +25,8 @@ def test_repo_oilcheck_template_is_valid():
     data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
     cfg = OilCheckConfig.from_dict(data)
 
-    assert cfg.version == "2.11"
-    assert data["version"] == "2.11"
+    assert cfg.version == "2.12"
+    assert data["version"] == "2.12"
     assert cfg.stations
     station = cfg.stations[0]
     assert station.station_id == "ST01"
@@ -203,7 +203,7 @@ def test_legacy_runtime_config_is_migrated_on_load(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.11"
+    assert cfg.version == "2.12"
     assert station.detector.kind == "yolo"
     assert station.detector.model_path.endswith("best.pt")
     assert station.detector.brush_label == "brush"
@@ -272,7 +272,7 @@ def test_v23_config_is_cleaned_up_to_v24(tmp_path):
     cfg = service.load()
     station = cfg.enabled_stations()[0]
 
-    assert cfg.version == "2.11"
+    assert cfg.version == "2.12"
     # 用户调过的 ROI 与判定参数保留
     assert station.tray_roi.points == ((0.5, 0.1), (0.72, 0.44))
     assert station.work_roi.points == ((0.35, 0.0), (0.99, 0.95))
@@ -420,26 +420,22 @@ def _write_config(tmp_path: Path, mutate) -> Path:  # noqa: ANN001
     return target
 
 
-def test_missing_demo_section_is_filled_with_template_videos(tmp_path):
-    """demo 整段缺失时补回模板清单，不能补成空列表。
+def test_missing_demo_section_is_filled_with_defaults(tmp_path):
+    """demo 整段缺失时补出默认段（含 sample_dir），示例视频照样能扫出来。
 
-    补成 ``videos: []`` 的文件看起来一切正常（demo 段在、视频文件也在），
-    监控页下拉里却一条示例都没有，且不报任何错——现场最难排查的一种。
+    2.12 起视频清单不再写进配置：demo 段缺不缺都不影响扫描目录，所以这里
+    断言的是「段被补出来、扫描目录是默认值」，不再断言某份清单。
     """
 
-    from app.oilcheck.config import OilCheckConfigService
+    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
 
     _write_config(tmp_path, lambda data: data.pop("demo"))
     cfg = OilCheckConfigService(tmp_path / "config").load()
 
-    # 断言「与模板清单一致」而不是写死条数：模板里新增示例视频时不该连带
-    # 改这条测试（写死两份清单会让加视频和改测试互相绊住）。
-    from app.oilcheck.config import load_json_with_comments
-
-    template = load_json_with_comments(runtime_root() / "config" / "oilcheck.json")
-    expected = [item["name"] for item in template["demo"]["videos"]]
-    assert expected, "模板里的示例视频清单不应为空"
-    assert [video.name for video in cfg.demo.videos] == expected
+    assert cfg.demo.sample_dir == "data/sample_video"
+    data = load_json_with_comments(tmp_path / "config" / "oilcheck.json")
+    assert set(data["demo"]) == {"loop", "fps_limit", "speed", "sample_dir"}
+    assert "videos" not in data["demo"]
 
 
 def test_tracking_threshold_migrates_only_from_old_default(tmp_path):
@@ -454,7 +450,7 @@ def test_tracking_threshold_migrates_only_from_old_default(tmp_path):
 
     path = _write_config(tmp_path, _old_default)
     cfg = OilCheckConfigService(path.parent).load()
-    assert cfg.version == "2.11"
+    assert cfg.version == "2.12"
     assert cfg.pipeline.bytetrack_high_thresh == 0.45
     # 新键补默认值（关闭），不会因为迁移被打开
     assert cfg.pipeline.brush_spawn_max_distance == 0.0
@@ -468,55 +464,103 @@ def test_tracking_threshold_migrates_only_from_old_default(tmp_path):
     assert tuned.pipeline.bytetrack_high_thresh == 0.36
 
 
-def test_missing_videos_key_is_filled_with_template_videos(tmp_path):
-    """demo 段在、videos 键缺失（早期版本保存出来的形状）也要补回清单。"""
+def test_legacy_videos_list_is_removed_on_load(tmp_path):
+    """2.12 起 ``demo.videos`` 手工清单删除：示例视频改为扫描目录。
 
-    from app.oilcheck.config import OilCheckConfigService
-
-    _write_config(tmp_path, lambda data: data["demo"].pop("videos"))
-    cfg = OilCheckConfigService(tmp_path / "config").load()
-
-    assert cfg.demo.videos, "缺 videos 键不应被补成空清单"
-
-
-def test_legacy_empty_videos_list_is_refilled_once(tmp_path):
-    """2.0 版本保存出来的空清单要修回来，且只改一次。
-
-    早期版本没有 demo 段时，UI 保存会把 ``videos: []`` 写进文件；之后按版本号
-    补 demo 的分支不再触发，服务器上从此一条示例视频都没有。升级到 2.6 时
-    补回模板清单——这份空清单不是用户主动清空的。
+    留着清单会让现场以为「登记了才出现」：拷进目录却不改配置时下拉里没有，
+    改了配置又和目录内容对不上。这里要求升级后键被清掉，且不因清理而丢
+    其它 demo 参数。
     """
 
     from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
 
     def _make_legacy(data) -> None:  # noqa: ANN001
-        data["version"] = "2.5"
-        data["demo"]["videos"] = []
+        data["version"] = "2.11"
+        data["demo"]["videos"] = [
+            {"name": "老名字", "path": "data/sample_video/cam_x_20260101_000000.mp4"}
+        ]
+        data["demo"]["speed"] = 0.5
 
     path = _write_config(tmp_path, _make_legacy)
     cfg = OilCheckConfigService(tmp_path / "config").load()
-    assert cfg.demo.videos, "旧版本遗留的空清单应补回模板示例视频"
 
-    # 用户之后主动清空（已是 2.6）必须保持为空，不能每次启动又加回来。
+    assert cfg.version == "2.12"
+    assert cfg.demo.speed == 0.5, "清理清单不能连带丢现场调过的参数"
     data = load_json_with_comments(path)
-    data["demo"]["videos"] = []
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-
-    cfg = OilCheckConfigService(tmp_path / "config").load()
-    assert cfg.demo.videos == ()
-    assert load_json_with_comments(path)["demo"]["videos"] == []
+    assert "videos" not in data["demo"]
+    assert data["demo"]["sample_dir"] == "data/sample_video"
 
 
-def test_empty_videos_list_is_kept(tmp_path):
-    """显式写成 ``videos: []`` 是用户主动清空，迁移不能改回去。"""
+def _write_sample_videos(root: Path, names: list[str]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (root / name).write_bytes(b"")
 
-    from app.oilcheck.config import OilCheckConfigService, load_json_with_comments
 
-    path = _write_config(tmp_path, lambda data: data["demo"].__setitem__("videos", []))
-    cfg = OilCheckConfigService(tmp_path / "config").load()
+def test_demo_videos_are_scanned_from_sample_dir(tmp_path):
+    """``data/sample_video`` 下的录像自动出现在清单里，不需要登记。"""
 
-    assert cfg.demo.videos == ()
-    assert load_json_with_comments(path)["demo"]["videos"] == []
+    from app.oilcheck.config import DemoConfig
+
+    sample = tmp_path / "data" / "sample_video"
+    _write_sample_videos(
+        sample,
+        [
+            "cam_6ca47a_20261126_110047.mp4",
+            "cam_6ca47a_20261125_092817.mp4",
+            # 元数据不是视频，不收起
+            "cam_6ca47a_20261126_110047.json",
+            # 其它常见容器一并认
+            "hand_take.mov",
+        ],
+    )
+    cfg = DemoConfig()
+    videos = cfg.videos(base_dir=tmp_path)
+
+    assert [v.name for v in videos] == [
+        "20261125_092817",
+        "20261126_110047",
+        "hand_take",  # 命名不规范的文件用文件名
+    ]
+    # 路径写成相对仓库根，日志/配置里看到的就是现场目录结构
+    assert videos[0].path == "data/sample_video/cam_6ca47a_20261125_092817.mp4"
+    assert cfg.video("20261126_110047", base_dir=tmp_path) is not None
+    assert cfg.video("不存在", base_dir=tmp_path) is None
+
+
+def test_demo_scan_follows_new_files_without_config_change(tmp_path):
+    """新录像拷进目录后立刻出现；目录不存在时干净地返回空。"""
+
+    from app.oilcheck.config import DemoConfig
+
+    cfg = DemoConfig()
+    # 目录还没有：不抛异常，只是没有视频可选。
+    assert cfg.videos(base_dir=tmp_path) == ()
+
+    sample = tmp_path / "data" / "sample_video"
+    _write_sample_videos(sample, ["cam_6ca47a_20261126_101415.mp4"])
+    assert [v.name for v in cfg.videos(base_dir=tmp_path)] == ["20261126_101415"]
+
+    _write_sample_videos(sample, ["cam_6ca47a_20261126_110047.mp4"])
+    assert [v.name for v in cfg.videos(base_dir=tmp_path)] == [
+        "20261126_101415",
+        "20261126_110047",
+    ]
+
+
+def test_demo_sample_dir_can_be_overridden(tmp_path):
+    """``demo.sample_dir`` 支持相对仓库根与绝对路径。"""
+
+    from app.oilcheck.config import DemoConfig
+
+    other = tmp_path / "other_videos"
+    _write_sample_videos(other, ["clip.mp4"])
+    assert DemoConfig.from_dict({"sample_dir": str(other)}).videos(base_dir=tmp_path)
+    assert DemoConfig.from_dict({"sample_dir": "other_videos"}).videos(
+        base_dir=tmp_path
+    )
+    # 空串按默认目录
+    assert DemoConfig.from_dict({"sample_dir": "  "}).sample_dir == "data/sample_video"
 
 
 def test_legacy_screw_label_is_migrated(tmp_path):
@@ -727,7 +771,7 @@ def test_repo_template_is_commented():
     text = path.read_text(encoding="utf-8")
     assert "//" in text, "模板应带注释"
     # 注释不破坏可解析性
-    assert json.loads(strip_json_comments(text))["version"] == "2.11"
+    assert json.loads(strip_json_comments(text))["version"] == "2.12"
 
 
 def test_save_preserves_comments(tmp_path):
@@ -1117,7 +1161,7 @@ def test_migration_removes_obsolete_plc_byte_order(tmp_path):
         strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
     )
     assert "byte_order" not in data["plc"]
-    assert data["version"] == "2.11"
+    assert data["version"] == "2.12"
 
 
 def test_migration_removes_obsolete_plc_result_hold_s(tmp_path):
@@ -1151,7 +1195,7 @@ def test_migration_removes_obsolete_plc_result_hold_s(tmp_path):
         strip_json_comments((config_dir / "oilcheck.json").read_text(encoding="utf-8"))
     )
     assert "result_hold_s" not in data["plc"]
-    assert data["version"] == "2.11"
+    assert data["version"] == "2.12"
 
 
 def test_console_filter_drops_file_only_records(tmp_path):

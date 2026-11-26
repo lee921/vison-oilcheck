@@ -893,7 +893,7 @@ class MonitorPage(QWidget):
     # 画面源（实时相机 / 示例视频）
     # ------------------------------------------------------------------
     def _reload_sources(self) -> None:
-        """按配置里的 demo.videos 重建画面源下拉。"""
+        """按示例视频目录重建画面源下拉。"""
 
         combo = getattr(self, "_source_combo", None)
         if combo is None:
@@ -908,11 +908,11 @@ class MonitorPage(QWidget):
         self._source_signature = tuple((v.name, v.path) for v in videos)
 
     def _sync_sources(self) -> None:
-        """配置里的视频清单变了就重建下拉。
+        """示例视频目录里的录像变了就重建下拉。
 
-        服务层会在配置文件被外部改动后自动重载（例如手工补上 ``demo.videos``），
-        但界面只在页面构建时读一次清单，不跟着重建的话下拉里永远是旧的几条，
-        现场会以为「配置改了没用」。清单很短，直接比较签名。
+        现场把新录像拷进 ``data/sample_video`` 后不必重启：服务层每次刷新都
+        会重新扫目录，这里比一下签名就重建。签名不变时不动下拉，免得打断
+        用户当前的选择。
         """
 
         signature = tuple(
@@ -997,7 +997,7 @@ class MonitorPage(QWidget):
         if not ok:
             InfoBar.error(
                 "切换画面源失败",
-                "示例视频未在配置中登记、文件不存在或启动失败，详见日志",
+                "示例视频不在扫描目录里、文件不存在或启动失败，详见日志",
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000,
                 parent=self,

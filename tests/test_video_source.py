@@ -82,22 +82,34 @@ def test_detector_config_rejects_removed_simulated_kind():
 # ----------------------------------------------------------------------
 # 示例视频配置
 # ----------------------------------------------------------------------
-def test_demo_config_parses_videos():
+def test_demo_config_scans_sample_dir():
+    """示例视频清单来自扫描目录，``videos`` 不再手写进配置。"""
+
+    import tempfile
+    from pathlib import Path
+
     cfg = DemoConfig.from_dict(
-        {
-            "loop": False,
-            "fps_limit": 10,
-            "videos": [
-                {"name": "A", "path": "data/sample_video/a.mp4"},
-                "data/sample_video/b.mp4",
-            ],
-        }
+        {"loop": False, "fps_limit": 10, "sample_dir": "data/sample_video"}
     )
     assert cfg.loop is False
     assert cfg.fps_limit == 10
-    assert [v.name for v in cfg.videos] == ["A", "b"]
-    assert cfg.video("b").path == "data/sample_video/b.mp4"
-    assert cfg.video("missing") is None
+    assert cfg.sample_dir == "data/sample_video"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        sample = base / "data" / "sample_video"
+        sample.mkdir(parents=True)
+        (sample / "cam_6ca47a_20261027_105708.mp4").write_bytes(b"")
+        (sample / "free_name.mp4").write_bytes(b"")
+
+        assert [v.name for v in cfg.videos(base_dir=base)] == [
+            "20261027_105708",
+            "free_name",
+        ]
+        assert cfg.video("free_name", base_dir=base).path == (
+            "data/sample_video/free_name.mp4"
+        )
+        assert cfg.video("missing", base_dir=base) is None
 
 
 # ----------------------------------------------------------------------

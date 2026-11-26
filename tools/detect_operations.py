@@ -1180,11 +1180,11 @@ def main() -> int:
     if not videos:
         videos = [
             Path(resolve_runtime_file(video.path, repo_root=runtime_root()))
-            for video in cfg.demo.videos
+            for video in cfg.demo.videos()
         ]
     if not videos:
         raise SystemExit(
-            "没有可用视频：请用 --video 指定，或在 config/oilcheck.json 的 demo 里登记"
+            f"没有可用视频：请用 --video 指定，或把录像放到 {cfg.demo.sample_dir}"
         )
 
     results: list[dict[str, Any]] = []

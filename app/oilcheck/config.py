@@ -128,7 +128,7 @@ def _scalar_bool(section: str, key: str, value: Any, default: bool) -> bool:
     return default
 
 # 配置结构版本。升级时 ensure_defaults 会把新增字段合并进已有配置文件。
-_CONFIG_VERSION = "2.11"
+_CONFIG_VERSION = "2.12"
 
 # 手/刷头跟踪后端：auto 优先用 ByteTrack，失败回退自研 ObjectTracker。
 _TRACKER_BACKENDS = frozenset({"auto", "bytetrack", "object"})
@@ -225,6 +225,12 @@ _PLC_REMOVED_2_10: tuple[str, ...] = ("byte_order",)
 # 2.11 删除的 plc 字段：``result_hold_s``。现场要求结果灯（灯5）常亮到
 # 下一个检测结果到来，不再按时间自动灭，这个时长因此没有消费方。
 _PLC_REMOVED_2_11: tuple[str, ...] = ("result_hold_s",)
+
+# 2.12 删除的 demo 字段：``videos``。示例视频改为直接扫描 ``demo.sample_dir``，
+# 手工清单不再有任何消费方。留着只会让现场以为「登记了才出现」——拷进目录
+# 却不改配置时下拉里没有，改了配置又和目录内容对不上。同 2.9/2.10 的做法：
+# 不看版本号，键存在就删，幂等。
+_DEMO_REMOVED_2_12: tuple[str, ...] = ("videos",)
 
 # 2.1 新增的检测器字段及其默认值，迁移时补齐。
 _DETECTOR_DEFAULTS_2_1: dict[str, Any] = {
@@ -781,6 +787,48 @@ class RecordingConfig:
         }
 
 
+# 示例视频目录里自动收录的文件后缀。训练录制写的是 mp4；其它常见容器一并
+# 认，现场用手机或导播软件转存的文件不必改名。
+_DEMO_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".m4v"})
+
+# 训练录制文件名形如 ``cam_6ca47a_20261126_110047.mp4``。
+_DEMO_STEM_RE = re.compile(r"(?:cam_[0-9A-Za-z]+_)?(\d{8}_\d{6})")
+
+
+def demo_video_name(path: Path) -> str:
+    """示例视频在「画面源」下拉里的显示名。
+
+    训练录制文件名是 ``cam_<相机>_<日期>_<时间>``，显示名只留 ``日期_时间``：
+    唯一（同一次录制不会撞名）、按名字排序就是按录像时间排序，现场一眼能
+    认出是哪一段。不匹配这个命名形状的文件用文件名本身，不会被吞掉。
+    """
+
+    match = _DEMO_STEM_RE.fullmatch(path.stem)
+    return match.group(1) if match else path.stem
+
+
+def demo_scan_root(sample_dir: str, base_dir: Path) -> Path:
+    """把 ``demo.sample_dir`` 解析成实际目录（相对路径按仓库根解析）。"""
+
+    raw = str(sample_dir or "").strip() or DemoConfig().sample_dir
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        root = Path(base_dir) / root
+    return root
+
+
+def _resolve_demo_path(raw_path: str, base_dir: Path) -> Path:
+    """把视频路径按仓库根解析后归一化，用于去重比较。"""
+
+    path = Path(str(raw_path)).expanduser()
+    if not path.is_absolute():
+        path = Path(base_dir) / path
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
 @dataclass(frozen=True)
 class DemoVideo:
     """一段示例视频：显示名 + 相对仓库根或绝对路径。"""
@@ -813,13 +861,17 @@ class DemoConfig:
 
     演示模式不再使用脚本伪造检测，而是直接回放 ``data/sample_video`` 下的
     真实录像：画面来自视频文件，检测结果来自训练好的模型。
+
+    视频清单**不需要登记**：直接扫描 ``sample_dir`` 下的录像文件，按文件名
+    排序后放进「画面源」下拉。现场把新录像拷进目录即可出现，不必改配置。
     """
 
     loop: bool = True
     fps_limit: int = 15
     # 示例回放默认速率倍数（0.5 为慢放）。判定计时用视频媒体时间，与速率无关。
     speed: float = 1.0
-    videos: tuple[DemoVideo, ...] = ()
+    # 自动扫描的示例视频目录，相对仓库根或绝对路径。空串按默认目录。
+    sample_dir: str = "data/sample_video"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> DemoConfig:
@@ -839,16 +891,12 @@ class DemoConfig:
         if speed <= 0:
             speed = d.speed
 
-        videos: list[DemoVideo] = []
-        for item in data.get("videos", ()) or ():
-            video = DemoVideo.from_dict(item)
-            if video is not None:
-                videos.append(video)
         return cls(
             loop=bool(loop),
             fps_limit=max(1, min(60, fps_limit)),
             speed=max(0.1, min(4.0, speed)),
-            videos=tuple(videos),
+            sample_dir=str(data.get("sample_dir") or d.sample_dir).strip()
+            or d.sample_dir,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -856,11 +904,35 @@ class DemoConfig:
             "loop": self.loop,
             "fps_limit": self.fps_limit,
             "speed": self.speed,
-            "videos": [video.to_dict() for video in self.videos],
+            "sample_dir": self.sample_dir,
         }
 
-    def video(self, name: str) -> DemoVideo | None:
-        for video in self.videos:
+    def videos(self, base_dir: Path | None = None) -> tuple[DemoVideo, ...]:
+        """``sample_dir`` 下的全部示例视频（按文件名排序）。"""
+
+        base = Path(base_dir) if base_dir is not None else runtime_root()
+        root = demo_scan_root(self.sample_dir, base)
+        try:
+            entries = sorted(root.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return ()
+        found: list[DemoVideo] = []
+        for entry in entries:
+            if entry.suffix.lower() not in _DEMO_VIDEO_SUFFIXES:
+                continue
+            if not entry.is_file():
+                continue
+            try:
+                rel = entry.resolve().relative_to(base.resolve()).as_posix()
+            except (OSError, ValueError):
+                rel = str(entry)
+            found.append(DemoVideo(name=demo_video_name(entry), path=rel))
+        return tuple(found)
+
+    def video(self, name: str, base_dir: Path | None = None) -> DemoVideo | None:
+        """按下拉里的显示名找视频（名字由文件名生成，见 ``demo_video_name``）。"""
+
+        for video in self.videos(base_dir):
             if video.name == name:
                 return video
         return None
@@ -1239,31 +1311,6 @@ def _unknown_keys(
     return found
 
 
-def _template_demo() -> dict[str, Any] | None:
-    """仓库模板里的 ``demo`` 段；模板缺失或不可解析时返回 None。"""
-
-    template = runtime_root() / "config" / "oilcheck.json"
-    try:
-        # 模板带注释（JSONC），不能用 json.loads 直接读。
-        tpl = load_json_with_comments(template)
-    except (OSError, ValueError):
-        return None
-    demo = tpl.get("demo") if isinstance(tpl, dict) else None
-    return demo if isinstance(demo, dict) and demo else None
-
-
-def _demo_videos_missing(demo: Any) -> bool:
-    """demo 段或其中的 videos 键是否「缺失」。
-
-    ``"videos": []`` 不算缺失：用户可以把清单清空，让下拉里只剩实时相机。
-    只有整段不在、或 videos 不是数组时才需要按模板补回来。
-    """
-
-    if not isinstance(demo, dict):
-        return True
-    return not isinstance(demo.get("videos"), list)
-
-
 @dataclass(frozen=True)
 class OilCheckConfig:
     version: str = _CONFIG_VERSION
@@ -1377,10 +1424,6 @@ class OilCheckConfigService:
         # 2.5 跟踪稳定性：锚点加绝对步长上限；关联代价门控语义对齐
         # （未进门限的代价改为 1.5，阈值 0.80 会把有效距离截到 0.667×）。
         stability_outdated = old_parts < (2, 5)
-        # 2.6 修复空示例视频清单：2.0 及更早的版本保存配置时，没有 demo 段
-        # 会被写成 "videos": []，之后按版本号补 demo 的分支不再触发，服务器
-        # 上从此一条示例视频都没有（文件里段在、视频也在，下拉里却是空的）。
-        demo_videos_outdated = old_parts < (2, 6)
         # 2.7 刷头跟踪稳定性：高置信度阈值 0.30 → 0.45（低分框里混着白毛巾/
         # 白导轨误检）；新增 brush_spawn_max_distance（默认关闭）。
         tracking_outdated = old_parts < (2, 7)
@@ -1393,31 +1436,11 @@ class OilCheckConfigService:
 
         changed: list[str] = []
 
-        # 1) demo 段：缺「整段」或「videos 键」时按模板补上示例视频清单。
-        #
-        #    显式写成 "videos": [] 的保持不动——那是用户主动清空，下拉里只剩
-        #    「实时相机」是预期行为。但整段/整键缺失不能补成空清单：下面第 6
-        #    步按「生效参数」补键，缺段会被补出 videos: []，现场看起来 demo
-        #    段在、视频文件也在，下拉里却一条示例都没有，日志也不报错。
-        #    这类文件多半来自早期版本的保存或手工删段，与版本号无关，所以
-        #    不再用 outdated 门控。
-        demo = data.get("demo")
-        videos = demo.get("videos") if isinstance(demo, dict) else None
-        # 升级到 2.6 时，把旧版本遗留的空清单也补回模板：那份空清单不是用户
-        # 主动清空的，是当时保存配置时凭空写出来的。
-        legacy_empty = demo_videos_outdated and videos == []
-        if _demo_videos_missing(demo) or legacy_empty:
-            template_demo = _template_demo()
-            template_videos = (
-                template_demo.get("videos") if template_demo is not None else None
-            )
-            if isinstance(template_videos, list) and template_videos:
-                if isinstance(demo, dict):
-                    demo["videos"] = template_videos
-                    changed.append("demo.videos")
-                else:
-                    data["demo"] = template_demo
-                    changed.append("demo")
+        # 1) demo 段：2.12 起示例视频直接扫描 ``demo.sample_dir``，不再有手工
+        #    清单。demo 段整段缺失时由下面第 6 步「键集合同步」补成默认值
+        #    （loop / fps_limit / speed / sample_dir），旧配置里的 ``videos``
+        #    清单由 4.7 删除。早期版本「保存配置凭空写出 videos: []」导致下拉
+        #    为空的问题随清单一起消失：清单在不在都不影响扫描目录。
 
         # 2) 工位 ROI：只保留涂油盘区，新增工作追踪区，删除旧的
         #    手持操作区/刷涂区/排除区。
@@ -1569,6 +1592,15 @@ class OilCheckConfigService:
                     plc_section.pop(key)
                     changed.append(f"-plc.{key}")
 
+        # 4.7) 2.12 示例视频改为扫描 ``demo.sample_dir``：删掉手工清单
+        #      ``demo.videos``。同样不看版本号，键存在就删，幂等。
+        demo_section = data.get("demo")
+        if isinstance(demo_section, dict):
+            for key in _DEMO_REMOVED_2_12:
+                if key in demo_section:
+                    demo_section.pop(key)
+                    changed.append(f"-demo.{key}")
+
         # 4.45) 检测置信度必须低于 ByteTrack 高置信度阈值，否则低分框在
         #       检测层就被丢掉，第二阶段补救关联永远收不到输入。旧配置里
         #       常见的 0.5 > 0.3 就属于这种情况，等价于关掉了第二阶段。
@@ -1585,13 +1617,6 @@ class OilCheckConfigService:
             if isinstance(high_thresh, (int, float)) and float(conf) > float(high_thresh):
                 detector["confidence"] = float(high_thresh)
                 changed.append("detector.confidence")
-
-        # 4.5) demo：旧配置没有示例回放速率时补默认值，不改现场已设的值。
-        demo = data.get("demo")
-        if isinstance(demo, dict):
-            if "speed" not in demo:
-                demo["speed"] = _default_demo_speed()
-                changed.append("demo.speed")
 
         # 5) detector：旧配置的 null / 空路径不会自动用上仓库权重
         for station in data.get("stations", ()) or ():
@@ -1733,14 +1758,16 @@ class OilCheckConfigService:
         if not isinstance(data, dict):
             return OilCheckConfig()
         cfg = OilCheckConfig.from_dict(data)
-        if not cfg.demo.videos:
-            # 空清单本身是合法配置（下拉只剩实时相机），但现场最常见的困惑
-            # 就在这里：文件里有 demo 段、data/sample_video 里也有视频，却
-            # 没有一条可选。启动日志里写明原因和文件路径，便于对照排查。
+        if not cfg.demo.videos():
+            # 目录里没有录像本身是合法的（开发机常见），但现场最常见的困惑
+            # 就在这里：配置看着没问题，下拉里却只有「实时相机」——原因是
+            # 录像没拷到扫描目录。日志里写明实际扫描的目录，便于对照排查。
+            root = demo_scan_root(cfg.demo.sample_dir, runtime_root())
             logger.warning(
-                "示例视频清单为空（demo.videos=[]）：监控页「画面源」只有实时相机。"
-                "配置文件：%s",
-                self.config_path,
+                "示例视频目录里没有录像（demo.sample_dir=%s，实际目录 %s）："
+                "监控页「画面源」只有实时相机。",
+                cfg.demo.sample_dir,
+                root,
             )
         return cfg
 
@@ -1903,9 +1930,10 @@ CONFIG_COMMENTS: dict[str, str] = {
     "demo.speed": (
         "播放速率倍数（0.1~4）。只改播放快慢，判定按视频媒体时间计时，" "结果不受影响"
     ),
-    "demo.videos": "示例视频清单，监控页「画面源」下拉按这里的 name 生成",
-    "demo.videos[].name": "下拉里显示的名字",
-    "demo.videos[].path": "视频路径，相对仓库根或绝对路径",
+    "demo.sample_dir": (
+        "示例视频目录（相对仓库根或绝对路径）。程序自动扫描这里的录像放进"
+        "「画面源」下拉，新录像拷进来即可出现，无需改配置"
+    ),
     # ---- plc：警示灯 ----
     "plc": (
         "PLC 警示灯（Modbus TCP）。默认关闭且只读：装上代码不会自动写 PLC。"
@@ -2002,12 +2030,6 @@ CONFIG_COMMENTS: dict[str, str] = {
         "刷子没有关键点时，用框内相对坐标（0~1）估计工作端：纵向位置"
     ),
 }
-
-
-def _default_demo_speed() -> float:
-    """示例回放默认速率（与 :class:`DemoConfig` 保持一致）。"""
-
-    return DemoConfig().speed
 
 
 def strip_json_comments(text: str) -> str:

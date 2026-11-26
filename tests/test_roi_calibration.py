@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -29,10 +30,21 @@ def _make_video(path, fps=10, frames=20):
     return True
 
 
-def _config(video_path: str):
+def _config(video_path: str, sample_dir: str = ""):
+    """标定对话框配置。
+
+    示例视频从 ``demo.sample_dir`` 扫描出来，所以测试把目录指到视频所在处
+    （而不是登记一条清单）。``sample_dir`` 为空时用视频的父目录。
+    """
+
+    demo: dict = {}
+    if sample_dir:
+        demo["sample_dir"] = sample_dir
+    elif video_path:
+        demo["sample_dir"] = str(Path(video_path).expanduser().parent)
     return OilCheckConfig.from_dict(
         {
-            "demo": {"videos": [{"name": "标定用示例", "path": video_path}]},
+            "demo": demo,
             "stations": [
                 {
                     "station_id": "ST01",
@@ -119,12 +131,13 @@ def test_roi_calibration_uses_sample_video_frame(qapp):
     dialog, service, results = _dialog(_config(SAMPLE_VIDEO))
     dialog.show()
     try:
-        index = dialog._source_combo.findData("标定用示例")
+        # 名字由文件名生成（去相机前缀，只留日期_时间）。
+        index = dialog._source_combo.findData("20261027_105708")
         assert index > 0
         dialog._source_combo.setCurrentIndex(index)
 
         # 示例视频帧已进入画布，且不依赖相机。
-        assert dialog._video_name == "标定用示例"
+        assert dialog._video_name == "20261027_105708"
         assert dialog._canvas.source_size == (2560, 1440)
         assert dialog._canvas._editable is True
         assert dialog._btn_capture.isEnabled() is False
@@ -148,7 +161,7 @@ def test_roi_calibration_seek_and_save_from_video(qapp, tmp_path):
     dialog.show()
     try:
         dialog._source_combo.setCurrentIndex(
-            dialog._source_combo.findData("标定用示例")
+            dialog._source_combo.findData("clip")
         )
         assert dialog._canvas.source_size == (64, 48)
 
@@ -174,12 +187,14 @@ def test_roi_calibration_seek_and_save_from_video(qapp, tmp_path):
 
 
 def test_roi_calibration_rejects_missing_video(qapp, tmp_path):
-    cfg = _config(str(tmp_path / "missing.mp4"))
+    # 文件名像视频、内容打不开：扫描得到，但 cv2 打不开。
+    (tmp_path / "broken.mp4").write_bytes(b"not a video")
+    cfg = _config(str(tmp_path / "broken.mp4"))
     dialog, service, _results = _dialog(cfg)
     dialog.show()
     try:
         dialog._source_combo.setCurrentIndex(
-            dialog._source_combo.findData("标定用示例")
+            dialog._source_combo.findData("broken")
         )
         # 视频打不开时回退到实时相机，不进入视频标定模式。
         assert dialog._video_name is None
@@ -191,10 +206,11 @@ def test_roi_calibration_rejects_missing_video(qapp, tmp_path):
         dialog.close()
 
 
-def test_roi_calibration_hides_source_row_without_videos(qapp):
-    cfg = _config("unused.mp4")
-    cfg = OilCheckConfig.from_dict({**cfg.to_dict(), "demo": {"videos": []}})
-    dialog, _service, _results = _dialog(cfg)
+def test_roi_calibration_hides_source_row_without_videos(qapp, tmp_path):
+    # 扫描目录里没有录像：整组控件隐藏。
+    empty = tmp_path / "empty_videos"
+    empty.mkdir()
+    dialog, _service, _results = _dialog(_config("", sample_dir=str(empty)))
     try:
         assert dialog._source_combo.count() == 1
         assert all(w.isHidden() for w in dialog._source_widgets)

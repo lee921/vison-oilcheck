@@ -91,7 +91,7 @@ class RoiCalibrationDialog(QDialog):
         self._frozen = False
         self._last_frame_ts = 0.0
         self._camera_starting = False
-        # 画面源：None 为实时相机，字符串为 demo.videos 中登记的示例视频名。
+        # 画面源：None 为实时相机，字符串为示例视频目录里扫描到的视频名。
         self._video_name: str | None = None
         self._video: DemoVideo | None = None
         self._capture: cv2.VideoCapture | None = None
@@ -107,7 +107,8 @@ class RoiCalibrationDialog(QDialog):
         self._station_combo.currentIndexChanged.connect(self._on_station_changed)
         self._source_combo = ComboBox()
         self._source_combo.addItem("实时相机", userData=None)
-        for video in cfg.demo.videos:
+        self._demo_videos = cfg.demo.videos()
+        for video in self._demo_videos:
             self._source_combo.addItem(video.name, userData=video.name)
         self._source_combo.currentIndexChanged.connect(self._on_source_changed)
         self._camera_label = QLabel("-")
@@ -171,7 +172,7 @@ class RoiCalibrationDialog(QDialog):
         # 没登记示例视频时整组隐藏，避免出现只有“实时相机”一项的下拉。
         self._source_widgets = (BodyLabel("画面源"), self._source_combo)
         for widget in self._source_widgets:
-            widget.setVisible(bool(cfg.demo.videos))
+            widget.setVisible(bool(self._demo_videos))
             top.addWidget(widget)
         top.addSpacing(12)
         top.addWidget(self._camera_label)
@@ -492,7 +493,7 @@ class RoiCalibrationDialog(QDialog):
             self._use_live_source()
             InfoBar.warning(
                 "示例视频不可用",
-                f"{name}：未在 demo.videos 中登记或文件无法打开，详见日志",
+                f"{name}：不在示例视频目录里或文件无法打开，详见日志",
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3500,
                 parent=self,

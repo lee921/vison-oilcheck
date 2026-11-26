@@ -470,7 +470,13 @@ class OilCheckService:
     # 示例视频源
     # ------------------------------------------------------------------
     def demo_videos(self) -> tuple[DemoVideo, ...]:
-        return tuple(self._config.demo.videos)
+        """示例视频目录下的全部录像（每次调用重新扫描）。
+
+        不缓存：现场把新录像拷进 ``demo.sample_dir`` 后，监控页下一次刷新
+        就能看到，不需要重启，也不需要在配置里登记。
+        """
+
+        return self._config.demo.videos()
 
     def demo_speed(self) -> float:
         """配置里的示例回放默认速率。"""
@@ -525,7 +531,10 @@ class OilCheckService:
             new_video = self._config.demo.video(video_name)
             if new_video is None:
                 self._logger.warning(
-                    "示例视频未在配置中登记: %s（工位=%s）", video_name, station_id
+                    "示例视频不在扫描目录里: %s（工位=%s，目录=%s）",
+                    video_name,
+                    station_id,
+                    self._config.demo.sample_dir,
                 )
                 return False
             new_source = self._make_video_source(
@@ -926,8 +935,16 @@ class OilCheckService:
                 )
                 continue
             self._runtimes[station.station_id] = runtime
-            # 配置重载后恢复该工位之前选中的示例视频。
-            video = self._active_video.get(station.station_id)
+            # 配置重载后恢复该工位之前选中的示例视频。按名字重新解析一次：
+            # 现场可能刚改过 demo.sample_dir，硬用记住的旧路径会把视频停在
+            # 已经不扫描的目录上。解析不到就什么都不做——原本就没选示例视频
+            # （用实时相机）时这里也走同一条路，画面不受影响。
+            remembered = self._active_video.get(station.station_id)
+            video = (
+                self._config.demo.video(remembered.name)
+                if remembered is not None
+                else None
+            )
             if video is not None:
                 source = self._make_video_source(
                     video,
@@ -940,6 +957,7 @@ class OilCheckService:
                     try:
                         source.start()
                         runtime.video_source = source
+                        self._active_video[station.station_id] = video
                     except Exception:
                         self._logger.exception(
                             "恢复示例视频失败: %s", video.name

@@ -88,16 +88,17 @@ def main() -> int:
         print(f"  {key} = {getattr(pipe, key, '<无此参数>')}")
 
     _hr("3) 示例视频")
-    for i, video in enumerate(cfg.demo.videos, 1):
+    demo_videos = cfg.demo.videos()
+    for i, video in enumerate(demo_videos, 1):
         path = Path(resolve_runtime_file(video.path, repo_root=runtime_root()))
         size = f"{path.stat().st_size / 1048576:.1f} MB" if path.exists() else "-"
         print(f"  [{i}] {video.name}: {path}  存在={path.exists()} {size}")
-    if not cfg.demo.videos:
-        print("  （空：监控页「画面源」只有实时相机）")
+    if not demo_videos:
+        print(f"  （空：{cfg.demo.sample_dir} 下没有录像，监控页「画面源」只有实时相机）")
         return 1
 
-    index = max(1, min(args.video, len(cfg.demo.videos))) - 1
-    video = cfg.demo.videos[index]
+    index = max(1, min(args.video, len(demo_videos))) - 1
+    video = demo_videos[index]
     video_path = Path(resolve_runtime_file(video.path, repo_root=runtime_root()))
     if not video_path.exists():
         print(f"\n视频文件不存在: {video_path}")
