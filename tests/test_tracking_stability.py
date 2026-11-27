@@ -575,3 +575,54 @@ def test_empty_hand_after_exit_still_does_not_pick():
         feed(pipeline, next(ts_iter), tray_screw)
 
     assert [e.event_type for e in events].count(EventType.PICK) == 0
+
+
+def test_rule_true_but_never_saw_screw_held_after_exit_does_not_pick():
+    """规则投「真」但离盘后一帧都没见到握手 ⇒ 不是取料。
+
+    现场 2026-11-27 10:40 的误判（片段
+    ``TASK-000002_oiling_missing_timeout_20261127_104002.mp4``）：工人
+    整理料盘，手在盘里停留 6.75 秒、把杆挪了位置，然后退到盘下方。规则
+    凭「杆长时间落在手框里 + 杆确实动过」投了「真」，模型给 p=0.146
+    明确判否——但当时的融合规则是「规则=True 就让模型不参与」，于是凭空
+    多出一件取料，还连带报了一次漏涂 NG。
+
+    实测 25 次真取料（``rule=True``）的 ``seen`` 全部为 1，所以这条守卫
+    对真取料零误伤。
+    """
+
+    pipeline, events = make_pipeline()
+    ts_iter = timestamps()
+    rod_y = ENTRY_HAND[1] - 60.0
+
+    # 盘外空手起步（进盘定性要用）。
+    for _ in range(3):
+        feed(pipeline, next(ts_iter), hand_at(350.0, 650.0))
+
+    # 手进盘，在盘里待够久，把那根杆带着挪动（杆心仍在盘内）。
+    for step in range(10):
+        feed(
+            pipeline,
+            next(ts_iter),
+            hand_at(ENTRY_HAND[0] + step * 2, ENTRY_HAND[1] - step * 8),
+            screw_at(ENTRY_HAND[0] + step * 3.0, rod_y),
+        )
+
+    # 手带着杆出盘（杆心离开盘区）：这是规则能投「真」的必要条件。
+    # 杆在这一刻之后不再被检出（被手完全遮住、或落到工作区外）——
+    # 现场那只手是往盘**下方**走的，杆垂在手心里，检测器丢掉了它。
+    for step in range(1, 5):
+        cx = ENTRY_HAND[0] - step * 20
+        cy = 600.0 + step * 20
+        if step < 3:
+            feed(pipeline, next(ts_iter), hand_at(cx, cy), screw_at(cx, cy))
+        else:
+            feed(pipeline, next(ts_iter), hand_at(cx, cy))
+    # 之后杆消失（被手完全遮住 / 落在下方没再检出），手一直在盘外——
+    # 「离盘后从未见到握手」。
+    for _ in range(20):
+        feed(pipeline, next(ts_iter), hand_at(300.0, 720.0))
+
+    assert [e.event_type for e in events].count(EventType.PICK) == 0, (
+        "离盘后从未见到握手，不应判取料"
+    )

@@ -290,11 +290,23 @@ class ReviewPage(QWidget):
         if event is None:
             return
         if not event.clip_reference:
+            # 没有片段有三种原因，文案要区分开，否则现场分不清是「功能没开」
+            # 还是「这段本来就不该存」。事件口径见 docs/14。
+            if event.result == EventResult.CONFIRMED:
+                reason = f"{event.event_label} 是确认事件，不保存片段。"
+            elif event.result == EventResult.NEEDS_REVIEW:
+                reason = (
+                    "这条事件没有片段：可能「保存 NG 事件片段」未启用"
+                    "（设置页 recording.event_clips_enabled），"
+                    "或片段仍在写入，稍后刷新再看。"
+                )
+            else:
+                reason = "这条事件没有片段。"
             InfoBar.warning(
                 "无视频片段",
-                "第一版未启用事件片段保存；请使用训练录制视频或现场录像复核。",
+                reason,
                 position=InfoBarPosition.TOP_RIGHT,
-                duration=3500,
+                duration=4500,
                 parent=self,
             )
             return

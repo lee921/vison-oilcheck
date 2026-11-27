@@ -1018,8 +1018,13 @@ def test_oiling_without_pick_is_reported_and_not_an_anomaly():
 def test_oiling_without_pick_emits_once_per_contact_segment():
     """同一段连续刷只报一次；离开足够久再刷够一次，就再报一次。"""
 
-    # 压制窗口取 oiling_holdoff_s；这里设小一点，用例才好构造「离开够久」。
-    pipeline, events = make_pipeline(brush_hold_s=0.5, oiling_holdoff_s=1.0)
+    # 这个用例按 5fps 喂帧（``timestamps`` 步长 0.2s），必须把 ``max_fps``
+    # 也钉在 5：帧率自适应倍率 = 实际帧间隔 / (1/max_fps)，不钉住的话改
+    # 线上默认值（15 → 20）会让倍率从 3 跳到上限 4，拼接窗口从 4.8s 涨到
+    # 6.4s，下面「离开 6 秒」就不再分两段了。
+    pipeline, events = make_pipeline(
+        max_fps=5, brush_hold_s=0.5, oiling_holdoff_s=1.0
+    )
     ts_iter = timestamps()
     feed_brush(pipeline, ts_iter, frames=6)
     # 刷子离开够久（> 1.0s × 帧率倍率），再回来刷够一次。

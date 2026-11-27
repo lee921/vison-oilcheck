@@ -1,7 +1,7 @@
 {
   "layout": 1,
   "ui_fps": 25,
-  "decode_max_fps": 25,
+  "decode_max_fps": 50,
   "offline_timeout_s": 10,
   "snapshot_dir": "snapshots",
   "log_dir": "logs",

@@ -36,6 +36,10 @@ from .state_machine import SessionEvent, SessionState, SessionStateMachine
 # 停止不应超过这个量级。超过就返回错误，不让调用方无限等。
 COMMAND_TIMEOUT_S = 20.0
 
+# 解码节流的容差。见 ``SessionActor._decode_on_schedule``：判定用
+# ``now - last >= interval × 该值``，留一点余量吸收解码时间戳抖动。
+_DECODE_GATE_TOLERANCE = 0.9
+
 
 class SessionActor:
     """基于 Actor 的会话执行器，用于串行化 SDK/PlayCtrl 调用。"""
@@ -91,8 +95,6 @@ class SessionActor:
         self._cv2: Any | None = None
         self._np: Any | None = None
 
-        self._last_dec_perf = 0.0
-        self._last_dec_enqueue = 0.0
         self._last_playctrl_error_ts = 0.0
         self._last_queue_drop_ts = 0.0
 
@@ -248,6 +250,29 @@ class SessionActor:
     def _decode_interval_s(self) -> float:
         with self._decode_fps_lock:
             return 1.0 / self._decode_max_fps
+
+    def _decode_on_schedule(self, last: float, now: float) -> tuple[bool, float]:
+        """解码节流：按「下一个应解码时刻」放行，而不是「距上一帧够不够久」。
+
+        原先两道闸（``_on_decoded_callback`` 与 ``_handle_decoded_data``）
+        各自用 ``now - last < 1/decode_max_fps`` 判定。相机主码流 25fps、
+        ``decode_max_fps`` 也是 25 时，帧间隔正好卡在 40ms 边界：网络与
+        PlayM4 的抖动让每第二帧差一点点、被判「早到」丢掉，丢掉之后下一帧
+        隔了 80ms 又能过 —— 于是**恒定丢一半**（实测 45%）。这与推理速度
+        无关（实测检测+管线 6.4ms/帧，预算有 10 倍余量）。
+
+        改为按节拍推进后，早到的那帧把 ``last`` 留在原处、下一帧继续比，
+        慢一拍的帧仍能补上，不会因为「每次都差 1ms」被系统性丢光；同时保留
+        10% 的容差，避免解码时间戳的微抖动把一整拍推后。
+
+        返回 ``(是否放行, 新的 last)``。``last <= 0`` 表示还没开始，直接放行。
+        """
+
+        interval = self._decode_interval_s()
+        if last <= 0 or now - last >= interval * _DECODE_GATE_TOLERANCE:
+            # 按整拍推进，而不是直接用 now：否则每次抖动都会把节拍往后拖。
+            return True, (last + interval if last > 0 else now)
+        return False, last
 
     def _ensure_lease(self) -> None:
         if self._lease is None:
@@ -411,7 +436,6 @@ class SessionActor:
         )
 
         self._touch_activity()
-        self._last_dec_perf = 0.0
         self._last_dec_enqueue = 0.0
 
         if self._preview_mode == "decode":
@@ -534,11 +558,18 @@ class SessionActor:
             return
 
         now = time.perf_counter()
-        # 控制解码回调频率，避免过高帧率拖慢 UI
-        min_interval = self._decode_interval_s()
-        if now - self._last_dec_enqueue < min_interval:
+        # 控制解码回调频率，避免过高帧率拖慢 UI。
+        #
+        # 这是**唯一**一道解码节流：``_on_decoded_callback`` 在 SDK 解码
+        # 线程上按节拍决定要不要把这一帧拷出来，``_handle_decoded_data``
+        # 不再重复判定。原先两道闸各自用「距上一帧够不够久」把关，相机
+        # 25fps + ``decode_max_fps=25`` 时帧间隔恰好压在 40ms 边界上，
+        # 抖动让每第二帧被判早到丢掉 —— 恒定丢一半（实测 45%）。
+        allowed, self._last_dec_enqueue = self._decode_on_schedule(
+            self._last_dec_enqueue, now
+        )
+        if not allowed:
             return
-        self._last_dec_enqueue = now
 
         width = int(frame_info.nWidth)
         height = int(frame_info.nHeight)
@@ -688,12 +719,12 @@ class SessionActor:
             return
         if self.state == SessionState.ERROR:
             return
-        now = time.perf_counter()
-        # 控制 UI 刷新频率
-        min_interval = self._decode_interval_s()
-        if now - self._last_dec_perf < min_interval:
-            return
-        self._last_dec_perf = now
+        # 这里**不再**做帧率节流。``_on_decoded_callback`` 在 SDK 解码线程上
+        # 已经按 ``decode_max_fps`` 的节拍决定放不放行；这里再做一道独立
+        # 判定只会在两道闸相位错开时把本来该收的帧丢掉（现场表现：相机
+        # 25fps 只到判定侧 8~12fps，日志里每小时上千条「视频时间戳异常」）。
+        # 剩下的工作是 YUV→BGR，实测 2560×1440 只要 0.3ms，够快，不需要
+        # 第二道闸。
 
         cv2 = self._cv2
         np = self._np

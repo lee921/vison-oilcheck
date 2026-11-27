@@ -98,7 +98,7 @@ class LogisticJudge:
         self.source = source
 
     @classmethod
-    def load(cls, path: Path | str) -> "LogisticJudge | None":
+    def load(cls, path: Path | str) -> LogisticJudge | None:
         """从 JSON 读权重；文件不存在 / 格式不对时返回 None 并记日志。"""
 
         path = Path(path)
@@ -452,7 +452,7 @@ class ForestJudge:
         self._index = {name: i for i, name in enumerate(self.features)}
 
     @classmethod
-    def load(cls, path: Path | str) -> "ForestJudge | None":
+    def load(cls, path: Path | str) -> ForestJudge | None:
         path = Path(path)
         if not path.is_file():
             return None

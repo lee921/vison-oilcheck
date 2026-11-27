@@ -364,7 +364,10 @@ class DetectorConfig:
 class PipelineConfig:
     """时序事件判定参数。所有时间单位为秒，距离为按画面对角线归一化。"""
 
-    max_fps: int = 15
+    # 检测最大帧率，同时是帧率自适应（``frame_scale``）的基准。现场相机
+    # 主码流标称 25fps、实测平均 22fps，判定侧取 20：略低于码流，既能让
+    # 每个检测节拍都拿到新帧（不出现重复帧白跑），又留出推理与写盘的余量。
+    max_fps: int = 20
 
     # 取料事件：空手进盘 → 带料离盘
     pick_hand_distance: float = 0.05
@@ -393,6 +396,34 @@ class PipelineConfig:
     # 空手处理会让真实取料连周期都建不出来。
     pick_sample_every_frames: int = 2
     pick_history_samples: int = 3
+
+    # 第二条取料判据：**丝杆自己离盘**也算取料。
+    #
+    # 「手」那套判据依赖手部跟踪：手被遮挡、漏检、或整段没被检出时，一次
+    # 真实的取料会被整件丢掉（现场表现为「取料没跑完就停了」）。丝杆是刚体、
+    # 检测稳定得多，所以这里独立看杆：杆心在盘区内停留够久（确实在盘里），
+    # 随后被检到移到盘区外并持续在外，就判一次取料。两条判据并行，同一次
+    # 取料被两条同时判出时按 ``screw_exit_pick_dedup_s`` 去重。
+    screw_exit_pick_enabled: bool = True
+    # 丝杆轨迹的关联距离（第二条判据靠它维护「这是同一根杆」）。杆比手
+    # 小得多、位移也小，门限取得比手紧：盘里相邻杆间距只有 0.02~0.03，
+    # 放宽到手的 0.15 会让轨迹在整排杆之间跳。
+    screw_exit_track_distance: float = 0.06
+    # 丝杆轨迹漏检后保留时长。杆被手完全遮住一两秒是常态，太短会把一次
+    # 取料切成两段。
+    screw_exit_track_missing_s: float = 1.00
+    # 杆必须在盘区内被连续观测这么久，才算「确实在盘里」。与
+    # ``pick_confirm_s`` 同一量级：滤掉杆从盘边划过/检测框抖动跨边线。
+    screw_exit_pick_inside_s: float = 0.30
+    # 杆心要越过盘区边线这么多（按画面对角线归一化）才算「出盘」，
+    # 不是贴着边线抖一下就判——门限区上下的检测抖动很常见。
+    screw_exit_pick_margin: float = 0.010
+    # 与另一条判据（手）的去重窗口：同一件料两条判据几乎同时确认
+    # （都在杆出盘后攒采样），窗口内同一位置只报一次取料。
+    #
+    # 不能放大到几秒：现场两件料之间最短只有 1 秒上下（刷够时长就放下，
+    # 接着取下根），窗口过大会把下一件真取料也吞掉。
+    screw_exit_pick_dedup_s: float = 1.00
 
     # 目标跟踪（手/刷头使用 ByteTrack）
     hand_track_max_distance: float = 0.15
@@ -424,7 +455,10 @@ class PipelineConfig:
     # ``screw_reacquire_timeout_s`` 有取舍关系：后者默认 0（工人拿着杆走出
     # 画面、过一会儿再回来涂油仍算这一件），开了本项之后这段时间会被计入
     # 超时，超出即判 NG。
-    oiling_timeout_s: float = 10.0
+    #
+    # 现场节拍实测：同一件料从取料到刷完通常 2~4 秒，5 秒足以覆盖正常节奏，
+    # 又不至于让「忘了涂」拖太久才报 NG（NG 片段也是按这个时长截取的）。
+    oiling_timeout_s: float = 5.0
 
     # 周期与保留
     holding_lost_timeout_s: float = 2.0
@@ -570,6 +604,26 @@ class PipelineConfig:
             pick_history_samples=_i(
                 "pick_history_samples", d.pick_history_samples, 1, 30
             ),
+            # 丝杆离盘判据（第二条取料规则）。布尔与三个门限同样要在这里
+            # 读出来，否则「文件里改了不生效」。
+            screw_exit_pick_enabled=_b(
+                "screw_exit_pick_enabled", d.screw_exit_pick_enabled
+            ),
+            screw_exit_track_distance=_f(
+                "screw_exit_track_distance", d.screw_exit_track_distance, 0.005
+            ),
+            screw_exit_track_missing_s=_f(
+                "screw_exit_track_missing_s", d.screw_exit_track_missing_s, 0.0
+            ),
+            screw_exit_pick_inside_s=_f(
+                "screw_exit_pick_inside_s", d.screw_exit_pick_inside_s, 0.0
+            ),
+            screw_exit_pick_margin=_f(
+                "screw_exit_pick_margin", d.screw_exit_pick_margin, 0.0
+            ),
+            screw_exit_pick_dedup_s=_f(
+                "screw_exit_pick_dedup_s", d.screw_exit_pick_dedup_s, 0.0
+            ),
             hand_track_max_distance=_f(
                 "hand_track_max_distance", d.hand_track_max_distance, 0.005
             ),
@@ -699,6 +753,12 @@ class PipelineConfig:
             "pick_confirm_s": self.pick_confirm_s,
             "pick_sample_every_frames": self.pick_sample_every_frames,
             "pick_history_samples": self.pick_history_samples,
+            "screw_exit_pick_enabled": self.screw_exit_pick_enabled,
+            "screw_exit_track_distance": self.screw_exit_track_distance,
+            "screw_exit_track_missing_s": self.screw_exit_track_missing_s,
+            "screw_exit_pick_inside_s": self.screw_exit_pick_inside_s,
+            "screw_exit_pick_margin": self.screw_exit_pick_margin,
+            "screw_exit_pick_dedup_s": self.screw_exit_pick_dedup_s,
             # 键顺序与 dataclass 声明一致：写回文件时按它重排，模板也照此排。
             "hand_track_max_distance": self.hand_track_max_distance,
             "hand_track_max_missing_s": self.hand_track_max_missing_s,
@@ -749,7 +809,36 @@ class RecordingConfig:
     segment_seconds: float = 600.0
     codec: str = "mp4v"
     auto_start: bool = False
+    # 保存 NG 事件前后的画面片段（复核页可直接播放）。见
+    # docs/14-NG事件片段存储设计.md。默认关闭：片段写盘与训练录制抢同一块
+    # 盘、同一份 CPU 编码，现场确认硬盘余量后再打开。
     event_clips_enabled: bool = False
+    # 片段目录，相对数据目录解析。
+    clip_dir: str = "clips"
+    # 环形缓冲长度（秒）。只作保险：覆盖判定结算本身的抖动；事件需要回看
+    # 的起点从事件里取（取料时刻），不靠这个长度。
+    clip_pre_seconds: float = 3.0
+    # 事件自带的起止之外，前后各再延长多久（秒）。事件里的起止是判定口径，
+    # 比人手看到的完整动作窄；留 1.5 秒余量才能看清取料前伸手、判出后放下件
+    # 的完整过程。
+    clip_margin_seconds: float = 1.5
+    # 事件之后继续录多久。判出 NG 之后工人往往立刻回头处理（放下工具、
+    # 重新拿杆），这 2 秒能看清后续动作，复核时更直观。
+    clip_post_seconds: float = 2.0
+    # 片段缓冲的缩放宽与 JPEG 质量。0 = 不缩放（保留原生分辨率）。
+    # 原生 2560×1440 编码约 11ms/帧、8 秒缓冲约 265MB；720p 约 2ms/45MB。
+    clip_buffer_width: int = 0
+    clip_jpeg_quality: int = 75
+    # 环形缓冲的内存上限（MB）。超过就丢最旧的帧并记 warning。
+    clip_buffer_max_mb: int = 512
+    # 片段帧率；0 = 跟随 ``fps``。片段比训练录制更需要动作完整，不建议 <10。
+    clip_fps: int = 0
+    # 片段编码；空 = 跟随 ``codec``。
+    clip_codec: str = ""
+    # 每相机同时挂起的片段上限。超限时提前收尾最早的（保留已有画面）。
+    clip_max_pending: int = 2
+    # 启动时清理超过该天数的片段；0 = 不清理。
+    clip_retain_days: int = 30
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> RecordingConfig:
@@ -774,6 +863,17 @@ class RecordingConfig:
             codec=str(data.get("codec") or d.codec),
             auto_start=_b("auto_start", d.auto_start),
             event_clips_enabled=_b("event_clips_enabled", d.event_clips_enabled),
+            clip_dir=str(data.get("clip_dir") or d.clip_dir),
+            clip_pre_seconds=max(0.0, _f("clip_pre_seconds", d.clip_pre_seconds)),
+            clip_margin_seconds=max(0.0, _f("clip_margin_seconds", d.clip_margin_seconds)),
+            clip_post_seconds=max(0.0, _f("clip_post_seconds", d.clip_post_seconds)),
+            clip_buffer_width=max(0, min(3840, _i("clip_buffer_width", d.clip_buffer_width))),
+            clip_jpeg_quality=max(1, min(100, _i("clip_jpeg_quality", d.clip_jpeg_quality))),
+            clip_buffer_max_mb=max(32, _i("clip_buffer_max_mb", d.clip_buffer_max_mb)),
+            clip_fps=max(0, min(60, _i("clip_fps", d.clip_fps))),
+            clip_codec=str(data.get("clip_codec") or d.clip_codec),
+            clip_max_pending=max(1, min(16, _i("clip_max_pending", d.clip_max_pending))),
+            clip_retain_days=max(0, _i("clip_retain_days", d.clip_retain_days)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -784,6 +884,17 @@ class RecordingConfig:
             "codec": self.codec,
             "auto_start": self.auto_start,
             "event_clips_enabled": self.event_clips_enabled,
+            "clip_dir": self.clip_dir,
+            "clip_pre_seconds": self.clip_pre_seconds,
+            "clip_margin_seconds": self.clip_margin_seconds,
+            "clip_post_seconds": self.clip_post_seconds,
+            "clip_buffer_width": self.clip_buffer_width,
+            "clip_jpeg_quality": self.clip_jpeg_quality,
+            "clip_buffer_max_mb": self.clip_buffer_max_mb,
+            "clip_fps": self.clip_fps,
+            "clip_codec": self.clip_codec,
+            "clip_max_pending": self.clip_max_pending,
+            "clip_retain_days": self.clip_retain_days,
         }
 
 
@@ -867,7 +978,12 @@ class DemoConfig:
     """
 
     loop: bool = True
-    fps_limit: int = 15
+    # 示例回放投放的帧率上限，实际取 min(视频原帧率, 该值)。与
+    # ``pipeline.max_fps`` 取同一个数（20）：现场码流 25fps、判定侧每拍
+    # 取一帧，回放低于它等于凭空丢帧——插帧到 20fps 的录像回来只投放
+    # 15fps，帧率自适应会把倍率算错，核对出来的结论也不是 20fps 下的。
+    # 15fps 的原始录像仍按自身帧率投放，不受影响。
+    fps_limit: int = 20
     # 示例回放默认速率倍数（0.5 为慢放）。判定计时用视频媒体时间，与速率无关。
     speed: float = 1.0
     # 自动扫描的示例视频目录，相对仓库根或绝对路径。空串按默认目录。
@@ -1802,6 +1918,31 @@ CONFIG_COMMENTS: dict[str, str] = {
         "手在涂油盘内的最短停留时长。低于该值视为从盘边划过，不判取料。"
         "纯时间阈值，不随帧率缩放"
     ),
+    # ---- pipeline：丝杆离盘判据（第二条取料规则）----
+    "pipeline.screw_exit_pick_enabled": (
+        "第二条取料判据：丝杆本身从盘区内移到盘区外也算取料，不依赖手部跟踪。\n"
+        "与「空手进盘→带料离盘」并行判定，两条同时判出时按去重窗口只报一次"
+    ),
+    "pipeline.screw_exit_track_distance": (
+        "丝杆轨迹的关联距离（第二条取料判据用）。杆比手小、位移也小，"
+        "门限要取得比手紧，否则轨迹会在盘里那排杆之间跳"
+    ),
+    "pipeline.screw_exit_track_missing_s": (
+        "丝杆轨迹漏检后保留时长。杆被手完全遮住一两秒是常态，太短会把"
+        "一次取料切成两段"
+    ),
+    "pipeline.screw_exit_pick_inside_s": (
+        "丝杆必须在盘区内被连续观测这么久才算「确实在盘里」。低于该值视为"
+        "从盘边划过或检测框抖动跨边线，不判取料。纯时间阈值，不随帧率缩放"
+    ),
+    "pipeline.screw_exit_pick_margin": (
+        "丝杆中心越过盘区边线这么多（按画面对角线归一化）才算「出盘」，"
+        "防止贴着边线抖动就判取料"
+    ),
+    "pipeline.screw_exit_pick_dedup_s": (
+        "两条取料判据的去重窗口：同一件料两条几乎同时确认，窗口内只报一次。"
+        "不能放大到几秒，否则会把紧接的下一件真取料吞掉"
+    ),
     # ---- pipeline：手部跟踪 ----
     "pipeline.hand_track_max_distance": (
         "手部轨迹匹配的最大归一化中心距离。低帧率时按帧间隔自动放大"
@@ -1922,11 +2063,39 @@ CONFIG_COMMENTS: dict[str, str] = {
     "recording.segment_seconds": "单个分段视频的时长，超过即切新文件",
     "recording.codec": "OpenCV VideoWriter 编码，例如 mp4v / XVID",
     "recording.auto_start": "启动后是否自动开始录制",
-    "recording.event_clips_enabled": "预留项：事件前后片段的开关，当前未实现",
+    "recording.event_clips_enabled": (
+        "保存 NG 事件前后的画面片段（复核页可直接播放）。默认关闭：片段写盘\n"
+        "与训练录制抢同一块盘与编码资源，现场确认硬盘余量后再打开"
+    ),
+    "recording.clip_dir": "片段目录，相对数据目录解析",
+    "recording.clip_pre_seconds": (
+        "环形缓冲长度（秒）。只作保险，覆盖判定结算的抖动；事件要回看的起点\n"
+        "从事件里取（取料时刻），不靠这个长度"
+    ),
+    "recording.clip_margin_seconds": (
+        "事件自带的起止之外前后各再延长多久（秒）。事件起止是判定口径，比人手\n"
+        "看到的完整动作窄；留 1.5 秒余量才能看清取料前伸手、判出后放下件的全过程"
+    ),
+    "recording.clip_post_seconds": (
+        "事件之后再额外录多久。判出 NG 后留 2 秒，看清工人随后的处理动作"
+    ),
+    "recording.clip_buffer_width": (
+        "片段缓冲的缩放宽，0 = 不缩放。缓冲存的是 JPEG：原生 2560×1440 约\n"
+        "11ms/帧、8 秒约 265MB；720p 约 2ms/45MB"
+    ),
+    "recording.clip_jpeg_quality": "片段缓冲的 JPEG 质量（1~100），默认 75",
+    "recording.clip_buffer_max_mb": "环形缓冲内存上限（MB）。超过就丢最旧的帧并记 warning",
+    "recording.clip_fps": "片段帧率；0 = 跟随 fps。片段比训练录制更需要动作完整，不建议低于 10",
+    "recording.clip_codec": "片段编码 FourCC；空 = 跟随 codec",
+    "recording.clip_max_pending": "每相机同时挂起的片段上限。超限时提前收尾最早的",
+    "recording.clip_retain_days": "启动时清理超过该天数的片段；0 = 不清理",
     # ---- demo ----
     "demo": "示例视频回放（画面来自 mp4，检测仍由模型完成）",
     "demo.loop": "播放结束后是否从头循环",
-    "demo.fps_limit": "投放帧率上限，实际取 min(视频原帧率, 该值)",
+    "demo.fps_limit": (
+        "投放帧率上限，实际取 min(视频原帧率, 该值)。与 pipeline.max_fps "
+        "取同一个数，回放才不会凭空丢帧"
+    ),
     "demo.speed": (
         "播放速率倍数（0.1~4）。只改播放快慢，判定按视频媒体时间计时，" "结果不受影响"
     ),

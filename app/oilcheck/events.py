@@ -18,6 +18,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,20 @@ class EventStore:
             if event is not None:
                 loaded[event_id] = event.with_review(result, note=note)
 
+        # 片段路径是事后回填的，单独一个文件；重启后要读回来，否则复核页
+        # 看不到「有片段」。
+        clips: dict[str, str] = {}
+        for path in sorted(self._events_dir().glob("clips-*.jsonl")):
+            for data in _iter_jsonl(path):
+                event_id = str(data.get("event_id", ""))
+                clip = str(data.get("clip_reference", ""))
+                if event_id and clip:
+                    clips[event_id] = clip
+        for event_id, clip in clips.items():
+            event = loaded.get(event_id)
+            if event is not None and not event.clip_reference:
+                loaded[event_id] = replace(event, clip_reference=clip)
+
         with self._lock:
             self._events = loaded
             while len(self._events) > self._capacity:
@@ -144,6 +159,30 @@ class EventStore:
                 self._logger.exception("写入复核文件失败: %s", path)
         return reviewed
 
+    def update_clip(self, event_id: str, path: str) -> EventRecord | None:
+        """给事件补上画面片段路径，并追加一行映射记录。
+
+        与 ``submit_review`` 一样用追加日志：不改写已有的事件行，历史可追溯。
+        片段是**事后**才写好的，事件入库那一刻拿不到路径，所以必须回填。
+        """
+
+        record_path = self._events_dir() / f"clips-{_date_of(time.time())}.jsonl"
+        payload = {"event_id": event_id, "clip_reference": str(path), "saved_at": time.time()}
+        with self._lock:
+            event = self._events.get(event_id)
+            if event is None:
+                # 事件可能已被 clear() 清掉或从未进内存；映射仍记一笔便于追溯。
+                self._logger.debug("回填片段路径时找不到事件 %s", event_id)
+                return None
+            updated = replace(event, clip_reference=str(path))
+            self._events[event_id] = updated
+            self._version += 1
+            try:
+                self._append_jsonl(record_path, payload)
+            except OSError:
+                self._logger.exception("写入片段映射失败: %s", record_path)
+        return updated
+
     def clear(self) -> int:
         """清空内存事件并删除本机所有事件/复核文件。
 
@@ -156,6 +195,7 @@ class EventStore:
             self._version += 1
             files = list(self._events_dir().glob("events-*.jsonl"))
             files.extend(self._events_dir().glob("reviews-*.jsonl"))
+            files.extend(self._events_dir().glob("clips-*.jsonl"))
             for path in files:
                 try:
                     path.unlink()

@@ -24,6 +24,7 @@ from typing import Any
 
 from app.paths import resolve_runtime_file, runtime_root
 
+from .clips import ClipConfig, EventClipService
 from .config import (
     DemoVideo,
     OilCheckConfig,
@@ -39,6 +40,7 @@ from .plc_io import PlcEvidence, PlcIoThread
 from .recorder import TrainingRecorder, delete_segments, list_segments
 from .types import (
     EventRecord,
+    EventResult,
     FrameDetections,
     RecordingStatus,
     StationSnapshot,
@@ -107,6 +109,9 @@ class OilCheckService:
         self._config_mtime = self._stat_config_mtime()
         # PLC 警示灯（默认关闭 + 只读）。线程起在 start()，停于 shutdown()。
         self._plc: PlcIoThread | None = None
+        # NG 事件片段：每相机一个环形帧缓冲，事件到来时登记一段、事后切出 mp4。
+        # 见 docs/14-NG事件片段存储设计.md。
+        self._clip_service = self._make_clip_service(config.recording)
 
         self._rebuild_runtimes_locked()
         self._rebuild_plc_locked()
@@ -125,6 +130,42 @@ class OilCheckService:
     @property
     def event_store(self) -> EventStore:
         return self._event_store
+
+    def _make_clip_service(self, recording) -> EventClipService:
+        clip_root = Path(recording.clip_dir)
+        if not clip_root.is_absolute():
+            clip_root = (self._data_root / clip_root).resolve()
+        fps = int(recording.clip_fps) or int(recording.fps)
+        # 漏涂要等满 pipeline.oiling_timeout_s 才判出；缓冲必须盖住这整段。
+        timeout_s = max(0.0, float(self._config.pipeline.oiling_timeout_s))
+        cfg = ClipConfig(
+            enabled=bool(recording.event_clips_enabled),
+            root=clip_root,
+            pre_seconds=float(recording.clip_pre_seconds),
+            timeout_seconds=timeout_s,
+            margin_seconds=float(recording.clip_margin_seconds),
+            post_seconds=float(recording.clip_post_seconds),
+            fps=max(1, min(60, fps)),
+            codec=(recording.clip_codec or recording.codec or "mp4v")[:4],
+            buffer_width=int(recording.clip_buffer_width),
+            jpeg_quality=int(recording.clip_jpeg_quality),
+            buffer_max_mb=int(recording.clip_buffer_max_mb),
+            max_pending=int(recording.clip_max_pending),
+            retain_days=int(recording.clip_retain_days),
+        )
+        return EventClipService(
+            config=cfg,
+            on_clip_ready=self._on_clip_ready,
+            logger_=self._logger,
+        )
+
+    @property
+    def clip_root(self) -> Path:
+        return self._clip_service.root
+
+    @property
+    def event_clips_enabled(self) -> bool:
+        return self._clip_service.enabled
 
     @property
     def recording_root(self) -> Path:
@@ -187,14 +228,23 @@ class OilCheckService:
                 pass
         for runtime in runtimes:
             self._shutdown_runtime(runtime)
+        # 正在录的事件片段要 release writer，否则 mp4 没有 moov atom、无法播放。
+        try:
+            self._clip_service.close()
+        except Exception:  # noqa: BLE001
+            self._logger.exception("收尾事件片段失败")
         self._logger.info("取料检测服务已停止")
 
     def reload(self, config: OilCheckConfig) -> None:
-        """应用新的配置并重建工位运行时（录制保持不变）。"""
+        """应用新的配置并重建工位运行时（训练录制保持不变）。"""
         self._config_mtime = self._stat_config_mtime()
         old = list(self._runtimes.values())
+        old_clips = self._clip_service
         with self._lock:
             self._config = config
+            # 片段参数改了（开关/时长/目录）就重建：旧缓冲配新参数会切歪。
+            if config.recording != self._config.recording:
+                self._clip_service = self._make_clip_service(config.recording)
             self._rebuild_runtimes_locked()
             old_plc = self._plc
             self._plc = None
@@ -211,6 +261,11 @@ class OilCheckService:
                 self._logger.exception("重载时停止 PLC 线程失败")
         if new_plc is not None:
             new_plc.start()
+        if old_clips is not self._clip_service:
+            try:
+                old_clips.close()
+            except Exception:  # noqa: BLE001
+                self._logger.exception("收尾旧的片段服务失败")
         self._logger.info("检测配置已重新加载（工位=%d）", len(self._runtimes))
 
     # ------------------------------------------------------------------
@@ -704,10 +759,32 @@ class OilCheckService:
     # 内部实现
     # ------------------------------------------------------------------
     def _run(self) -> None:
+        self._run_loop()
+
+    def _run_loop(self) -> None:
+        # 固定节拍：先按「到下一个取帧时刻还有多久」等待，再做这一轮的工作。
+        # 原先写「``wait(interval)`` → 干活」，真实周期 = interval + 本轮耗时
+        # （取帧、片段 JPEG 编码、PLC 快照、flush_idle 等），15fps 配置实测
+        # 只跑到 ~12.5fps。
+        #
+        # 节拍只是**限速**：真正取帧时用 ``FrameBuffer.wait_newer`` 等下一帧
+        # 到达，而不是取「最新帧」。相机帧间隔不均匀（25fps 主码流实测中位
+        # 38ms、p90 75ms），固定相位取样会有一成的节拍落在两帧之间、拿到
+        # 重复帧，15fps 配置只能到 13.6fps —— 日志里那些「视频时间戳异常」
+        # 就是这些白跑的节拍。
+        next_tick = time.monotonic()
         while not self._stop_event.is_set():
             interval = self._poll_interval()
-            if self._stop_event.wait(interval):
-                break
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                if self._stop_event.wait(delay):
+                    break
+            elif delay <= -interval:
+                # 落后超过一整拍：说明刚才那次工作严重超时（磁盘卡顿、GC）。
+                # 从「现在」重新起拍，不要补发一串空转把 CPU 打满。
+                next_tick = time.monotonic()
+            next_tick += interval
+
             self._reload_if_file_changed()
             with self._lock:
                 runtimes = list(self._runtimes.values())
@@ -717,6 +794,30 @@ class OilCheckService:
                 if runtime.closed:
                     continue
                 self._poll_station(runtime)
+            # 相机断流后就再也没有新帧了，靠这个按时间把在录片段收尾。
+            try:
+                self._clip_service.flush_idle()
+            except Exception:  # noqa: BLE001
+                self._logger.exception("收尾超时的片段失败")
+
+    def _next_camera_frame(self, session: Any, since_ts: float) -> Any:
+        """等「比 ``since_ts`` 更新」的相机帧（最多等一拍）。
+
+        为什么不是 ``frame_buffer.get()``：固定节拍取样时，相机帧间隔抖动
+        （25fps 主码流实测中位 38ms、p90 75ms）会让约一成的节拍落在两帧之间，
+        取到的还是上一帧 —— 这一拍白跑，配置 15fps 实测只有 13.6fps，
+        日志里对应「视频时间戳异常」。``wait_newer`` 有更新的帧就返回，
+        节拍只用于限速，不再决定采样相位。
+
+        超时上限只取**一拍**：多工位是串行轮询的，一个工位等久了会直接
+        拖慢其他工位。等不到就下一拍再来，反正节拍本身就在限速。
+        """
+
+        buffer = session.frame_buffer
+        waiter = getattr(buffer, "wait_newer", None)
+        if waiter is None:
+            return buffer.get()
+        return waiter(since_ts, timeout=self._poll_interval())
 
     def _stat_config_mtime(self) -> float | None:
         try:
@@ -780,7 +881,11 @@ class OilCheckService:
             frame = video.get()
         else:
             session = self._manager.get_session(camera_id)
-            frame = None if session is None else session.frame_buffer.get()
+            frame = (
+                None
+                if session is None
+                else self._next_camera_frame(session, runtime.last_frame_ts)
+            )
         if frame is None:
             return
         if frame.ts <= runtime.last_frame_ts:
@@ -794,18 +899,24 @@ class OilCheckService:
 
         with self._lock:
             recorder = self._recorders.get(camera_id)
+        # 判定用媒体时间：示例回放变速时它仍按视频自身帧周期前进，
+        # 因此“盘内停留多久”“刷子靠近累计多久”与播放速度无关。
+        # 实时相机没有媒体时间，回退到墙钟时间。
+        pipelines_ts = frame.ts if frame.media_ts is None else frame.media_ts
         # 示例回放不写入训练录制：回放视频没有录制价值。
         if recorder is not None and recorder.active and not synthetic:
             recorder.submit(frame.ts, frame.bgr)
+        # 事件片段要的是**现场时间**（``frame.ts``），不是判定时间轴；
+        # 两者都传进去，切片时按偏移换算。回放也推缓冲：不写盘，但联调
+        # 时能用同一套代码验证切片是否对准了动作。
+        self._clip_service.push(
+            camera_id, bgr=frame.bgr, ts=frame.ts, pipeline_ts=pipelines_ts
+        )
 
         if runtime.busy:
             runtime.dropped_frames += 1
             return
         runtime.busy = True
-        # 判定用媒体时间：示例回放变速时它仍按视频自身帧周期前进，
-        # 因此“盘内停留多久”“刷子靠近累计多久”与播放速度无关。
-        # 实时相机没有媒体时间，回退到墙钟时间。
-        pipelines_ts = frame.ts if frame.media_ts is None else frame.media_ts
         try:
             runtime.executor.submit(
                 self._process_frame, runtime, frame.bgr, pipelines_ts
@@ -901,6 +1012,34 @@ class OilCheckService:
     def _on_event(self, event: EventRecord) -> None:
         self._event_store.add(event)
         self._logger.debug("事件已入库: %s", event.event_id)
+        # 只给需要人工复核的事件存片段（当前就是漏涂 NG）。登记必须在
+        # 判定线程里同步完成：此刻环形缓冲的最后几帧正好是事件时刻的画面。
+        if not self._clip_service.enabled:
+            return
+        if event.result == EventResult.CONFIRMED:
+            return
+        try:
+            self._clip_service.on_event(
+                event_id=event.event_id,
+                task_id=event.task_id,
+                event_type=_event_type_name(event.event_type),
+                reason=str(event.evidence.get("reason", "")),
+                station_id=event.station_id,
+                camera_id=event.camera_id,
+                event_start=event.timestamp_start,
+                event_end=event.timestamp_end,
+                needs_review=event.result == EventResult.NEEDS_REVIEW,
+            )
+        except Exception:  # noqa: BLE001
+            self._logger.exception("登记事件片段失败 %s", event.event_id)
+
+    def _on_clip_ready(self, event_id: str, path: str) -> None:
+        """片段写完后回填事件的 ``clip_reference``（复核页据此播放）。"""
+
+        try:
+            self._event_store.update_clip(event_id, path)
+        except Exception:  # noqa: BLE001
+            self._logger.exception("回填事件片段路径失败 %s", event_id)
 
     def _load_judges(self):
         """加载取料/涂油的二级判定权重（缺文件则不启用）。
@@ -1026,6 +1165,12 @@ class OilCheckService:
         except Exception:
             pass
         return None
+
+
+def _event_type_name(event_type: Any) -> str:
+    """事件类型名：枚举取 ``value``，历史遗留字符串原样保留。"""
+
+    return str(getattr(event_type, "value", event_type))
 
 
 def _load_judge_file(path: Path):

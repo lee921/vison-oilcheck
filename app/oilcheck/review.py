@@ -52,17 +52,30 @@ def _stages(task: _Cycle) -> tuple[tuple[str, float], ...]:
     return tuple(seen)
 
 
-def build_pick_summary(task: _Cycle, *, dwell_s: float) -> ReviewSummary:
-    """取料完成事件的摘要。"""
+def build_pick_summary(
+    task: _Cycle, *, dwell_s: float, source: str = "hand_exit"
+) -> ReviewSummary:
+    """取料完成事件的摘要。
 
+    ``source`` 是这条取料由哪条判据判出：``hand_exit`` = 空手进盘、带料
+    离盘；``screw_exit`` = 丝杆自己从盘区内移到盘区外。两条判据并行，摘要
+    要让复核员一眼看出是哪一条，因为「盘内停留」这个指标在两条判据下含义
+    不同（前者是手在盘里的时长，后者是杆躺在盘里 + 被带走的时间跨度）。
+    """
+
+    screw_only = source == "screw_exit"
     metrics = (
         ReviewMetric(
             key="dwell_in_tray_s",
-            label="手在盘内停留",
+            label="丝杆在盘内停留" if screw_only else "手在盘内停留",
             value=_fmt_s(dwell_s),
             required="非取料动作通常 < 0.30 s",
             passed=True,
-            hint="空手进盘、带料离盘，取料本身成立。",
+            hint=(
+                "丝杆确实在盘里放稳过，随后被检到移到盘区外。"
+                if screw_only
+                else "空手进盘、带料离盘，取料本身成立。"
+            ),
         ),
         ReviewMetric(
             key="screw_confidence",
@@ -83,7 +96,11 @@ def build_pick_summary(task: _Cycle, *, dwell_s: float) -> ReviewSummary:
     return ReviewSummary(
         check_name="取料",
         verdict="取料确认",
-        reason="手空手进盘、随后带着丝杆离开",
+        reason=(
+            "丝杆从涂油盘区内移到盘区外"
+            if screw_only
+            else "手空手进盘、随后带着丝杆离开"
+        ),
         metrics=metrics,
         timeline=_stages(task),
     )

@@ -90,6 +90,18 @@ class SettingsPage(QWidget):
         self._max_fps.setRange(1, 60)
         self._pick_hand_distance = _double_spin(0.005, 0.5, 0.005, 3)
         self._pick_confirm = _double_spin(0.0, 10.0, 0.05, 2)
+        # 第二条取料判据：丝杆自己出盘区。开关 + 两个关键门限。
+        self._screw_exit_enabled = QCheckBox("启用「丝杆移出盘区」取料判据")
+        self._screw_exit_enabled.setToolTip(
+            "只看杆、不看手：杆在盘区内放稳过，随后被检到移到盘区外，"
+            "就算一次取料。手被遮挡/漏检时由它兜底。与手部判据并行，"
+            "同一件料只报一次。"
+        )
+        self._screw_exit_inside = _double_spin(0.0, 10.0, 0.05, 2)
+        self._screw_exit_inside.setToolTip(
+            "杆必须在盘区内**放稳**（位置不动）这么久，才算「确实在盘里」。"
+            "这是判取料的前提，防止杆从盘区上空划过被误判。"
+        )
         self._brush_distance = _double_spin(0.005, 0.5, 0.005, 3)
         self._brush_hold = _double_spin(0.0, 60.0, 0.1, 2)
         self._oiling_timeout = _double_spin(0.0, 3600.0, 1.0, 1)
@@ -125,6 +137,32 @@ class SettingsPage(QWidget):
         self._segment_seconds = _double_spin(10.0, 86400.0, 30.0, 1)
         self._codec = LineEdit()
         self._auto_start = QCheckBox("程序启动后自动开始录制")
+        # NG 事件片段：只给需要人工复核的事件（当前是漏涂）存前后画面。
+        self._event_clips = QCheckBox("保存 NG 事件片段（复核页可直接播放）")
+        self._event_clips.setToolTip(
+            "漏涂等需要复核的事件，前后各留 1.5 秒余量录成 mp4。\n"
+            "片段写盘与训练录制共用磁盘和编码资源，确认硬盘余量后再打开。"
+        )
+        self._clip_margin = _double_spin(0.0, 30.0, 1.5, 0.5)
+        self._clip_post = _double_spin(0.0, 60.0, 2.0, 0.5)
+        self._clip_buffer_width = QSpinBox()
+        self._clip_buffer_width.setRange(0, 3840)
+        self._clip_buffer_width.setSpecialValueText("原生分辨率")
+        self._clip_buffer_width.setSuffix(" px")
+        self._clip_buffer_width.setToolTip(
+            "缓冲的缩放宽，0 = 不缩放。缓冲存的是 JPEG：\n"
+            "原生 2560×1440 约 75MB，1280×720 约 45MB。复核看动作，720p 通常够。"
+        )
+        self._clip_jpeg_quality = QSpinBox()
+        self._clip_jpeg_quality.setRange(1, 100)
+        self._clip_buffer_max_mb = QSpinBox()
+        self._clip_buffer_max_mb.setRange(32, 8192)
+        self._clip_buffer_max_mb.setSuffix(" MB")
+        self._clip_buffer_max_mb.setToolTip("环形缓冲的内存上限，超过就丢最旧的帧")
+        self._clip_retain_days = QSpinBox()
+        self._clip_retain_days.setRange(0, 3650)
+        self._clip_retain_days.setSuffix(" 天")
+        self._clip_retain_days.setToolTip("启动时清理超过该天数的片段；0 = 不清理")
 
         # PLC 警示灯（默认关闭 + 只读）
         self._plc_enabled = QCheckBox("启用 PLC 警示灯输出")
@@ -178,6 +216,8 @@ class SettingsPage(QWidget):
         pipeline_form.addRow("检测最大帧率", self._max_fps)
         pipeline_form.addRow("手-丝杆接近距离（归一化）", self._pick_hand_distance)
         pipeline_form.addRow("盘内停留确认时长（秒）", self._pick_confirm)
+        pipeline_form.addRow("", self._screw_exit_enabled)
+        pipeline_form.addRow("丝杆在盘内放稳时长（秒）", self._screw_exit_inside)
         pipeline_form.addRow("刷头-丝杆接触距离（归一化）", self._brush_distance)
         pipeline_form.addRow("刷子靠近判完成时长（秒）", self._brush_hold)
         pipeline_form.addRow("未涂油超时判 NG（秒，0=不限时）", self._oiling_timeout)
@@ -208,6 +248,13 @@ class SettingsPage(QWidget):
         record_form.addRow("分段时长（秒）", self._segment_seconds)
         record_form.addRow("编码 FourCC", self._codec)
         record_form.addRow("", self._auto_start)
+        record_form.addRow("", self._event_clips)
+        record_form.addRow("片段前后余量（秒）", self._clip_margin)
+        record_form.addRow("片段事件后再录（秒）", self._clip_post)
+        record_form.addRow("片段缓冲缩放宽", self._clip_buffer_width)
+        record_form.addRow("片段 JPEG 质量", self._clip_jpeg_quality)
+        record_form.addRow("片段缓冲内存上限", self._clip_buffer_max_mb)
+        record_form.addRow("片段保留", self._clip_retain_days)
 
         plc_form = QFormLayout()
         plc_form.addRow("", self._plc_enabled)
@@ -282,6 +329,8 @@ class SettingsPage(QWidget):
         self._max_fps.setValue(int(pipeline.max_fps))
         self._pick_hand_distance.setValue(float(pipeline.pick_hand_distance))
         self._pick_confirm.setValue(float(pipeline.pick_confirm_s))
+        self._screw_exit_enabled.setChecked(bool(pipeline.screw_exit_pick_enabled))
+        self._screw_exit_inside.setValue(float(pipeline.screw_exit_pick_inside_s))
         self._brush_distance.setValue(float(pipeline.brush_contact_distance))
         self._brush_hold.setValue(float(pipeline.brush_hold_s))
         self._oiling_timeout.setValue(float(pipeline.oiling_timeout_s))
@@ -310,6 +359,13 @@ class SettingsPage(QWidget):
         self._segment_seconds.setValue(float(recording.segment_seconds))
         self._codec.setText(recording.codec)
         self._auto_start.setChecked(bool(recording.auto_start))
+        self._event_clips.setChecked(bool(recording.event_clips_enabled))
+        self._clip_margin.setValue(float(recording.clip_margin_seconds))
+        self._clip_post.setValue(float(recording.clip_post_seconds))
+        self._clip_buffer_width.setValue(int(recording.clip_buffer_width))
+        self._clip_jpeg_quality.setValue(int(recording.clip_jpeg_quality))
+        self._clip_buffer_max_mb.setValue(int(recording.clip_buffer_max_mb))
+        self._clip_retain_days.setValue(int(recording.clip_retain_days))
 
         plc = cfg.plc
         self._plc_enabled.setChecked(bool(plc.enabled))
@@ -466,6 +522,8 @@ class SettingsPage(QWidget):
             max_fps=int(self._max_fps.value()),
             pick_hand_distance=float(self._pick_hand_distance.value()),
             pick_confirm_s=float(self._pick_confirm.value()),
+            screw_exit_pick_enabled=self._screw_exit_enabled.isChecked(),
+            screw_exit_pick_inside_s=float(self._screw_exit_inside.value()),
             brush_contact_distance=float(self._brush_distance.value()),
             brush_hold_s=float(self._brush_hold.value()),
             oiling_timeout_s=float(self._oiling_timeout.value()),
@@ -492,6 +550,13 @@ class SettingsPage(QWidget):
             segment_seconds=float(self._segment_seconds.value()),
             codec=self._codec.text().strip() or "mp4v",
             auto_start=self._auto_start.isChecked(),
+            event_clips_enabled=self._event_clips.isChecked(),
+            clip_margin_seconds=float(self._clip_margin.value()),
+            clip_post_seconds=float(self._clip_post.value()),
+            clip_buffer_width=int(self._clip_buffer_width.value()),
+            clip_jpeg_quality=int(self._clip_jpeg_quality.value()),
+            clip_buffer_max_mb=int(self._clip_buffer_max_mb.value()),
+            clip_retain_days=int(self._clip_retain_days.value()),
         )
         plc = replace(
             self._oil_cfg.plc,

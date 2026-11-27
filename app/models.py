@@ -204,7 +204,10 @@ class RelayConfig:
 class AppConfig:
     layout: int = 4
     ui_fps: int = 15
-    decode_max_fps: int = 15
+    # 解码侧最大帧率。必须**大于**相机码流帧率：这一项是节流上限，取成和
+    # 码流一样的值（例如 25fps 相机配 25）时，帧间隔正好压在 1/fps 边界上，
+    # 抖动会让每第二帧被判「早到」丢掉，恒定丢一半。现场默认 50。
+    decode_max_fps: int = 50
     offline_timeout_s: int = 10
     snapshot_dir: str = "snapshots"
     log_dir: str = "logs"

@@ -74,7 +74,9 @@ def _make_frame(pipeline: StationPipeline, ts: float) -> RawFrame:
         tray=pipeline._tray_region_box((width, height)),
         work=station.work_roi.pixel_bbox(width, height),
         oiling=station.oiling_roi.pixel_bbox(width, height),
-        screw_history=list(pipeline._screw_history),
+        screw_history=[
+            (entry_ts, list(boxes)) for entry_ts, boxes in pipeline._screw_history
+        ],
         detector=station.detector,
     )
 

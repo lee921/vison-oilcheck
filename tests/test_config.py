@@ -1308,6 +1308,7 @@ def test_app_config_bad_field_types_fall_back_to_defaults(tmp_path):
     """字段类型非法时退回默认值，不能抛异常（那会崩在日志就绪之前）。"""
 
     from app.config_service import ConfigService
+    from app.models import AppConfig
 
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
@@ -1318,7 +1319,9 @@ def test_app_config_bad_field_types_fall_back_to_defaults(tmp_path):
     cfg = ConfigService(repo_root=tmp_path).load_app_config()
     assert cfg.ui_fps == 15
     assert cfg.layout == 4
-    assert cfg.decode_max_fps == 15
+    # 默认值必须**大于**码流帧率（见 AppConfig.decode_max_fps 的注释）：
+    # 取成 25 时帧间隔正好压在节流边界上，恒定丢一半。
+    assert cfg.decode_max_fps == AppConfig().decode_max_fps == 50
 
 
 def test_cameras_parse_failure_raises_instead_of_empty_list(tmp_path):
@@ -1398,7 +1401,8 @@ def test_pipeline_overflow_number_falls_back():
 
     from app.oilcheck.config import PipelineConfig
 
-    assert PipelineConfig.from_dict({"max_fps": 1e400}).max_fps == 15
+    default = PipelineConfig().max_fps
+    assert PipelineConfig.from_dict({"max_fps": 1e400}).max_fps == default
 
 
 def test_plc_string_booleans_are_parsed():

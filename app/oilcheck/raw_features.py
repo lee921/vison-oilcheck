@@ -44,8 +44,10 @@ IN_HAND_FRAC = 0.30
 ROD_MOVE_EPS = 0.010
 # 「这根杆一直没动」的 IoU 门限。
 PARKED_IOU = 0.50
-# 与多少帧前对照判断「动没动」。
-MOVE_FRAMES_BACK = 8
+# 与多久之前对照判断「动没动」（秒）。标定帧率 15fps 下的 8 帧 = 0.533s。
+# 按**时间**而不是帧数：帧数会让同一段动作在 20fps 下只回看 0.4s、
+# 15fps 下 0.53s，特征值随帧率漂移，模型结论跟着变。
+MOVE_LOOKBACK_S = 8.0 / 15.0
 # 没找到候选时距离填这个值（超过归一化对角线 1.0，不会与真实距离混淆）。
 MISSING_DISTANCE = 2.0
 
@@ -91,7 +93,8 @@ class RawFrame:
     tray: BBox | None = None
     work: BBox | None = None
     oiling: BBox | None = None
-    screw_history: list[list[BBox]] = field(default_factory=list)
+    # 此前的丝杆框：(时间戳, 该帧全部杆框)。按时间索引，回看窗口与帧率无关。
+    screw_history: list[tuple[float, list[BBox]]] = field(default_factory=list)
     detector: DetectorConfig = field(default_factory=DetectorConfig)
 
     @property
@@ -117,16 +120,18 @@ class RawFrame:
         return self.tray is not None and _contains(self.tray, box.center)
 
     # -- 预处理：杆「动没动」 --------------------------------------------
-    def moved_since(self, box: BBox, frames_back: int = MOVE_FRAMES_BACK) -> float:
-        """这根杆相对 ``frames_back`` 帧前的位置移动了多少（归一化）。
+    def moved_since(
+        self, box: BBox, lookback_s: float = MOVE_LOOKBACK_S
+    ) -> float:
+        """这根杆相对 ``lookback_s`` 秒前的位置移动了多少（归一化）。
 
-        历史不足时返回 0——开局没有对照，不能凭它下结论。
+        按时间取对照帧，不按帧数：同一段动作在 15fps 与 20fps 下看的是同一个
+        时间距离，特征值不随帧率漂移。历史不足时返回 0——开局没有对照，
+        不能凭它下结论。
         """
 
-        if len(self.screw_history) < frames_back:
-            return 0.0
-        past = self.screw_history[-frames_back]
-        if not past:
+        past = self._history_at(lookback_s)
+        if past is None:
             return 0.0
         cx, cy = box.center
         return min(
@@ -134,13 +139,22 @@ class RawFrame:
             default=0.0,
         ) / self.diag
 
-    def parked_iou(self, box: BBox, frames_back: int = MOVE_FRAMES_BACK) -> float:
-        """这根杆与 ``frames_back`` 帧前同位框的最大 IoU。"""
+    def parked_iou(self, box: BBox, lookback_s: float = MOVE_LOOKBACK_S) -> float:
+        """这根杆与 ``lookback_s`` 秒前同位框的最大 IoU。"""
 
-        if len(self.screw_history) < frames_back:
+        past = self._history_at(lookback_s)
+        if past is None:
             return 0.0
-        past = self.screw_history[-frames_back]
         return max((_iou(box, other) for other in past), default=0.0)
+
+    def _history_at(self, lookback_s: float) -> list[BBox] | None:
+        """``lookback_s`` 秒之前（含）最近的一份杆框；历史不足返回 None。"""
+
+        target = self.ts - lookback_s
+        frames = [entry for entry in self.screw_history if entry[0] <= target + 1e-9]
+        if not frames:
+            return None
+        return frames[-1][1]
 
 
 # ----------------------------------------------------------------------
